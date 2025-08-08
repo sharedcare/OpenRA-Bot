@@ -57,8 +57,8 @@ class OpenRAEnvironment(gym.Env):
     
     def __init__(self, 
                  api_host: str = "localhost",
-                 api_port: int = 8082,
-                 ws_port: int = 8082,
+                 api_port: int = 8081,
+                 ws_port: int = 8081,
                  max_episode_steps: int = 5000,
                  observation_type: str = "vector"):
         

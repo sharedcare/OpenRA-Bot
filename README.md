@@ -12,10 +12,10 @@ A Gymnasium-compatible Python interface and an in-engine C# bridge for training 
 
 ## Repository Layout
 
-- `OpenRA.Bot/openra_env.py`: Python environment implementation
-- `OpenRA.Bot/example_usage.py`: End-to-end examples (random, agent, SB3, vision)
-- `OpenRA.Bot/requirements.txt`: Python dependencies
-- `OpenRA.Bot/openra_api_bridge.cs`: C# API bridge (HTTP + long-polling)
+- `openra_env.py`: Python environment implementation
+- `example_usage.py`: End-to-end examples (random, agent, SB3, vision)
+- `requirements.txt`: Python dependencies
+- `OpenRAApiBridge.cs`: C# API bridge (HTTP + long-polling)
 
 ## Quick Start (Windows)
 
@@ -23,7 +23,7 @@ A Gymnasium-compatible Python interface and an in-engine C# bridge for training 
 
 - Windows 10/11
 - Python 3.8+
-- Built OpenRA solution (this repo). Use Visual Studio 2022 or `dotnet` to build, then run `OpenRA.WindowsLauncher` and select the RA mod.
+- Copy `OpenRAApiBridge.cs` to your OpenRA Project\OpenRA.Mods.Common\OpenRAApiBridge.cs Built OpenRA solution. Use Visual Studio 2022 or `dotnet` to build, then run `OpenRA.WindowsLauncher` and select the RA mod.
 
 ### Enable the Python RL bot in RA
 
