@@ -1,6 +1,6 @@
 # OpenRA Reinforcement Learning Environment (OpenRA.Bot)
 
-A Gymnasium-compatible Python interface and an in-engine C# bridge for training RL agents on OpenRA.
+A Gymnasium-compatible Python interface and an in-engine C# bridge for training RL agents on [OpenRA](https://github.com/OpenRA/OpenRA).
 
 ## Features
 
@@ -23,6 +23,7 @@ A Gymnasium-compatible Python interface and an in-engine C# bridge for training 
 
 - Windows 10/11
 - Python 3.8+
+- Clone [OpenRA](http://github.com/OpenRA/OpenRA) repo
 - Copy `OpenRAApiBridge.cs` to your OpenRA Project\OpenRA.Mods.Common\OpenRAApiBridge.cs Built OpenRA solution. Use Visual Studio 2022 or `dotnet` to build, then run `OpenRA.WindowsLauncher` and select the RA mod.
 
 ### Enable the Python RL bot in RA
