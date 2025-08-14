@@ -15,6 +15,7 @@ using System.Threading.Tasks;
 using System.IO;
 using OpenRA.Traits;
 using OpenRA.Mods.Common.Traits;
+using OpenRA.Mods.Common;
 
 namespace OpenRA.Mods.Common.PythonBridge
 {
@@ -242,14 +243,70 @@ namespace OpenRA.Mods.Common.PythonBridge
                     MaxHealth = a.TraitOrDefault<IHealth>()?.MaxHP ?? 0
                 }).ToArray();
 
+            var allyUnits = player.World.Actors
+                .Where(a => a.Owner != player && !a.IsDead && a.IsInWorld
+                           && a.OccupiesSpace != null
+                           && player.RelationshipWith(a.Owner) == PlayerRelationship.Ally)
+                .Where(a => player.Shroud.IsVisible(a.Location)) // Only include visible allies
+                .Select(a => new ActorData
+                {
+                    Id = a.ActorID,
+                    Type = a.Info.Name,
+                    Position = new PositionData { X = a.Location.X, Y = a.Location.Y },
+                    Health = a.TraitOrDefault<IHealth>()?.HP ?? 0,
+                    MaxHealth = a.TraitOrDefault<IHealth>()?.MaxHP ?? 0
+                }).ToArray();
+
             var playerResources = player.PlayerActor.Trait<PlayerResources>();
             var powerManager = player.PlayerActor.TraitOrDefault<PowerManager>();
+
+            // Map info enrichment
+            var map = world.Map;
+            var mapInfo = new MapInfoData
+            {
+                Tileset = map.Tileset,
+                Bounds = new BoundsData
+                {
+                    X = map.Bounds.X,
+                    Y = map.Bounds.Y,
+                    Width = map.Bounds.Width,
+                    Height = map.Bounds.Height
+                },
+                ResourceCells = Array.Empty<ResourceCellData>()
+            };
+
+            // Collect visible resource cells if resource layer is available
+            var resourceLayer = world.WorldActor.TraitOrDefault<IResourceLayer>();
+            if (resourceLayer != null)
+            {
+                var resources = new List<ResourceCellData>();
+                foreach (var cell in map.AllCells)
+                {
+                    if (!resourceLayer.IsVisible(cell))
+                        continue;
+
+                    var content = resourceLayer.GetResource(cell);
+                    if (content.Type == null || content.Density == 0)
+                        continue;
+
+                    resources.Add(new ResourceCellData
+                    {
+                        X = cell.X,
+                        Y = cell.Y,
+                        Type = content.Type,
+                        Density = content.Density
+                    });
+                }
+
+                mapInfo.ResourceCells = resources.ToArray();
+            }
 
             return new GameStateData
             {
                 Tick = world.WorldTick,
                 MyUnits = myUnits,
                 EnemyUnits = enemyUnits,
+                AllyUnits = allyUnits,
                 Resources = new ResourceData
                 {
                     Cash = playerResources.Cash,
@@ -266,8 +323,72 @@ namespace OpenRA.Mods.Common.PythonBridge
                 { 
                     X = world.Map.MapSize.Width,
                     Y = world.Map.MapSize.Height
-                }
+                },
+                Map = mapInfo,
+                Production = CollectProductionInfo()
             };
+        }
+
+        private ProductionOverview CollectProductionInfo()
+        {
+            var overview = new ProductionOverview
+            {
+                Queues = Array.Empty<ProductionQueueData>()
+            };
+
+            var queues = new List<ProductionQueueData>();
+            foreach (var a in world.Actors)
+            {
+                if (a.Owner != player || a.IsDead || !a.IsInWorld)
+                    continue;
+
+                var pqs = a.TraitsImplementing<ProductionQueue>().ToArray();
+                if (pqs.Length == 0)
+                    continue;
+
+                foreach (var q in pqs)
+                {
+                    if (!q.Enabled)
+                        continue;
+
+                    var current = q.CurrentItem();
+                    var items = q.AllQueued().Select(pi => new ProductionQueueItem
+                    {
+                        Item = pi.Item,
+                        Cost = pi.TotalCost,
+                        Progress = pi.TotalTime > 0 ? Math.Clamp((int)(((pi.TotalTime - pi.RemainingTime) * 100) / pi.TotalTime), 0, 100) : 0,
+                        Paused = pi.Paused,
+                        Done = pi.Done
+                    }).ToArray();
+
+                    var buildables = q.BuildableItems().Select(ai => new BuildableItem
+                    {
+                        Name = ai.Name,
+                        Cost = q.GetProductionCost(ai)
+                    }).ToArray();
+
+                    queues.Add(new ProductionQueueData
+                    {
+                        ActorId = a.ActorID,
+                        Type = q.Info.Type,
+                        Group = q.Info.Group,
+                        Enabled = q.Enabled,
+                        Current = current != null ? new ProductionQueueItem
+                        {
+                            Item = current.Item,
+                            Cost = current.TotalCost,
+                            Progress = current.TotalTime > 0 ? Math.Clamp((int)(((current.TotalTime - current.RemainingTime) * 100) / current.TotalTime), 0, 100) : 0,
+                            Paused = current.Paused,
+                            Done = current.Done
+                        } : null,
+                        Items = items,
+                        Buildable = buildables
+                    });
+                }
+            }
+
+            overview.Queues = queues.ToArray();
+            return overview;
         }
 
         private void ProcessActions(ActionRequest[] actions)
@@ -281,6 +402,9 @@ namespace OpenRA.Mods.Common.PythonBridge
                         break;
                     case "attack":
                         ProcessAttackAction(action);
+                        break;
+                    case "deploy":
+                        ProcessDeployAction(action);
                         break;
                     case "build":
                         ProcessBuildAction(action);
@@ -332,6 +456,17 @@ namespace OpenRA.Mods.Common.PythonBridge
             if (producer != null && producer.Owner == player)
             {
                 var order = Order.StartProduction(producer, action.UnitType, 1, true);
+                QueueOrder(order);
+            }
+        }
+
+        private void ProcessDeployAction(ActionRequest action)
+        {
+            var actor = world.GetActorById(action.ActorId);
+            if (actor != null && actor.Owner == player)
+            {
+                // Deploy MCV or other units with Transforms/Deploy capability
+                var order = new Order("DeployTransform", actor, false);
                 QueueOrder(order);
             }
         }
@@ -413,9 +548,12 @@ namespace OpenRA.Mods.Common.PythonBridge
         public int Tick { get; set; }
         public ActorData[] MyUnits { get; set; } = Array.Empty<ActorData>();
         public ActorData[] EnemyUnits { get; set; } = Array.Empty<ActorData>();
+        public ActorData[] AllyUnits { get; set; } = Array.Empty<ActorData>();
         public ResourceData Resources { get; set; } = new();
         public PowerData Power { get; set; } = new();
         public PositionData MapSize { get; set; } = new();
+        public MapInfoData Map { get; set; } = new();
+        public ProductionOverview Production { get; set; } = new();
     }
 
     public class ActorData
@@ -456,5 +594,60 @@ namespace OpenRA.Mods.Common.PythonBridge
         public int TargetX { get; set; }
         public int TargetY { get; set; }
         public string UnitType { get; set; } = "";
+        public bool Queued { get; set; } = false;
+    }
+
+    public class MapInfoData
+    {
+        public string Tileset { get; set; } = "";
+        public BoundsData Bounds { get; set; } = new();
+        public ResourceCellData[] ResourceCells { get; set; } = Array.Empty<ResourceCellData>();
+    }
+
+    public class BoundsData
+    {
+        public int X { get; set; }
+        public int Y { get; set; }
+        public int Width { get; set; }
+        public int Height { get; set; }
+    }
+
+    public class ResourceCellData
+    {
+        public int X { get; set; }
+        public int Y { get; set; }
+        public string Type { get; set; } = "";
+        public byte Density { get; set; }
+    }
+
+    public class ProductionOverview
+    {
+        public ProductionQueueData[] Queues { get; set; } = Array.Empty<ProductionQueueData>();
+    }
+
+    public class ProductionQueueData
+    {
+        public uint ActorId { get; set; }
+        public string Type { get; set; } = "";
+        public string Group { get; set; } = null;
+        public bool Enabled { get; set; }
+        public ProductionQueueItem Current { get; set; }
+        public ProductionQueueItem[] Items { get; set; } = Array.Empty<ProductionQueueItem>();
+        public BuildableItem[] Buildable { get; set; } = Array.Empty<BuildableItem>();
+    }
+
+    public class ProductionQueueItem
+    {
+        public string Item { get; set; } = "";
+        public int Cost { get; set; }
+        public int Progress { get; set; }
+        public bool Paused { get; set; }
+        public bool Done { get; set; }
+    }
+
+    public class BuildableItem
+    {
+        public string Name { get; set; } = "";
+        public int Cost { get; set; }
     }
 }

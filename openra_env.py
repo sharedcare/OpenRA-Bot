@@ -9,8 +9,8 @@ import websocket
 import json
 import threading
 import time
-from typing import Dict, List, Tuple, Any, Optional
-from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass, field
 from collections import deque
 import gymnasium as gym
 from gymnasium import spaces
@@ -29,11 +29,21 @@ class ActorInfo:
 
 
 @dataclass
+class ResourceCell:
+    """Information about a resource cell on the map"""
+    x: int
+    y: int
+    type: str
+    density: int
+
+
+@dataclass
 class GameState:
     """Complete game state information"""
     tick: int
     my_units: List[ActorInfo]
     enemy_units: List[ActorInfo]
+    ally_units: List[ActorInfo] = field(default_factory=list)
     cash: int
     resources: int
     resource_capacity: int
@@ -42,6 +52,8 @@ class GameState:
     power_state: str
     map_width: int
     map_height: int
+    resource_cells: List[ResourceCell] = field(default_factory=list)
+    production: Dict = field(default_factory=dict)
 
 
 class OpenRAEnvironment(gym.Env):
@@ -60,7 +72,8 @@ class OpenRAEnvironment(gym.Env):
                  api_port: int = 8081,
                  ws_port: int = 8081,
                  max_episode_steps: int = 5000,
-                 observation_type: str = "vector"):
+                 observation_type: str = "vector",
+                 enable_actions: Optional[List[str]] = None):
         
         super().__init__()
         
@@ -69,6 +82,9 @@ class OpenRAEnvironment(gym.Env):
         self.ws_port = ws_port
         self.max_episode_steps = max_episode_steps
         self.observation_type = observation_type
+        # Configure enabled actions (reduced set by default)
+        default_actions = ['move', 'attack', 'deploy']
+        self.action_types: List[str] = enable_actions if enable_actions else default_actions
         
         # API endpoints
         self.api_base = f"http://{api_host}:{api_port}/api"
@@ -113,7 +129,7 @@ class OpenRAEnvironment(gym.Env):
         max_unit_types = len(self.unit_types)
         
         self.action_space = spaces.MultiDiscrete([
-            4,          # action_type: 0=move, 1=attack, 2=produce, 3=build
+            len(self.action_types),  # action_type: 0=move, 1=attack, 2=produce, 3=build, 4=deploy
             max_units,  # unit_id
             max_coord,  # target_x
             max_coord,  # target_y  
@@ -135,10 +151,17 @@ class OpenRAEnvironment(gym.Env):
             )
         
         elif self.observation_type == "image":
-            # Image-based observation: multiple channels representing different info
+            # Image-based observation: multi-channel feature map for model input
+            # Channels:
+            # 0: my infantry, 1: my vehicles/others, 2: allies (all types),
+            # 3: enemy infantry, 4: enemy vehicles/others,
+            # 5: resource density (grayscale),
+            # 6: power surplus (global, repeated),
+            # 7: cash (global, repeated),
+            # 8: my low-health mask (<50%), 9: enemy low-health mask (<50%)
             self.observation_space = spaces.Box(
-                low=0, high=255, 
-                shape=(128, 128, 8),  # 8 channels: units, buildings, resources, etc.
+                low=0, high=255,
+                shape=(128, 128, 10),
                 dtype=np.uint8
             )
     
@@ -240,7 +263,7 @@ class OpenRAEnvironment(gym.Env):
             return observation, info
             
         except Exception as e:
-            raise RuntimeError(f"Failed to reset environment: {e}")
+            raise RuntimeError(f"Failed to reset environment: {e}") from e
     
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """Execute action and return next state"""
@@ -263,6 +286,8 @@ class OpenRAEnvironment(gym.Env):
         # Prepare observation and info
         observation = self._state_to_observation(self.current_state)
         info = self._get_info()
+        # Provide action mask for downstream policy
+        info['action_mask'] = self._get_action_mask()
         
         return observation, reward, terminated, truncated, info
     
@@ -302,11 +327,36 @@ class OpenRAEnvironment(gym.Env):
                 for unit in data['EnemyUnits']
             ]
             self._enemy_unit_ids = [u.id for u in enemy_units]
+
+            ally_units = [
+                ActorInfo(
+                    id=unit['Id'],
+                    type=unit['Type'],
+                    x=unit['Position']['X'],
+                    y=unit['Position']['Y'],
+                    health=unit['Health'],
+                    max_health=unit['MaxHealth'],
+                    is_idle=True,
+                )
+                for unit in data.get('AllyUnits', [])
+            ]
+
+            # Map resource cells (optional)
+            resource_cells = []
+            if 'Map' in data and isinstance(data['Map'], dict):
+                for rc in data['Map'].get('ResourceCells', []) or []:
+                    try:
+                        resource_cells.append(ResourceCell(
+                            x=rc['X'], y=rc['Y'], type=rc.get('Type', ''), density=rc.get('Density', 0)
+                        ))
+                    except Exception:
+                        continue
             
             return GameState(
                 tick=data['Tick'],
                 my_units=my_units,
                 enemy_units=enemy_units,
+                ally_units=ally_units,
                 cash=data['Resources']['Cash'],
                 resources=data['Resources']['Resources'],
                 resource_capacity=data['Resources']['ResourceCapacity'],
@@ -314,19 +364,22 @@ class OpenRAEnvironment(gym.Env):
                 power_drained=data['Power']['Drained'],
                 power_state=data['Power']['State'],
                 map_width=data['MapSize']['X'],
-                map_height=data['MapSize']['Y']
+                map_height=data['MapSize']['Y'],
+                resource_cells=resource_cells,
+                production=data.get('Production', {})
             )
             
         except Exception as e:
-            raise RuntimeError(f"Failed to get game state: {e}")
+            raise RuntimeError(f"Failed to get game state: {e}") from e
     
     def _execute_action(self, action: np.ndarray):
         """Execute the given action"""
         action_type, unit_id, target_x, target_y, target_id, unit_type = action
+        atype = self.action_types[int(action_type)] if self.action_types else 'move'
         
         actions = []
         
-        if action_type == 0:  # Move
+        if atype == 'move':  # Move
             actions.append({
                 "Type": "move",
                 "ActorId": int(self._resolve_my_unit_id(unit_id)),
@@ -334,14 +387,14 @@ class OpenRAEnvironment(gym.Env):
                 "TargetY": int(target_y)
             })
         
-        elif action_type == 1:  # Attack
+        elif atype == 'attack':  # Attack
             actions.append({
                 "Type": "attack",
                 "ActorId": int(self._resolve_my_unit_id(unit_id)),
                 "TargetId": int(self._resolve_enemy_unit_id(target_id))
             })
         
-        elif action_type == 2:  # Produce
+        elif atype == 'produce':  # Produce
             unit_type_name = self.reverse_unit_types.get(unit_type, 'infantry')
             actions.append({
                 "Type": "produce",
@@ -349,7 +402,7 @@ class OpenRAEnvironment(gym.Env):
                 "UnitType": unit_type_name
             })
         
-        elif action_type == 3:  # Build
+        elif atype == 'build':  # Build
             unit_type_name = self.reverse_unit_types.get(unit_type, 'barracks')
             actions.append({
                 "Type": "build",
@@ -358,7 +411,13 @@ class OpenRAEnvironment(gym.Env):
                 "TargetX": int(target_x),
                 "TargetY": int(target_y)
             })
-        
+
+        elif atype == 'deploy':  # Deploy (e.g., MCV)
+            actions.append({
+                "Type": "deploy",
+                "ActorId": int(self._resolve_my_unit_id(unit_id))
+            })
+
         if actions:
             try:
                 response = requests.post(
@@ -370,6 +429,46 @@ class OpenRAEnvironment(gym.Env):
                     print(f"Action execution failed: {response.text}")
             except Exception as e:
                 print(f"Failed to execute action: {e}")
+
+    def _get_action_mask(self) -> Dict[str, np.ndarray]:
+        """Compute a simple action mask over the configured action set.
+        Returns a dict of boolean arrays usable by common RL libraries.
+        - move_mask[unit] = 1 if unit exists
+        - attack_mask[unit, target] = 1 if both exist and enemy exists
+        - deploy_mask[unit] = 1 if unit name suggests deploy capability (heuristic)
+        Note: This is a lightweight mask; engine-side validity still applies.
+        """
+        max_units = 100
+        my_units = self.current_state.my_units if self.current_state else []
+        enemy_units = self.current_state.enemy_units if self.current_state else []
+
+        move_mask = np.zeros((max_units,), dtype=np.uint8)
+        deploy_mask = np.zeros((max_units,), dtype=np.uint8)
+        attack_mask = np.zeros((max_units, max_units), dtype=np.uint8)
+
+        for i, u in enumerate(my_units[:max_units]):
+            move_mask[i] = 1
+            t = u.type.lower()
+            if 'mcv' in t or 'deploy' in t:
+                deploy_mask[i] = 1
+
+        if enemy_units:
+            for i, _ in enumerate(my_units[:max_units]):
+                for j, _ in enumerate(enemy_units[:max_units]):
+                    attack_mask[i, j] = 1
+
+        mask = {
+            'action_type': np.ones((len(self.action_types),), dtype=np.uint8),
+            'move_mask': move_mask,
+            'attack_mask': attack_mask,
+            'deploy_mask': deploy_mask,
+        }
+        if 'produce' in self.action_types:
+            mask['produce_mask'] = move_mask.copy()
+        if 'build' in self.action_types:
+            mask['build_mask'] = move_mask.copy()
+
+        return mask
 
     def _resolve_my_unit_id(self, index: int) -> int:
         """Map unit index to actual my unit ActorId; clamp if out of range."""
@@ -446,14 +545,14 @@ class OpenRAEnvironment(gym.Env):
         return obs
     
     def _state_to_image(self, state: GameState) -> np.ndarray:
-        """Convert state to image observation (128x128x8)"""
-        img = np.zeros((128, 128, 8), dtype=np.uint8)
+        """Convert state to image observation (128x128x10)."""
+        img = np.zeros((128, 128, 10), dtype=np.uint8)
         
         # Scale coordinates to image size
         scale_x = 128.0 / state.map_width
         scale_y = 128.0 / state.map_height
         
-        # Channel 0-1: My units (infantry, vehicles)
+        # Channel 0-1: My units (infantry, vehicles/others)
         for unit in state.my_units:
             x = int(unit.x * scale_x)
             y = int(unit.y * scale_y)
@@ -463,22 +562,56 @@ class OpenRAEnvironment(gym.Env):
                 else:
                     img[y, x, 1] = 255
         
-        # Channel 2-3: Enemy units
+        # Channel 2: Allies (all types)
+        for unit in state.ally_units:
+            x = int(unit.x * scale_x)
+            y = int(unit.y * scale_y)
+            if 0 <= x < 128 and 0 <= y < 128:
+                img[y, x, 2] = 255
+
+        # Channel 3-4: Enemy units (infantry, vehicles/others)
         for unit in state.enemy_units:
             x = int(unit.x * scale_x)
             y = int(unit.y * scale_y)
             if 0 <= x < 128 and 0 <= y < 128:
                 if 'infantry' in unit.type.lower():
-                    img[y, x, 2] = 255
-                else:
                     img[y, x, 3] = 255
+                else:
+                    img[y, x, 4] = 255
         
-        # Channel 4: Resources (simplified)
-        img[:, :, 4] = int(state.cash / 100)  # Resource overlay
+        # Channel 5: Resource density map (from resource_cells)
+        if state.resource_cells:
+            max_density = max((rc.density for rc in state.resource_cells), default=1)
+            max_density = max(1, max_density)
+            for rc in state.resource_cells:
+                x = int(rc.x * scale_x)
+                y = int(rc.y * scale_y)
+                if 0 <= x < 128 and 0 <= y < 128:
+                    val = int(min(255, (rc.density / max_density) * 255))
+                    img[y, x, 5] = max(img[y, x, 5], val)
         
-        # Channel 5: Power state
-        power_level = int((state.power_provided - state.power_drained) / 10)
-        img[:, :, 5] = max(0, min(255, power_level))
+        # Channel 6: Power surplus (global constant map)
+        power_level = int((state.power_provided - state.power_drained))
+        img[:, :, 6] = max(0, min(255, power_level))
+
+        # Channel 7: Cash (global constant map)
+        img[:, :, 7] = max(0, min(255, int(state.cash / 100)))
+
+        # Channel 8: My low-health mask (<50%)
+        for unit in state.my_units:
+            if unit.max_health > 0 and unit.health / unit.max_health < 0.5:
+                x = int(unit.x * scale_x)
+                y = int(unit.y * scale_y)
+                if 0 <= x < 128 and 0 <= y < 128:
+                    img[y, x, 8] = 255
+
+        # Channel 9: Enemy low-health mask (<50%)
+        for unit in state.enemy_units:
+            if unit.max_health > 0 and unit.health / unit.max_health < 0.5:
+                x = int(unit.x * scale_x)
+                y = int(unit.y * scale_y)
+                if 0 <= x < 128 and 0 <= y < 128:
+                    img[y, x, 9] = 255
         
         # Channels 6-7: Reserved for additional features
         
@@ -537,9 +670,11 @@ class OpenRAEnvironment(gym.Env):
             'step_count': self.step_count,
             'episode_reward': self.episode_reward,
             'my_unit_count': len(self.current_state.my_units),
+            'ally_unit_count': len(self.current_state.ally_units),
             'enemy_unit_count': len(self.current_state.enemy_units),
             'cash': self.current_state.cash,
-            'power_state': self.current_state.power_state
+            'power_state': self.current_state.power_state,
+            'production': self.current_state.production
         }
     
     def close(self):
