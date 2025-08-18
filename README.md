@@ -139,8 +139,7 @@ curl -X POST http://localhost:8081/api/actions \
   - `Production`: per-building queues owned by player
     - `Production.Queues[]` with:
       - `ActorId`, `Type` (e.g., Building/Infantry/Vehicle), `Group`, `Enabled`
-      - `Current`: `{ Item, Cost, Progress(0-100), Paused, Done }`
-      - `Items[]`: same shape as `Current`
+      - `Items[]`: `{ Item, Cost, Progress(0-100), Paused, Done }`
       - `Buildable[]`: `{ Name, Cost }`
 
 ### Actions (MultiDiscrete)

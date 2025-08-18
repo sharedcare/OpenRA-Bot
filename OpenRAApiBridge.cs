@@ -341,7 +341,6 @@ namespace OpenRA.Mods.Common.PythonBridge
 					if (!q.Enabled)
 						continue;
 
-					var current = q.CurrentItem();
 					var items = q.AllQueued().Select(pi => new ProductionQueueItem
 					{
 						Item = pi.Item,
@@ -363,15 +362,6 @@ namespace OpenRA.Mods.Common.PythonBridge
 						Type = q.Info.Type,
 						Group = q.Info.Group,
 						Enabled = q.Enabled,
-						Current = current != null ? new ProductionQueueItem
-						{
-							Item = current.Item,
-							Cost = current.TotalCost,
-							Progress = current.TotalTime > 0 ? Math.Clamp((current.TotalTime - current.RemainingTime) * 100 / current.TotalTime, 0, 100) : 0,
-							Paused = current.Paused,
-							Done = current.Done
-						}
-						: null,
 						Items = items,
 						Buildable = buildables
 					});
@@ -403,6 +393,9 @@ namespace OpenRA.Mods.Common.PythonBridge
 					case "produce":
 						ProcessProduceAction(action);
 						break;
+					case "cancel":
+						ProcessCancelAction(action);
+						break;
 				}
 			}
 		}
@@ -432,12 +425,20 @@ namespace OpenRA.Mods.Common.PythonBridge
 
 		void ProcessBuildAction(ActionRequest action)
 		{
-			var builder = world.GetActorById(action.ActorId);
-			if (builder != null && builder.Owner == Player)
+			// Issue a PlaceBuilding order tied to the specified ProductionQueue actor
+			var queueActor = world.GetActorById(action.ActorId);
+			if (queueActor == null || queueActor.Owner != Player)
+				return;
+
+			var targetCell = new CPos(action.TargetX, action.TargetY);
+			var order = new Order("PlaceBuilding", Player.PlayerActor, Target.FromCell(world, targetCell), false)
 			{
-				var targetCell = new CPos(action.TargetX, action.TargetY);
-				// Create appropriate build order
-			}
+				TargetString = action.UnitType,   // rules actor name to place
+				ExtraData = action.ActorId,        // queue owner actor id
+				ExtraLocation = new CPos(0, 0),    // variant index (0=default)
+				SuppressVisualFeedback = true
+			};
+			QueueOrder(order);
 		}
 
 		void ProcessProduceAction(ActionRequest action)
@@ -459,6 +460,20 @@ namespace OpenRA.Mods.Common.PythonBridge
 				var order = new Order("DeployTransform", actor, false);
 				QueueOrder(order);
 			}
+		}
+
+		void ProcessCancelAction(ActionRequest action)
+		{
+			var queueActor = world.GetActorById(action.ActorId);
+			if (queueActor == null || queueActor.Owner != Player)
+				return;
+
+			var order = new Order("CancelProduction", queueActor, false)
+			{
+				TargetString = action.UnitType,
+				ExtraData = action.Count > 0 ? action.Count : 1
+			};
+			QueueOrder(order);
 		}
 
 		void ResetGame()
@@ -583,6 +598,7 @@ namespace OpenRA.Mods.Common.PythonBridge
 		public int TargetY { get; set; }
 		public string UnitType { get; set; } = "";
 		public bool Queued { get; set; } = false;
+		public uint Count { get; set; } = 1;
 	}
 
 	public class MapInfoData
@@ -619,7 +635,6 @@ namespace OpenRA.Mods.Common.PythonBridge
 		public string Type { get; set; } = "";
 		public string Group { get; set; } = null;
 		public bool Enabled { get; set; }
-		public ProductionQueueItem Current { get; set; }
 		public ProductionQueueItem[] Items { get; set; } = [];
 		public BuildableItem[] Buildable { get; set; } = [];
 	}
