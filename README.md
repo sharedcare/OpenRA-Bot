@@ -36,7 +36,7 @@ PythonApiBridge@PythonRL:
   ApiPort: 8081
   EnableRealTimeUpdates: true
 ```
-
+Add these lines in `mods/ra/rules/ai.yaml` under `Player` section.
 Start a Skirmish game, add an AI slot, and choose bot type "Python RL Agent". When the match starts the HTTP API listens on `http://localhost:8081`.
 
 ### Python setup

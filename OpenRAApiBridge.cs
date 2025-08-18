@@ -2,8 +2,6 @@
  * OpenRA Python API Bridge
  * Provides HTTP interface for Python RL agents
  */
-#endregion
-
 using System;
 using System.Collections.Generic;
 using System.IO;
