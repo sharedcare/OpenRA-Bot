@@ -1,7 +1,6 @@
-/*
- * OpenRA Python API Bridge
- * Provides HTTP interface for Python RL agents
- */
+// OpenRA Python API Bridge
+// Provides HTTP interface for Python RL agents
+
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -171,8 +170,9 @@ namespace OpenRA.Mods.Common.PythonBridge
 						{
 							var body = await new StreamReader(request.InputStream).ReadToEndAsync();
 							var actions = JsonSerializer.Deserialize<ActionRequest[]>(body);
-							ProcessActions(actions);
-							responseText = JsonSerializer.Serialize(new { success = true });
+							var results = ProcessActions(actions);
+							var overall = results.All(r => r.Success);
+							responseText = JsonSerializer.Serialize(new { success = overall, results });
 						}
 
 						break;
@@ -291,6 +291,9 @@ namespace OpenRA.Mods.Common.PythonBridge
 				mapInfo.ResourceCells = resources.ToArray();
 			}
 
+			// Compute placeable areas for any finished building items
+			var placeableAreas = CollectPlaceableAreas();
+
 			return new GameStateData
 			{
 				Tick = world.WorldTick,
@@ -315,8 +318,62 @@ namespace OpenRA.Mods.Common.PythonBridge
 					Y = world.Map.MapSize.Height
 				},
 				Map = mapInfo,
-				Production = CollectProductionInfo()
+				Production = CollectProductionInfo(),
+				PlaceableAreas = placeableAreas
 			};
+		}
+
+		PlaceableAreaData[] CollectPlaceableAreas()
+		{
+			var results = new List<PlaceableAreaData>();
+			foreach (var a in world.Actors)
+			{
+				if (a.Owner != Player || a.IsDead || !a.IsInWorld)
+					continue;
+
+				var pqs = a.TraitsImplementing<ProductionQueue>().ToArray();
+				if (pqs.Length == 0)
+					continue;
+
+				foreach (var q in pqs)
+				{
+					if (!q.Enabled)
+						continue;
+
+					// For each finished building item, compute valid cells
+					var finished = q.AllQueued().Where(i => i.Done).Select(i => i.Item).Distinct().ToArray();
+					foreach (var item in finished)
+					{
+						if (!world.Map.Rules.Actors.TryGetValue(item, out var actorInfo))
+							continue;
+						var bi = actorInfo.TraitInfoOrDefault<BuildingInfo>();
+						if (bi == null)
+							continue;
+
+						var cells = new List<PositionData>();
+						foreach (var cell in world.Map.AllCells)
+						{
+							if (!world.CanPlaceBuilding(cell, actorInfo, bi, null))
+								continue;
+							if (!bi.IsCloseEnoughToBase(world, Player, actorInfo, cell))
+								continue;
+							cells.Add(new PositionData { X = cell.X, Y = cell.Y });
+						}
+
+						if (cells.Count > 0)
+						{
+							results.Add(new PlaceableAreaData
+							{
+								ActorId = a.ActorID,
+								UnitType = item,
+								Cells = cells.ToArray()
+							});
+						}
+					}
+				}
+			}
+
+			return results.ToArray();
 		}
 
 		ProductionOverview CollectProductionInfo()
@@ -372,108 +429,167 @@ namespace OpenRA.Mods.Common.PythonBridge
 			return overview;
 		}
 
-		void ProcessActions(ActionRequest[] actions)
+		ActionResult[] ProcessActions(ActionRequest[] actions)
 		{
-			foreach (var action in actions)
+			var results = new List<ActionResult>(actions?.Length ?? 0);
+			if (actions == null)
+				return results.ToArray();
+
+			for (var i = 0; i < actions.Length; i++)
 			{
-				switch (action.Type)
+				var a = actions[i];
+				var r = new ActionResult { Index = i, Type = a.Type, Success = false };
+				switch (a.Type)
 				{
 					case "move":
-						ProcessMoveAction(action);
+					{
+						var ok = TryProcessMoveAction(a, out var err);
+						r.Success = ok; r.Error = err;
 						break;
+					}
+
 					case "attack":
-						ProcessAttackAction(action);
+					{
+						var ok = TryProcessAttackAction(a, out var err);
+						r.Success = ok; r.Error = err;
 						break;
+					}
+
 					case "deploy":
-						ProcessDeployAction(action);
+					{
+						var ok = TryProcessDeployAction(a, out var err);
+						r.Success = ok; r.Error = err;
 						break;
+					}
+
 					case "build":
-						ProcessBuildAction(action);
+					{
+						var ok = TryProcessBuildAction(a, out var err);
+						r.Success = ok; r.Error = err;
 						break;
+					}
+
 					case "produce":
-						ProcessProduceAction(action);
+					{
+						var ok = TryProcessProduceAction(a, out var err);
+						r.Success = ok; r.Error = err;
 						break;
+					}
+
 					case "cancel":
-						ProcessCancelAction(action);
+					{
+						var ok = TryProcessCancelAction(a, out var err);
+						r.Success = ok; r.Error = err;
+						break;
+					}
+
+					default:
+						r.Success = false;
+						r.Error = "unknown_action";
 						break;
 				}
+
+				results.Add(r);
 			}
+
+			return results.ToArray();
 		}
 
-		void ProcessMoveAction(ActionRequest action)
+		bool TryProcessMoveAction(ActionRequest action, out string error)
 		{
 			var actor = world.GetActorById(action.ActorId);
-			if (actor != null && actor.Owner == Player)
-			{
-				var targetCell = new CPos(action.TargetX, action.TargetY);
-				var order = new Order("Move", actor, Target.FromCell(world, targetCell), false);
-				QueueOrder(order);
-			}
+			if (actor == null) { error = "actor_not_found"; return false; }
+			if (actor.Owner != Player) { error = "not_owner"; return false; }
+			var targetCell = new CPos(action.TargetX, action.TargetY);
+			var order = new Order("Move", actor, Target.FromCell(world, targetCell), false);
+			QueueOrder(order);
+			error = null;
+			return true;
 		}
 
-		void ProcessAttackAction(ActionRequest action)
+		bool TryProcessAttackAction(ActionRequest action, out string error)
 		{
 			var actor = world.GetActorById(action.ActorId);
 			var target = world.GetActorById(action.TargetId);
-
-			if (actor != null && target != null && actor.Owner == Player)
-			{
-				var order = new Order("Attack", actor, Target.FromActor(target), false);
-				QueueOrder(order);
-			}
+			if (actor == null) { error = "actor_not_found"; return false; }
+			if (actor.Owner != Player) { error = "not_owner"; return false; }
+			if (target == null) { error = "target_not_found"; return false; }
+			var order = new Order("Attack", actor, Target.FromActor(target), false);
+			QueueOrder(order);
+			error = null;
+			return true;
 		}
 
-		void ProcessBuildAction(ActionRequest action)
+		bool TryProcessBuildAction(ActionRequest action, out string error)
 		{
-			// Issue a PlaceBuilding order tied to the specified ProductionQueue actor
 			var queueActor = world.GetActorById(action.ActorId);
-			if (queueActor == null || queueActor.Owner != Player)
-				return;
-
+			if (queueActor == null) { error = "queue_actor_not_found"; return false; }
+			if (queueActor.Owner != Player) { error = "not_owner"; return false; }
+			if (string.IsNullOrEmpty(action.UnitType)) { error = "unit_type_missing"; return false; }
+			if (!world.Map.Rules.Actors.TryGetValue(action.UnitType, out var actorInfo)) { error = "unit_type_invalid"; return false; }
+			var buildingInfo = actorInfo.TraitInfoOrDefault<BuildingInfo>();
+			if (buildingInfo == null) { error = "not_a_building"; return false; }
+			var queue = queueActor.TraitsImplementing<ProductionQueue>()
+				.FirstOrDefault(q => q.CanBuild(actorInfo) && q.AllQueued().Any(i => i.Done && i.Item == action.UnitType));
+			if (queue == null) { error = "no_finished_item_in_queue"; return false; }
 			var targetCell = new CPos(action.TargetX, action.TargetY);
+			if (!world.CanPlaceBuilding(targetCell, actorInfo, buildingInfo, null) || !buildingInfo.IsCloseEnoughToBase(world, Player, actorInfo, targetCell))
+			{ error = "invalid_build_location"; return false; }
 			var order = new Order("PlaceBuilding", Player.PlayerActor, Target.FromCell(world, targetCell), false)
 			{
-				TargetString = action.UnitType,   // rules actor name to place
-				ExtraData = action.ActorId,        // queue owner actor id
-				ExtraLocation = new CPos(0, 0),    // variant index (0=default)
+				TargetString = action.UnitType,
+				ExtraData = action.ActorId,
+				ExtraLocation = new CPos(0, 0),
 				SuppressVisualFeedback = true
 			};
 			QueueOrder(order);
+			error = null;
+			return true;
 		}
 
-		void ProcessProduceAction(ActionRequest action)
+		bool TryProcessProduceAction(ActionRequest action, out string error)
 		{
 			var producer = world.GetActorById(action.ActorId);
-			if (producer != null && producer.Owner == Player)
-			{
-				var order = Order.StartProduction(producer, action.UnitType, 1, true);
-				QueueOrder(order);
-			}
+			if (producer == null) { error = "producer_not_found"; return false; }
+			if (producer.Owner != Player) { error = "not_owner"; return false; }
+			if (string.IsNullOrEmpty(action.UnitType)) { error = "unit_type_missing"; return false; }
+			if (!world.Map.Rules.Actors.TryGetValue(action.UnitType, out var unitInfo)) { error = "unit_type_invalid"; return false; }
+			var pq = producer.TraitsImplementing<ProductionQueue>().FirstOrDefault(q => unitInfo.TraitInfo<BuildableInfo>().Queue.Contains(q.Info.Type));
+			if (pq == null) { error = "no_matching_queue"; return false; }
+			if (!pq.CanQueue(unitInfo, out _, out _)) { error = "cannot_queue"; return false; }
+			var order = Order.StartProduction(producer, action.UnitType, 1, true);
+			QueueOrder(order);
+			error = null;
+			return true;
 		}
 
-		void ProcessDeployAction(ActionRequest action)
+		bool TryProcessDeployAction(ActionRequest action, out string error)
 		{
 			var actor = world.GetActorById(action.ActorId);
-			if (actor != null && actor.Owner == Player)
-			{
-				// Deploy MCV or other units with Transforms/Deploy capability
-				var order = new Order("DeployTransform", actor, false);
-				QueueOrder(order);
-			}
+			if (actor == null) { error = "actor_not_found"; return false; }
+			if (actor.Owner != Player) { error = "not_owner"; return false; }
+			var canDeploy = actor.TraitsImplementing<IIssueDeployOrder>().Any();
+			if (!canDeploy) { error = "cannot_deploy"; return false; }
+			var order = new Order("DeployTransform", actor, false);
+			QueueOrder(order);
+			error = null;
+			return true;
 		}
 
-		void ProcessCancelAction(ActionRequest action)
+		bool TryProcessCancelAction(ActionRequest action, out string error)
 		{
 			var queueActor = world.GetActorById(action.ActorId);
-			if (queueActor == null || queueActor.Owner != Player)
-				return;
-
+			if (queueActor == null) { error = "queue_actor_not_found"; return false; }
+			if (queueActor.Owner != Player) { error = "not_owner"; return false; }
+			if (string.IsNullOrEmpty(action.UnitType)) { error = "unit_type_missing"; return false; }
 			var order = new Order("CancelProduction", queueActor, false)
 			{
 				TargetString = action.UnitType,
 				ExtraData = action.Count > 0 ? action.Count : 1
 			};
 			QueueOrder(order);
+			error = null;
+			return true;
 		}
 
 		void ResetGame()
@@ -557,6 +673,7 @@ namespace OpenRA.Mods.Common.PythonBridge
 		public PositionData MapSize { get; set; } = new();
 		public MapInfoData Map { get; set; } = new();
 		public ProductionOverview Production { get; set; } = new();
+		public PlaceableAreaData[] PlaceableAreas { get; set; } = [];
 	}
 
 	public class ActorData
@@ -652,5 +769,20 @@ namespace OpenRA.Mods.Common.PythonBridge
 	{
 		public string Name { get; set; } = "";
 		public int Cost { get; set; }
+	}
+
+	public class PlaceableAreaData
+	{
+		public uint ActorId { get; set; }
+		public string UnitType { get; set; } = "";
+		public PositionData[] Cells { get; set; } = [];
+	}
+
+	public class ActionResult
+	{
+		public int Index { get; set; }
+		public string Type { get; set; }
+		public bool Success { get; set; }
+		public string Error { get; set; }
 	}
 }

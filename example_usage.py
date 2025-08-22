@@ -45,39 +45,196 @@ def basic_example():
 
 # Example 2: Simple AI agent
 class SimpleAgent:
-    """Simple rule-based agent for demonstration"""
-    
+    """Rule-based agent: deploy MCV, then build base and infantry."""
+
     def __init__(self, env):
         self.env = env
         self.action_history = []
-    
+        # Build convenient mapping from action name to index
+        self.action_index = {name: i for i, name in enumerate(self.env.action_types)}
+        self.deployed_this_episode = False
+
+    # --- Helpers ---
+    def _find_queue_index_by_id(self, info, actor_id: int) -> int:
+        ids = info.get('queue_actor_ids', [])
+        try:
+            return ids.index(actor_id)
+        except ValueError:
+            return 0
+
+    def _find_first_index(self, pred, seq):
+        for i, x in enumerate(seq):
+            if pred(x):
+                return i
+        return -1
+
+    def _have_building(self, info, names):
+        names = set(n.lower() for n in (names if isinstance(names, (list, tuple, set)) else [names]))
+        for u in info.get('my_units', []) or []:
+            if u.get('type', '').lower() in names:
+                return True
+        return False
+
+    def _count_buildings(self, info, names) -> int:
+        names = set(n.lower() for n in (names if isinstance(names, (list, tuple, set)) else [names]))
+        count = 0
+        for u in info.get('my_units', []) or []:
+            if u.get('type', '').lower() in names:
+                count += 1
+        return count
+
+    def _queue_contains(self, queue, item_name: str) -> bool:
+        for it in queue.get('Items', []) or []:
+            if it.get('Item') == item_name:
+                return True
+        return False
+
+    def _queue_has_done(self, queue, item_name: str) -> bool:
+        for it in queue.get('Items', []) or []:
+            if it.get('Item') == item_name and it.get('Done'):
+                return True
+        return False
+
+    def _select_build_cell(self, info, unit_type: str):
+        cells = (info.get('placeable_areas') or {}).get(unit_type, [])
+        if not cells:
+            return None
+        # Pick a deterministic first cell for now
+        return cells[0]
+
+    def _action(self, name: str, unit_idx: int = 0, x: int = 0, y: int = 0, target_idx: int = 0, unit_type_name: str = ''):
+        t = self.action_index.get(name, 0)
+        unit_type_idx = self.env.unit_types.get(unit_type_name, 0)
+        return np.array([t, unit_idx, x, y, target_idx, unit_type_idx], dtype=np.int64)
+
+    # --- Core policy ---
     def select_action(self, observation, info):
-        """Select action based on simple rules"""
-        my_units = info.get('my_unit_count', 0)
-        enemy_units = info.get('enemy_unit_count', 0)
+        my_units_list = info.get('my_units', []) or []
         cash = info.get('cash', 0)
-        
-        # Simple strategy:
-        # 1. If we have cash and fewer units than enemy, try to produce
-        # 2. If we have more units, try to attack
-        # 3. Otherwise, move randomly
-        
-        if cash > 500 and my_units < enemy_units * 1.5:
-            # Try to produce units
-            action = np.array([2, 0, 0, 0, 0, 0])  # Produce infantry
-        elif my_units > enemy_units and enemy_units > 0:
-            # Try to attack (simplified)
-            action = np.array([1, 0, 0, 0, 0, 0])  # Attack with first unit
+
+        # 1) Deploy MCV if present and no conyard yet
+        mcv_idx = self._find_first_index(lambda u: 'mcv' in u.get('type', '').lower(), my_units_list)
+        if mcv_idx >= 0 and not self._have_building(info, ['fact']) and not self.deployed_this_episode:
+            if 'deploy' in self.action_index:
+                action = self._action('deploy', unit_idx=mcv_idx)
+                self.deployed_this_episode = True
+                self.action_history.append(action)
+                return action
+
+        # Read production queues
+        production = info.get('production', {}) or {}
+        queues = production.get('Queues', []) or []
+
+        # 2) If any building item finished, place it
+        for q in queues:
+            # Find any done building (e.g., powr, proc, tent/barr)
+            for it in q.get('Items', []) or []:
+                item_name = it.get('Item')
+                if it.get('Done') and item_name:
+                    cell = self._select_build_cell(info, item_name)
+                    if cell:
+                        unit_idx = self._find_queue_index_by_id(info, q.get('ActorId', 0))
+                        x, y = int(cell[0]), int(cell[1])
+                        action = self._action('build', unit_idx=unit_idx, x=x, y=y, unit_type_name=item_name)
+                        self.action_history.append(action)
+                        return action
+
+        # 3) If any queue has buildable entries, produce in priority: powr -> tent/barr -> proc
+        has_buildable = any(((q.get('Buildable', []) or [])) for q in queues)
+        if has_buildable:
+            barr_count_now = self._count_buildings(info, ['tent', 'barr'])
+            # powr first
+            act = None
+            act = act or next((self._action('produce', unit_idx=self._find_queue_index_by_id(info, q.get('ActorId', 0)), unit_type_name='powr')
+                               for q in queues
+                               if ('powr' in [b.get('Name') for b in (q.get('Buildable', []) or [])] and not self._queue_contains(q, 'powr') and cash >= 100)), None)
+            # then tent/barr under cap
+            if act is None and barr_count_now < 4:
+                for prefer in ('tent', 'barr'):
+                    for q in queues:
+                        buildable = [b.get('Name') for b in (q.get('Buildable', []) or [])]
+                        if prefer in buildable and not self._queue_contains(q, prefer) and cash >= 100:
+                            act = self._action('produce', unit_idx=self._find_queue_index_by_id(info, q.get('ActorId', 0)), unit_type_name=prefer)
+                            break
+                    if act is not None:
+                        break
+            # finally proc
+            if act is None:
+                for q in queues:
+                    buildable = [b.get('Name') for b in (q.get('Buildable', []) or [])]
+                    if 'proc' in buildable and not self._queue_contains(q, 'proc') and cash >= 100:
+                        act = self._action('produce', unit_idx=self._find_queue_index_by_id(info, q.get('ActorId', 0)), unit_type_name='proc')
+                        break
+            if act is not None:
+                self.action_history.append(act)
+                return act
+
+        # 4) Otherwise queue production based on economy and power:
+        #    - If power is Low/Critical: build powr
+        #    - If cash < 2000: build proc
+        #    - Else: build tent/barr (cap at 4 total)
+        power_state = (info.get('power_state') or 'Normal')
+        barr_count = self._count_buildings(info, ['tent', 'barr'])
+
+        def try_queue(target_name: str) -> np.ndarray | None:
+            # Do not queue duplicates; ensure it is buildable from some queue
+            for q in queues:
+                if self._queue_contains(q, target_name):
+                    continue
+                buildable = [b.get('Name') for b in (q.get('Buildable', []) or [])]
+                if target_name in buildable and cash >= 100:
+                    unit_idx = self._find_queue_index_by_id(info, q.get('ActorId', 0))
+                    return self._action('produce', unit_idx=unit_idx, unit_type_name=target_name)
+            return None
+
+        # Power first
+        if power_state in ('Low', 'Critical') and not self._queue_contains({'Items': []}, 'powr'):
+            act = try_queue('powr')
+            if act is not None:
+                self.action_history.append(act)
+                return act
+
+        # Economy-driven building
+        if cash < 2000:
+            act = try_queue('proc')
+            if act is not None:
+                self.action_history.append(act)
+                return act
         else:
-            # Move randomly
-            action = np.array([
-                0,  # Move action
-                random.randint(0, min(my_units-1, 99)) if my_units > 0 else 0,
-                random.randint(0, 127),  # Random X
-                random.randint(0, 127),  # Random Y
-                0, 0
-            ])
-        
+            # Build barracks if under cap
+            if barr_count < 4:
+                # Prefer tent then barr depending on faction availability
+                act = try_queue('tent') or try_queue('barr')
+                if act is not None:
+                    self.action_history.append(act)
+                    return act
+
+        # 5) After barracks count >= 1, constantly produce infantry (e1)
+        if self._have_building(info, ['tent', 'barr']):
+            # Always attempt to queue e1 if any barracks queue can build it
+            for q in queues:
+                buildable = [b.get('Name') for b in (q.get('Buildable', []) or [])]
+                if 'e1' in buildable and cash >= 100:
+                    unit_idx = self._find_queue_index_by_id(info, q.get('ActorId', 0))
+                    action = self._action('produce', unit_idx=unit_idx, unit_type_name='e1')
+                    self.action_history.append(action)
+                    return action
+
+        # 6) If we have ongoing production but nothing to place yet, wait
+        for q in queues:
+            items = q.get('Items', []) or []
+            if any((not it.get('Done', False)) for it in items):
+                action = self._action('noop')
+                self.action_history.append(action)
+                return action
+
+        # Fallback: idle (no-op move to current position of first unit if exists)
+        if my_units_list:
+            u0 = my_units_list[0]
+            action = self._action('noop')
+        else:
+            action = self._action('noop')
+
         self.action_history.append(action)
         return action
 
@@ -86,7 +243,12 @@ def agent_example():
     """Example with a simple AI agent"""
     print("🤖 Starting simple agent example...")
     
-    env = create_simple_combat_env()
+    # Enable full action set including noop/produce/build/deploy
+    env = OpenRAEnvironment(
+        api_port=8082,
+        observation_type="vector",
+        enable_actions=['noop', 'move', 'attack', 'produce', 'build', 'deploy']
+    )
     agent = SimpleAgent(env)
     
     try:
@@ -100,6 +262,18 @@ def agent_example():
             
             for step in range(100):  # Max 100 steps per episode
                 action = agent.select_action(observation, info)
+                # Print selected action each step
+                try:
+                    atype_idx = int(action[0])
+                    atype = env.action_types[atype_idx] if 0 <= atype_idx < len(env.action_types) else str(atype_idx)
+                    unit_idx = int(action[1])
+                    tx, ty = int(action[2]), int(action[3])
+                    target_idx = int(action[4])
+                    utype_idx = int(action[5])
+                    utype_name = env.reverse_unit_types.get(utype_idx, str(utype_idx))
+                    print(f"  Step {step} action: type={atype}, unit_idx={unit_idx}, target=({tx},{ty}), target_idx={target_idx}, unit_type={utype_name}")
+                except Exception:
+                    print(f"  Step {step} action (raw): {action}")
                 observation, reward, terminated, truncated, info = env.step(action)
                 
                 episode_reward += reward
@@ -277,6 +451,44 @@ def custom_reward_example():
         print(f"❌ Error during custom reward example: {e}")
 
 
+def build_with_placeable_example():
+    """Example: read Production + PlaceableAreas, then build a structure at a valid cell."""
+    print("🏗️ Starting build-with-placeable example...")
+    env = OpenRAEnvironment(api_port=8082, observation_type="vector", enable_actions=['move','attack','produce','build','deploy'])
+    try:
+        obs, info = env.reset()
+        prod = info.get('production', {})
+        # Pick a queue that has finished items
+        target_q = None
+        target_build = None
+        for q in prod.get('Queues', []):
+            # Look for finished items in Items
+            for it in q.get('Items', []):
+                if it.get('Done') and it.get('Item'):
+                    target_q = q
+                    target_build = it['Item']
+                    break
+            if target_q:
+                break
+        if not target_q or not target_build:
+            print("No finished build items found; try queueing production first.")
+            return
+        # Lookup placeable area for this unit type
+        placeable = info.get('placeable_areas', {})
+        coords = placeable.get(target_build, [])
+        if not coords:
+            print("No valid placement cells for", target_build)
+            return
+        tx, ty = coords[0]
+        # Build action: [action_type(build), unit_idx(any my unit index mapped to producer), tx, ty, target_id, unit_type_idx]
+        # We will pass unit_idx=0 and rely on server ActorId mapping by selecting the right ActorId in env (advanced users can add producer mapping)
+        unit_type_idx = next((idx for idx, name in env.reverse_unit_types.items() if name == target_build), 0)
+        action = np.array([env.action_types.index('build'), 0, tx, ty, 0, unit_type_idx], dtype=np.int64)
+        obs, reward, terminated, truncated, info = env.step(action)
+        print("Issued build for", target_build, "at", (tx, ty), "reward=", reward)
+    finally:
+        env.close()
+
 if __name__ == "__main__":
     print("🎮 OpenRA RL Environment Examples")
     print("=" * 50)
@@ -286,7 +498,8 @@ if __name__ == "__main__":
         ("Simple Agent", agent_example),
         ("Stable-Baselines3 Training", sb3_training_example),
         ("Visual Environment", visual_example),
-        ("Custom Reward Shaping", custom_reward_example)
+        ("Custom Reward Shaping", custom_reward_example),
+        ("Build using PlaceableAreas", build_with_placeable_example)
     ]
     
     while True:

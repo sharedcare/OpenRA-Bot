@@ -43,7 +43,6 @@ class GameState:
     tick: int
     my_units: List[ActorInfo]
     enemy_units: List[ActorInfo]
-    ally_units: List[ActorInfo] = field(default_factory=list)
     cash: int
     resources: int
     resource_capacity: int
@@ -52,8 +51,10 @@ class GameState:
     power_state: str
     map_width: int
     map_height: int
+    ally_units: List[ActorInfo] = field(default_factory=list)
     resource_cells: List[ResourceCell] = field(default_factory=list)
     production: Dict = field(default_factory=dict)
+    placeable_areas: Dict[str, List[Tuple[int, int]]] = field(default_factory=dict)
 
 
 class OpenRAEnvironment(gym.Env):
@@ -83,7 +84,8 @@ class OpenRAEnvironment(gym.Env):
         self.max_episode_steps = max_episode_steps
         self.observation_type = observation_type
         # Configure enabled actions (reduced set by default)
-        default_actions = ['move', 'attack', 'deploy']
+        # Include a 'noop' that performs no action, useful while waiting for production to complete
+        default_actions = ['noop', 'move', 'attack', 'deploy']
         self.action_types: List[str] = enable_actions if enable_actions else default_actions
         
         # API endpoints
@@ -103,9 +105,27 @@ class OpenRAEnvironment(gym.Env):
         self.ws_connected = False
         
         # Unit type mappings (game-specific)
+        # Include RA actor codes needed by build/produce API (powr, proc, tent/barr, fact, mcv, e1)
+        # Additional entries remain for generic categories; unknown types default to 0
         self.unit_types = {
-            'infantry': 0, 'tank': 1, 'artillery': 2, 'aircraft': 3,
-            'barracks': 4, 'factory': 5, 'power_plant': 6, 'refinery': 7
+            # Buildings
+            'powr': 0,        # Power Plant
+            'proc': 1,        # Refinery
+            'tent': 2,        # Allied Barracks (RA)
+            'barr': 3,        # Soviet Barracks (RA)
+            'fact': 4,        # Construction Yard
+            # Vehicles / Units
+            'mcv': 5,
+            'e1': 6,          # Rifle Infantry (RA)
+            # Generic fallbacks (kept for compatibility in observations)
+            'infantry': 7,
+            'tank': 8,
+            'artillery': 9,
+            'aircraft': 10,
+            'barracks': 11,
+            'factory': 12,
+            'power_plant': 13,
+            'refinery': 14,
         }
         self.reverse_unit_types = {v: k for k, v in self.unit_types.items()}
         
@@ -115,6 +135,10 @@ class OpenRAEnvironment(gym.Env):
         # ID mappings between action indices and actual ActorId
         self._my_unit_ids = []
         self._enemy_unit_ids = []
+        self._queue_actor_ids = []
+        # Recent action deduplication (avoid re-sending identical actions while animations complete)
+        self._recent_actions = deque(maxlen=256)
+        self._action_ttl_steps = 8  # skip identical actions for this many env steps
         
         # Connect to game
         self._connect()
@@ -352,6 +376,30 @@ class OpenRAEnvironment(gym.Env):
                     except Exception:
                         continue
             
+            # Parse placeable areas (optional)
+            placeable_areas: Dict[str, List[Tuple[int, int]]] = {}
+            for entry in data.get('PlaceableAreas', []) or []:
+                try:
+                    unit_type = entry.get('UnitType', '')
+                    cells = entry.get('Cells', []) or []
+                    coords = [(c['X'], c['Y']) for c in cells]
+                    if unit_type:
+                        if unit_type not in placeable_areas:
+                            placeable_areas[unit_type] = []
+                        placeable_areas[unit_type].extend(coords)
+                except Exception:
+                    continue
+
+            # Cache production queue actor ids for action resolution
+            self._queue_actor_ids = []
+            try:
+                for q in (data.get('Production', {}) or {}).get('Queues', []) or []:
+                    aid = q.get('ActorId')
+                    if isinstance(aid, int):
+                        self._queue_actor_ids.append(aid)
+            except Exception:
+                self._queue_actor_ids = []
+
             return GameState(
                 tick=data['Tick'],
                 my_units=my_units,
@@ -366,7 +414,8 @@ class OpenRAEnvironment(gym.Env):
                 map_width=data['MapSize']['X'],
                 map_height=data['MapSize']['Y'],
                 resource_cells=resource_cells,
-                production=data.get('Production', {})
+                production=data.get('Production', {}),
+                placeable_areas=placeable_areas
             )
             
         except Exception as e:
@@ -394,19 +443,23 @@ class OpenRAEnvironment(gym.Env):
                 "TargetId": int(self._resolve_enemy_unit_id(target_id))
             })
         
-        elif atype == 'produce':  # Produce
+        elif atype == 'noop':  # No operation
+            # Intentionally do nothing
+            pass
+        
+        elif atype == 'produce':  # Produce (queue actor index)
             unit_type_name = self.reverse_unit_types.get(unit_type, 'infantry')
             actions.append({
                 "Type": "produce",
-                "ActorId": int(self._resolve_my_unit_id(unit_id)),
+                "ActorId": int(self._resolve_queue_actor_id(unit_id)),
                 "UnitType": unit_type_name
             })
         
-        elif atype == 'build':  # Build
+        elif atype == 'build':  # Build (queue actor index)
             unit_type_name = self.reverse_unit_types.get(unit_type, 'barracks')
             actions.append({
                 "Type": "build",
-                "ActorId": int(self._resolve_my_unit_id(unit_id)),
+                "ActorId": int(self._resolve_queue_actor_id(unit_id)),
                 "UnitType": unit_type_name,
                 "TargetX": int(target_x),
                 "TargetY": int(target_y)
@@ -419,6 +472,15 @@ class OpenRAEnvironment(gym.Env):
             })
 
         if actions:
+            # Deduplicate actions: skip any that match a recent signature within TTL
+            deduped = []
+            for a in actions:
+                sig = self._action_signature(a)
+                if not self._is_duplicate_action(sig):
+                    deduped.append(a)
+            actions = deduped
+
+        if actions:
             try:
                 response = requests.post(
                     f"{self.api_base}/actions",
@@ -427,8 +489,37 @@ class OpenRAEnvironment(gym.Env):
                 )
                 if response.status_code != 200:
                     print(f"Action execution failed: {response.text}")
+                else:
+                    # Record successfully sent actions
+                    for a in actions:
+                        self._record_action(self._action_signature(a))
             except Exception as e:
                 print(f"Failed to execute action: {e}")
+
+    def _action_signature(self, a: Dict) -> Tuple:
+        """Create a normalized signature for an action dict to support deduplication."""
+        return (
+            a.get('Type', ''),
+            int(a.get('ActorId', -1)),
+            int(a.get('TargetX', -1)),
+            int(a.get('TargetY', -1)),
+            int(a.get('TargetId', -1)),
+            str(a.get('UnitType', '')),
+        )
+
+    def _is_duplicate_action(self, sig: Tuple) -> bool:
+        """Return True if an equivalent action was sent within the TTL steps."""
+        now = self.step_count
+        # Purge expired
+        self._recent_actions = deque([(s, t) for (s, t) in self._recent_actions if now - t <= self._action_ttl_steps], maxlen=256)
+        for s, t in self._recent_actions:
+            if s == sig:
+                return True
+        return False
+
+    def _record_action(self, sig: Tuple):
+        now = self.step_count
+        self._recent_actions.append((sig, now))
 
     def _get_action_mask(self) -> Dict[str, np.ndarray]:
         """Compute a simple action mask over the configured action set.
@@ -441,6 +532,7 @@ class OpenRAEnvironment(gym.Env):
         max_units = 100
         my_units = self.current_state.my_units if self.current_state else []
         enemy_units = self.current_state.enemy_units if self.current_state else []
+        queue_ids = self._queue_actor_ids if hasattr(self, '_queue_actor_ids') else []
 
         move_mask = np.zeros((max_units,), dtype=np.uint8)
         deploy_mask = np.zeros((max_units,), dtype=np.uint8)
@@ -464,9 +556,21 @@ class OpenRAEnvironment(gym.Env):
             'deploy_mask': deploy_mask,
         }
         if 'produce' in self.action_types:
-            mask['produce_mask'] = move_mask.copy()
+            # Enable indices that correspond to existing production queues
+            produce_mask = np.zeros((max_units,), dtype=np.uint8)
+            n = min(len(queue_ids), max_units)
+            if n > 0:
+                produce_mask[:n] = 1
+            mask['produce_mask'] = produce_mask
         if 'build' in self.action_types:
-            mask['build_mask'] = move_mask.copy()
+            # Enable queue indices if any placeable items exist (heuristic)
+            build_mask = np.zeros((max_units,), dtype=np.uint8)
+            has_any_placeable = bool(self.current_state and self.current_state.placeable_areas)
+            if has_any_placeable:
+                n = min(len(queue_ids), max_units)
+                if n > 0:
+                    build_mask[:n] = 1
+            mask['build_mask'] = build_mask
 
         return mask
 
@@ -483,6 +587,13 @@ class OpenRAEnvironment(gym.Env):
             return int(index)
         i = int(max(0, min(index, len(self._enemy_unit_ids) - 1)))
         return self._enemy_unit_ids[i]
+
+    def _resolve_queue_actor_id(self, index: int) -> int:
+        """Map index to a production queue actor ActorId; clamp if out of range."""
+        if not getattr(self, '_queue_actor_ids', None):
+            return self._resolve_my_unit_id(index)
+        i = int(max(0, min(index, len(self._queue_actor_ids) - 1)))
+        return self._queue_actor_ids[i]
     
     def _state_to_observation(self, state: GameState) -> np.ndarray:
         """Convert game state to observation vector/image"""
@@ -674,7 +785,23 @@ class OpenRAEnvironment(gym.Env):
             'enemy_unit_count': len(self.current_state.enemy_units),
             'cash': self.current_state.cash,
             'power_state': self.current_state.power_state,
-            'production': self.current_state.production
+            'production': self.current_state.production,
+            # Expose additional details to enable rule-based logic
+            'placeable_areas': self.current_state.placeable_areas,
+            'my_units': [
+                {
+                    'id': u.id,
+                    'type': u.type,
+                    'x': u.x,
+                    'y': u.y,
+                    'is_idle': u.is_idle,
+                }
+                for u in self.current_state.my_units
+            ],
+            # Mapping from unit index -> ActorId used by the environment
+            'my_unit_ids': self._my_unit_ids[:],
+            # Mapping from queue index -> ActorId for production/build actions
+            'queue_actor_ids': self._queue_actor_ids[:],
         }
     
     def close(self):

@@ -6,7 +6,7 @@ A Gymnasium-compatible Python interface and an in-engine C# bridge for training 
 
 - Gymnasium-compatible API (reset/step/close with `observation, reward, terminated, truncated, info`)
 - Vector and image observations
-- Action space covering move, attack, and produce (build is stubbed for now)
+- Action space covering move, attack, produce, build, deploy
 - Real-time updates via HTTP long-polling (`/api/gamestate/stream`)
 - Examples for random play, a simple rule-based agent, and Stable-Baselines3
 
@@ -84,7 +84,8 @@ model.save("openra_ppo_agent")
 
 - `GET  /api/gamestate` – current state (units/resources/power/map)
 - `GET  /api/gamestate/stream` – long-polling for real-time updates/events
-- `POST /api/actions` – execute actions (JSON array). Supported: `move`, `attack`, `produce`
+- `POST /api/actions` – execute actions (JSON array). Supported: `move`, `attack`, `produce`, `build`, `deploy`, `cancel`
+  - Returns `{ success: boolean, results: [{ index, type, success, error }] }`
 - `POST /api/reset` – reset episode (clears queued orders; map reload not guaranteed)
 
 Example curl:
@@ -141,6 +142,8 @@ curl -X POST http://localhost:8081/api/actions \
       - `ActorId`, `Type` (e.g., Building/Infantry/Vehicle), `Group`, `Enabled`
       - `Items[]`: `{ Item, Cost, Progress(0-100), Paused, Done }`
       - `Buildable[]`: `{ Name, Cost }`
+  - `PlaceableAreas[]`: legal placement cells for finished building items
+    - Per entry: `{ ActorId, UnitType, Cells: [{X,Y}, ...] }`
 
 ### Actions (MultiDiscrete)
 - Layout: `[action_type, unit_idx, target_x, target_y, target_idx, unit_type_idx]`
@@ -151,7 +154,7 @@ curl -X POST http://localhost:8081/api/actions \
   - `move`: uses `unit_idx`, `target_x`, `target_y`
   - `attack`: uses `unit_idx`, `target_idx`
   - `produce`: uses `unit_idx` (producer building), `unit_type_idx` (maps to unit type name)
-  - `build`: uses `unit_idx` (builder), `unit_type_idx`, `target_x`, `target_y` (note: server-side build handler is a stub)
+  - `build`: uses `unit_idx` (queue actor idx), `unit_type_idx`, `target_x`, `target_y`
   - `deploy`: uses `unit_idx`（e.g., MCV deploy）
 
 #### Action mask (provided in `info['action_mask']`)
@@ -160,7 +163,8 @@ curl -X POST http://localhost:8081/api/actions \
   - `move_mask`: `(100,)`
   - `attack_mask`: `(100, 100)`
   - `deploy_mask`: `(100,)`
-  - If enabled: `produce_mask`, `build_mask` (currently alias `move_mask`)
+  - If enabled: `produce_mask`
+  - `build_mask`: `(100,)` enabled when there exists any legal placement derived from `PlaceableAreas`
 - Note: This is a lightweight, heuristic mask to reduce invalid samples. Engine-side checks still apply.
 
 ## Configuration
