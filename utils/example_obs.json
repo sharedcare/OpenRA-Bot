@@ -1,0 +1,393 @@
+{
+    "Tick": 29049,
+    "MyUnits": [
+        {
+            "Id": 223,
+            "Type": "fact",
+            "Position": {
+                "X": 91,
+                "Y": 47
+            },
+            "Health": 150000,
+            "MaxHealth": 150000,
+            "IsIdle": true
+        },
+        {
+            "Id": 226,
+            "Type": "powr",
+            "Position": {
+                "X": 95,
+                "Y": 50
+            },
+            "Health": 40000,
+            "MaxHealth": 40000,
+            "IsIdle": true
+        }
+    ],
+    "EnemyUnits": [
+        {
+            "Id": 212,
+            "Type": "fact",
+            "Position": {
+                "X": 35,
+                "Y": 47
+            },
+            "Health": 150000,
+            "MaxHealth": 150000,
+            "IsIdle": false
+        }
+    ],
+    "AllyUnits": [],
+    "Resources": {
+        "Cash": 4566,
+        "Resources": 0,
+        "ResourceCapacity": 0
+    },
+    "Power": {
+        "Provided": 100,
+        "Drained": 0,
+        "State": "Normal"
+    },
+    "MapSize": {
+        "X": 130,
+        "Y": 74
+    },
+    "Map": {
+        "Tileset": "SNOW",
+        "Bounds": {
+            "X": 1,
+            "Y": 1,
+            "Width": 128,
+            "Height": 72
+        },
+        "ResourceCells": [
+            {
+                "X": 60,
+                "Y": 2,
+                "Type": "Ore",
+                "Density": 3
+            },
+            {
+                "X": 61,
+                "Y": 2,
+                "Type": "Ore",
+                "Density": 12
+            },
+            ...
+            {
+                "X": 85,
+                "Y": 71,
+                "Type": "Gems",
+                "Density": 2
+            },
+            {
+                "X": 87,
+                "Y": 71,
+                "Type": "Gems",
+                "Density": 2
+            },
+            ...
+        ]
+    },
+    "Production": {
+        "Queues": [
+            {
+                "ActorId": 4,
+                "Type": "Building",
+                "Group": null,
+                "Enabled": true,
+                "Items": [
+                    {
+                        "Item": "proc",
+                        "Cost": 1400,
+                        "Progress": 100,
+                        "Paused": false,
+                        "Done": true
+                    },
+                    {
+                        "Item": "powr",
+                        "Cost": 300,
+                        "Progress": 0,
+                        "Paused": false,
+                        "Done": false
+                    }
+                ],
+                "Buildable": [
+                    {
+                        "Name": "syrd",
+                        "Cost": 1000
+                    },
+                    {
+                        "Name": "proc",
+                        "Cost": 1400
+                    },
+                    {
+                        "Name": "powr",
+                        "Cost": 300
+                    },
+                    {
+                        "Name": "tent",
+                        "Cost": 500
+                    }
+                ]
+            },
+            {
+                "ActorId": 4,
+                "Type": "Defense",
+                "Group": null,
+                "Enabled": true,
+                "Items": [
+                    {
+                        "Item": "brik",
+                        "Cost": 200,
+                        "Progress": 100,
+                        "Paused": false,
+                        "Done": true
+                    }
+                ],
+                "Buildable": [
+                    {
+                        "Name": "sbag",
+                        "Cost": 30
+                    },
+                    {
+                        "Name": "brik",
+                        "Cost": 200
+                    }
+                ]
+            }
+        ]
+    },
+    "PlaceableAreas": [
+        {
+            "ActorId": 4,
+            "UnitType": "powr",
+            "Cells": [
+                {
+                    "X": 88,
+                    "Y": 43
+                },
+                {
+                    "X": 89,
+                    "Y": 43
+                },
+                {
+                    "X": 90,
+                    "Y": 43
+                },
+                {
+                    "X": 91,
+                    "Y": 43
+                },
+                {
+                    "X": 92,
+                    "Y": 43
+                },
+                {
+                    "X": 93,
+                    "Y": 43
+                },
+                {
+                    "X": 94,
+                    "Y": 43
+                },
+                {
+                    "X": 95,
+                    "Y": 43
+                },
+                {
+                    "X": 88,
+                    "Y": 44
+                },
+                {
+                    "X": 89,
+                    "Y": 44
+                },
+                {
+                    "X": 90,
+                    "Y": 44
+                },
+                {
+                    "X": 91,
+                    "Y": 44
+                },
+                {
+                    "X": 92,
+                    "Y": 44
+                },
+                {
+                    "X": 93,
+                    "Y": 44
+                },
+                {
+                    "X": 94,
+                    "Y": 44
+                },
+                {
+                    "X": 95,
+                    "Y": 44
+                },
+                {
+                    "X": 88,
+                    "Y": 45
+                },
+                {
+                    "X": 89,
+                    "Y": 45
+                },
+                {
+                    "X": 94,
+                    "Y": 45
+                },
+                {
+                    "X": 95,
+                    "Y": 45
+                },
+                {
+                    "X": 88,
+                    "Y": 46
+                },
+                {
+                    "X": 89,
+                    "Y": 46
+                },
+                {
+                    "X": 94,
+                    "Y": 46
+                },
+                {
+                    "X": 95,
+                    "Y": 46
+                },
+                {
+                    "X": 88,
+                    "Y": 47
+                },
+                {
+                    "X": 89,
+                    "Y": 47
+                },
+                {
+                    "X": 94,
+                    "Y": 47
+                },
+                {
+                    "X": 95,
+                    "Y": 47
+                },
+                {
+                    "X": 88,
+                    "Y": 48
+                },
+                {
+                    "X": 89,
+                    "Y": 48
+                },
+                {
+                    "X": 94,
+                    "Y": 48
+                },
+                {
+                    "X": 95,
+                    "Y": 48
+                },
+                {
+                    "X": 88,
+                    "Y": 49
+                },
+                {
+                    "X": 89,
+                    "Y": 49
+                },
+                {
+                    "X": 94,
+                    "Y": 49
+                },
+                {
+                    "X": 95,
+                    "Y": 49
+                },
+                {
+                    "X": 88,
+                    "Y": 50
+                },
+                {
+                    "X": 89,
+                    "Y": 50
+                },
+                {
+                    "X": 94,
+                    "Y": 50
+                },
+                {
+                    "X": 95,
+                    "Y": 50
+                },
+                {
+                    "X": 88,
+                    "Y": 51
+                },
+                {
+                    "X": 89,
+                    "Y": 51
+                },
+                {
+                    "X": 90,
+                    "Y": 51
+                },
+                {
+                    "X": 91,
+                    "Y": 51
+                },
+                {
+                    "X": 92,
+                    "Y": 51
+                },
+                {
+                    "X": 93,
+                    "Y": 51
+                },
+                {
+                    "X": 94,
+                    "Y": 51
+                },
+                {
+                    "X": 95,
+                    "Y": 51
+                },
+                {
+                    "X": 88,
+                    "Y": 52
+                },
+                {
+                    "X": 89,
+                    "Y": 52
+                },
+                {
+                    "X": 90,
+                    "Y": 52
+                },
+                {
+                    "X": 91,
+                    "Y": 52
+                },
+                {
+                    "X": 92,
+                    "Y": 52
+                },
+                {
+                    "X": 93,
+                    "Y": 52
+                },
+                {
+                    "X": 94,
+                    "Y": 52
+                },
+                {
+                    "X": 95,
+                    "Y": 52
+                }
+            ]
+        }
+    ]
+}

@@ -49,6 +49,15 @@ namespace OpenRA
 		public int NetFrame;
 		public int LocalFrame;
 		public RLActor[] Actors;
+		public RLResourceCell[] Resources;
+	}
+
+	public sealed class RLResourceCell
+	{
+		public int CellX;
+		public int CellY;
+		public int TypeIndex;
+		public int Density;
 	}
 
 	/// <summary>
@@ -112,6 +121,79 @@ namespace OpenRA
 			Game.StartGame(preview.ToMap(), WorldType.Regular);
 		}
 
+		// Start local game with option to add a built-in bot opponent before the world starts
+		public static void StartLocalGame(string modId, string mapUid, string binDir, bool addBotOpponent, string botType = null, string botSlotId = null)
+		{
+			EnsureInitialized();
+
+			var desiredBinDir = string.IsNullOrEmpty(binDir) ?
+				Path.GetFullPath(Path.GetDirectoryName(typeof(PythonAPI).Assembly.Location) ?? ".") :
+				Path.GetFullPath(binDir);
+			var engineDir = Directory.GetParent(desiredBinDir)?.FullName ?? desiredBinDir;
+
+			try { AppDomain.CurrentDomain.SetData("APP_CONTEXT_BASE_DIRECTORY", desiredBinDir); } catch { }
+
+			if (Game.Mods == null || Game.ModData == null || Game.ModData.Manifest.Id != modId)
+			{
+				var args = new Arguments($"Game.Mod={modId}", $"Engine.EngineDir={engineDir}");
+				typeof(Game).GetMethod("Initialize", BindingFlags.NonPublic | BindingFlags.Static)
+					.Invoke(null, [args]);
+			}
+
+			JoinLocalIfNeeded();
+			EnsurePlayableAgent(mapUid, null);
+
+			if (addBotOpponent)
+				TryAddLocalBotOpponent(botType, botSlotId);
+
+			var preview = Game.ModData.MapCache[mapUid];
+			if (preview.Status != MapStatus.Available)
+				throw new InvalidOperationException($"Invalid map uid: {mapUid}");
+
+			Game.StartGame(preview.ToMap(), WorldType.Regular);
+		}
+
+		static void TryAddLocalBotOpponent(string botType, string botSlotId)
+		{
+			var om = Game.OrderManager;
+			if (om == null)
+				return;
+
+			var lobby = om.LobbyInfo;
+			var localId = Game.LocalClientId;
+			var controller = lobby.Clients.FirstOrDefault(c => c.Index == localId) ?? lobby.Clients.FirstOrDefault();
+			if (controller == null)
+				return;
+
+			controller.IsAdmin = true; // ensure Game.IsHost so bot logic enables
+
+			var slotId = string.IsNullOrEmpty(botSlotId) ? "Multi1" : botSlotId;
+			if (!lobby.Slots.ContainsKey(slotId))
+				lobby.Slots[slotId] = new Session.Slot { PlayerReference = slotId, AllowBots = true };
+
+			var bt = botType;
+			if (string.IsNullOrEmpty(bt))
+				bt = GetBotTypes().FirstOrDefault();
+			if (string.IsNullOrEmpty(bt))
+				return;
+
+			var nextIndex = lobby.Clients.Count == 0 ? 1 : lobby.Clients.Max(c => c.Index) + 1;
+			lobby.Clients.Add(new Session.Client
+			{
+				Index = nextIndex,
+				Name = "AI",
+				PreferredColor = controller.PreferredColor,
+				Color = controller.Color,
+				Faction = "Random",
+				SpawnPoint = 0,
+				Team = 0,
+				State = Session.ClientState.Ready,
+				Slot = slotId,
+				Bot = bt,
+				BotControllerClientIndex = controller.Index
+			});
+		}
+
 		// Ensure a playable client is bound to a playable slot for the given map
 		public static void EnsurePlayableAgent(string mapUid, string slotId)
 		{
@@ -173,14 +255,21 @@ namespace OpenRA
 			if (om == null || om.World == null)
 				return false;
 
-			// Immediate network/connection maintenance
+			// Phase 1: receive anything from previous frame
 			om.TickImmediate();
 
 			var world = om.World;
 			var willTick = om.TryTick();
+			if (!willTick)
+			{
+				// Phase 2: for local echo connections, orders sent during TryTick() are only
+				// received on the next TickImmediate() — flush once more, then retry.
+				om.TickImmediate();
+				willTick = om.TryTick();
+			}
+
 			if (willTick)
 			{
-				// Run unsynced order generator tick and world tick
 				Sync.RunUnsynced(world, () => world.OrderGenerator.Tick(world));
 				world.Tick();
 			}
@@ -333,12 +422,36 @@ namespace OpenRA
 				});
 			}
 
+			// Build resource snapshot from map binary layer (type index + density)
+			var resourceCells = new List<RLResourceCell>();
+			var map = world.Map;
+			var restrictToVisibility = localPlayer != null;
+			foreach (var c in map.AllCells)
+			{
+				if (restrictToVisibility && !localPlayer.Shroud.IsVisible(c))
+					continue;
+
+				var uv = c.ToMPos(map);
+				var rt = map.Resources[uv];
+				if (rt.Type == 0 || rt.Index == 0)
+					continue;
+
+				resourceCells.Add(new RLResourceCell
+				{
+					CellX = c.X,
+					CellY = c.Y,
+					TypeIndex = rt.Type,
+					Density = rt.Index
+				});
+			}
+
 			return new RLState
 			{
 				WorldTick = world.WorldTick,
 				NetFrame = Game.NetFrameNumber,
 				LocalFrame = Game.LocalTick,
-				Actors = list.ToArray()
+				Actors = list.ToArray(),
+				Resources = resourceCells.ToArray()
 			};
 		}
 
@@ -392,8 +505,7 @@ namespace OpenRA
 			return false;
 		}
 
-		// --- Remote server join + lobby helpers for pythonnet ---
-
+		// Remote server join + lobby helpers for pythonnet
 		public static bool JoinServer(string modId, string host, int port, string password = "", string binDir = null)
 		{
 			EnsureInitialized();
@@ -417,6 +529,126 @@ namespace OpenRA
 			return true;
 		}
 
+		// Get current connection state
+		public static string GetConnectionState()
+		{
+			var om = Game.OrderManager;
+			if (om?.Connection is NetworkConnection nc)
+				return nc.ConnectionState.ToString();
+			return "NotConnected";
+		}
+
+		// Check if connected to lobby
+		public static bool IsConnectedToLobby()
+		{
+			var om = Game.OrderManager;
+			if (om?.Connection is NetworkConnection nc)
+			{
+				// Consider lobby connected when the transport is connected and we have lobby info that includes ourselves
+				if (nc.ConnectionState != ConnectionState.Connected || om.LobbyInfo == null)
+					return false;
+
+				return om.LocalClient != null; // validated and added to LobbyInfo
+			}
+
+			return false;
+		}
+
+		// Get lobby information as a dictionary-like structure
+		public static Dictionary<string, object> GetLobbyInfo()
+		{
+			var om = Game.OrderManager;
+			if (om?.LobbyInfo == null)
+				return [];
+
+			var lobby = om.LobbyInfo;
+			var result = new Dictionary<string, object>
+			{
+				["ServerName"] = lobby.GlobalSettings.ServerName ?? "",
+				["Map"] = lobby.GlobalSettings.Map ?? "",
+				["MapStatus"] = lobby.GlobalSettings.MapStatus.ToString(),
+				["AllowSpectators"] = lobby.GlobalSettings.AllowSpectators,
+				["GameUid"] = lobby.GlobalSettings.GameUid ?? "",
+				["Dedicated"] = lobby.GlobalSettings.Dedicated
+			};
+
+			// Add clients info
+			var clients = new List<Dictionary<string, object>>();
+			foreach (var client in lobby.Clients)
+			{
+				clients.Add(new Dictionary<string, object>
+				{
+					["Index"] = client.Index,
+					["Name"] = client.Name ?? "",
+					["State"] = client.State.ToString(),
+					["Slot"] = client.Slot ?? "",
+					["IsAdmin"] = client.IsAdmin,
+					["IsObserver"] = client.IsObserver,
+					["IsBot"] = client.IsBot,
+					["Team"] = client.Team,
+					["Faction"] = client.Faction ?? "",
+					["Color"] = client.Color.ToArgb()
+				});
+			}
+
+			result["Clients"] = clients;
+
+			// Add slots info
+			var slots = new Dictionary<string, object>();
+			foreach (var slot in lobby.Slots)
+			{
+				slots[slot.Key] = new Dictionary<string, object>
+				{
+					["PlayerReference"] = slot.Value.PlayerReference ?? "",
+					["Closed"] = slot.Value.Closed,
+					["AllowBots"] = slot.Value.AllowBots,
+					["LockFaction"] = slot.Value.LockFaction,
+					["LockColor"] = slot.Value.LockColor,
+					["LockTeam"] = slot.Value.LockTeam,
+					["Required"] = slot.Value.Required
+				};
+			}
+
+			result["Slots"] = slots;
+
+			return result;
+		}
+
+		// Wait for connection to be established (with timeout)
+		public static bool WaitForConnection(int timeoutMs = 10000)
+		{
+			var startTime = Game.RunTime;
+			while (Game.RunTime - startTime < timeoutMs)
+			{
+				// Process network messages
+				Game.OrderManager?.TickImmediate();
+
+				if (IsConnectedToLobby())
+					return true;
+
+				// Check for connection errors
+				var om = Game.OrderManager;
+				if (om?.Connection is NetworkConnection nc && nc.ConnectionState == ConnectionState.NotConnected)
+				{
+					if (!string.IsNullOrEmpty(nc.ErrorMessage))
+						throw new InvalidOperationException($"Connection failed: {nc.ErrorMessage}");
+					return false;
+				}
+
+				// Small delay to avoid busy waiting
+				System.Threading.Thread.Sleep(50);
+			}
+
+			return false;
+		}
+
+		public static void SetNetworkConnectTimeout(int milliseconds)
+		{
+			if (milliseconds < 100)
+				milliseconds = 100;
+			NetworkConnection.ConnectTimeoutMs = milliseconds;
+		}
+
 		public static void CreateAndStartLocalServer(string modId, string mapUid, string binDir)
 		{
 			CreateAndStartLocalServer(modId, mapUid, binDir, (string[])null);
@@ -437,7 +669,7 @@ namespace OpenRA
 			{
 				var args = new Arguments($"Game.Mod={modId}", $"Engine.EngineDir={engineDir}");
 				typeof(Game).GetMethod("Initialize", BindingFlags.NonPublic | BindingFlags.Static)
-					.Invoke(null, new object[] { args });
+					.Invoke(null, [args]);
 			}
 
 			var orders = new List<Order>();
@@ -483,7 +715,113 @@ namespace OpenRA
 			if (om == null)
 				return;
 			var state = ready ? Session.ClientState.Ready : Session.ClientState.Invalid;
-			om.IssueOrder(Order.Command("state " + state));
+			om.IssueOrder(Order.Command($"state {state}"));
+		}
+
+		public static string[] GetBotTypes()
+		{
+			var om = Game.OrderManager;
+			if (om == null || Game.ModData == null)
+				return [];
+
+			var uid = om.LobbyInfo?.GlobalSettings?.Map;
+			if (string.IsNullOrEmpty(uid))
+				return [];
+
+			var preview = Game.ModData.MapCache[uid];
+			var types = preview.PlayerActorInfo.TraitInfos<IBotInfo>().Select(t => t.Type).Where(t => t != null).Distinct().ToArray();
+			return types;
+		}
+
+		public static bool AddBotToSlot(string slotId, string botType = null)
+		{
+			var om = Game.OrderManager;
+			if (om == null || string.IsNullOrEmpty(slotId))
+				return false;
+
+			var lobby = om.LobbyInfo;
+			var controller = lobby.Clients.FirstOrDefault(c => c.IsAdmin) ?? lobby.Clients.FirstOrDefault();
+			if (controller == null)
+				return false;
+
+			var bt = botType;
+			if (string.IsNullOrEmpty(bt))
+				bt = GetBotTypes().FirstOrDefault();
+			if (string.IsNullOrEmpty(bt))
+				return false;
+
+			om.IssueOrder(Order.Command($"slot_bot {slotId} {controller.Index} {bt}"));
+			return true;
+		}
+
+		public static bool AddBotToFreeSlot(string botType = null)
+		{
+			var om = Game.OrderManager;
+			if (om == null)
+				return false;
+
+			var lobby = om.LobbyInfo;
+			foreach (var kv in lobby.Slots)
+			{
+				var key = kv.Key;
+				var slot = kv.Value;
+				if (slot.Closed)
+					continue;
+				if (!slot.AllowBots)
+					continue;
+				var c = lobby.ClientInSlot(key);
+				if (c == null || c.Bot != null)
+					return AddBotToSlot(key, botType);
+			}
+
+			return false;
+		}
+
+		public static void RemoveAllBots()
+		{
+			var om = Game.OrderManager;
+			if (om == null)
+				return;
+			var lobby = om.LobbyInfo;
+			foreach (var kv in lobby.Slots)
+			{
+				var c = lobby.ClientInSlot(kv.Key);
+				if (c != null && c.Bot != null)
+					om.IssueOrder(Order.Command("slot_open " + kv.Value.PlayerReference));
+			}
+		}
+
+		public static void StartGameFromLobby()
+		{
+			var om = Game.OrderManager;
+			if (om == null)
+				return;
+			om.IssueOrder(Order.Command("startgame"));
+		}
+
+		// Inform the server that we have the currently selected map by sending state=NotReady
+		// This mirrors the UI lobby logic that acknowledges map availability
+		public static bool TryAcknowledgeMap()
+		{
+			var om = Game.OrderManager;
+			if (om == null || om.LobbyInfo == null)
+				return false;
+
+			var uid = om.LobbyInfo.GlobalSettings.Map;
+			if (string.IsNullOrEmpty(uid))
+				return false;
+
+			var preview = Game.ModData?.MapCache?[uid];
+			if (preview == null)
+				return false;
+
+			if (preview.Status == MapStatus.Available)
+			{
+				om.IssueOrder(Order.Command($"state {Session.ClientState.NotReady}"));
+				return true;
+			}
+
+			return false;
 		}
 
 		public static void SetSpectator(bool spectate)

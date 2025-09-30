@@ -5,7 +5,7 @@ Demonstrates how to use the OpenRA environment for RL training
 
 import numpy as np
 import time
-from openra_env import OpenRAEnvironment, create_simple_combat_env, create_visual_env
+from envs.openra_env_http import OpenRAEnvironment, create_simple_combat_env, create_visual_env
 import random
 
 # Example 1: Basic environment interaction
