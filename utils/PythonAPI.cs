@@ -121,8 +121,10 @@ namespace OpenRA
 			Game.StartGame(preview.ToMap(), WorldType.Regular);
 		}
 
-		// Start local game with option to add a built-in bot opponent before the world starts
-		public static void StartLocalGame(string modId, string mapUid, string binDir, bool addBotOpponent, string botType = null, string botSlotId = null)
+		// Start local game with option to add a built-in bot opponent and set lobby options before the world starts
+		public static void StartLocalGame(string modId, string mapUid, string binDir,
+			bool addBotOpponent, string botType = null, string botSlotId = null,
+			bool? explored = null, bool? fog = null)
 		{
 			EnsureInitialized();
 
@@ -145,6 +147,22 @@ namespace OpenRA
 
 			if (addBotOpponent)
 				TryAddLocalBotOpponent(botType, botSlotId);
+
+			// Apply lobby options directly (update GlobalSettings) and also via order for parity
+			var om = Game.OrderManager;
+			if (om != null)
+			{
+				if (explored.HasValue)
+				{
+					SetLobbyBooleanOption("explored", explored.Value);
+					om.IssueOrder(Order.Command($"option explored {(explored.Value ? "True" : "False")}"));
+				}
+				if (fog.HasValue)
+				{
+					SetLobbyBooleanOption("fog", fog.Value);
+					om.IssueOrder(Order.Command($"option fog {(fog.Value ? "True" : "False")}"));
+				}
+			}
 
 			var preview = Game.ModData.MapCache[mapUid];
 			if (preview.Status != MapStatus.Available)
@@ -789,6 +807,23 @@ namespace OpenRA
 				if (c != null && c.Bot != null)
 					om.IssueOrder(Order.Command("slot_open " + kv.Value.PlayerReference));
 			}
+		}
+
+		// Directly set a lobby boolean option value in GlobalSettings
+		public static void SetLobbyBooleanOption(string id, bool value)
+		{
+			var om = Game.OrderManager;
+			if (om == null || om.LobbyInfo == null)
+				return;
+
+			var gs = om.LobbyInfo.GlobalSettings;
+			if (!gs.LobbyOptions.TryGetValue(id, out var state))
+			{
+				state = new Session.LobbyOptionState();
+				gs.LobbyOptions[id] = state;
+			}
+
+			state.Value = value ? "True" : "False";
 		}
 
 		public static void StartGameFromLobby()

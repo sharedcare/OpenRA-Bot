@@ -154,7 +154,7 @@ class OpenRAEnv(gym.Env):
         elif self.remote_host and self.remote_port:
             self._join_remote()
         else:
-            api.StartLocalGame(self.mod_id, self.map_uid, self.bin_dir)
+            api.StartLocalGame(self.mod_id, self.map_uid, self.bin_dir, addBotOpponent=True, explored=True, fog=False)
 
         obs = self._get_obs()
         self._last_obs = obs

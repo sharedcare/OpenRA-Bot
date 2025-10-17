@@ -20,11 +20,21 @@ def build_observation(openra: Dict[str, Any]) -> Dict[str, Any]:
             'available_orders': list(a.AvailableOrders) if getattr(a, 'AvailableOrders', None) is not None else [],
         })
 
+    resources: List[Dict[str, Any]] = []
+    for r in state.Resources:
+        resources.append({
+            'cell_x': int(r.CellX),
+            'cell_y': int(r.CellY),
+            'type_index': int(r.TypeIndex),
+            'density': int(r.Density),
+        })
+
     obs = {
         'world_tick': int(state.WorldTick),
         'net_frame': int(state.NetFrame),
         'local_frame': int(state.LocalFrame),
         'actors': actors,
+        'resources': resources,
     }
 
     my_owner = int(openra['Game'].LocalClientId)
