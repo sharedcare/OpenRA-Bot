@@ -66,6 +66,7 @@ namespace OpenRA
 	public static class PythonAPI
 	{
 		static bool initialized;
+		static int networkConnectTimeoutMs = 10000;
 
 		static void EnsureInitialized()
 		{
@@ -157,6 +158,7 @@ namespace OpenRA
 					SetLobbyBooleanOption("explored", explored.Value);
 					om.IssueOrder(Order.Command($"option explored {(explored.Value ? "True" : "False")}"));
 				}
+
 				if (fog.HasValue)
 				{
 					SetLobbyBooleanOption("fog", fog.Value);
@@ -243,6 +245,7 @@ namespace OpenRA
 			{
 				// Use same logic as Game.JoinLocal(), but it's internal. Recreate essential parts here.
 				var om = new OrderManager(new EchoConnection());
+
 				// Refresh static classes before the game starts
 				TextNotificationsManager.Clear();
 				UnitOrders.Clear();
@@ -635,8 +638,9 @@ namespace OpenRA
 		// Wait for connection to be established (with timeout)
 		public static bool WaitForConnection(int timeoutMs = 10000)
 		{
+			var effectiveTimeout = timeoutMs > 0 ? timeoutMs : networkConnectTimeoutMs;
 			var startTime = Game.RunTime;
-			while (Game.RunTime - startTime < timeoutMs)
+			while (Game.RunTime - startTime < effectiveTimeout)
 			{
 				// Process network messages
 				Game.OrderManager?.TickImmediate();
@@ -664,7 +668,7 @@ namespace OpenRA
 		{
 			if (milliseconds < 100)
 				milliseconds = 100;
-			NetworkConnection.ConnectTimeoutMs = milliseconds;
+			networkConnectTimeoutMs = milliseconds;
 		}
 
 		public static void CreateAndStartLocalServer(string modId, string mapUid, string binDir)
