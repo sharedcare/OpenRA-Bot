@@ -24,6 +24,8 @@ def ensure_engine(bin_dir: str) -> Dict[str, Any]:
         clr.AddReference('OpenRA.Game')  # type: ignore[attr-defined]
         clr.AddReference('OpenRA.Utility')  # type: ignore[attr-defined]
         clr.AddReference('OpenRA.Platforms.Default')  # type: ignore[attr-defined]
+        # # Load common mod traits to enable production/building inspection from Python
+        # clr.AddReference('OpenRA.Mods.Common')  # type: ignore[attr-defined]
     except Exception:
         # In editor or lints without runtime, these may fail; defer real failures to runtime usage
         pass

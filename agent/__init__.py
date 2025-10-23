@@ -1,4 +1,4 @@
-from .agent import BaseAgent, RandomMoveAgent
+from .agent import BaseAgent, RandomMoveAgent, RLAgent
 
-__all__ = ["BaseAgent", "RandomMoveAgent"]
+__all__ = ["BaseAgent", "RandomMoveAgent", "RLAgent"]
 

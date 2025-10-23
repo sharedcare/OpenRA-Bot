@@ -29,13 +29,66 @@ def build_observation(openra: Dict[str, Any]) -> Dict[str, Any]:
             'density': int(r.Density),
         })
 
-    obs = {
+    obs: Dict[str, Any] = {
         'world_tick': int(state.WorldTick),
         'net_frame': int(state.NetFrame),
         'local_frame': int(state.LocalFrame),
         'actors': actors,
         'resources': resources,
     }
+
+    # Optional production overview and placeable areas if available from engine
+    try:
+        prod = getattr(state, 'Production', None)
+        if prod is not None and getattr(prod, 'Queues', None) is not None:
+            queues: List[Dict[str, Any]] = []
+            for q in prod.Queues:
+                try:
+                    items = []
+                    for it in (q.Items or []):
+                        items.append({
+                            'Item': getattr(it, 'Item', ''),
+                            'Cost': int(getattr(it, 'Cost', 0)),
+                            'Progress': int(getattr(it, 'Progress', 0)),
+                            'Paused': bool(getattr(it, 'Paused', False)),
+                            'Done': bool(getattr(it, 'Done', False)),
+                        })
+                    buildable = []
+                    for b in (q.Buildable or []):
+                        buildable.append({
+                            'Name': getattr(b, 'Name', ''),
+                            'Cost': int(getattr(b, 'Cost', 0)),
+                        })
+                    queues.append({
+                        'ActorId': int(getattr(q, 'ActorId', 0)),
+                        'Type': getattr(q, 'Type', ''),
+                        'Group': getattr(q, 'Group', None),
+                        'Enabled': bool(getattr(q, 'Enabled', False)),
+                        'Items': items,
+                        'Buildable': buildable,
+                    })
+                except Exception:
+                    continue
+            obs['production'] = { 'Queues': queues }
+    except Exception:
+        pass
+
+    try:
+        placeable = getattr(state, 'PlaceableAreas', None)
+        if placeable is not None:
+            pa: Dict[str, List[List[int]]] = {}
+            for entry in placeable:
+                try:
+                    unit_type = getattr(entry, 'UnitType', '')
+                    cells = getattr(entry, 'Cells', []) or []
+                    coords = [[int(c.X), int(c.Y)] for c in cells]
+                    if unit_type:
+                        pa.setdefault(unit_type, []).extend(coords)
+                except Exception:
+                    continue
+            obs['placeable_areas'] = pa
+    except Exception:
+        pass
 
     my_owner = int(openra['Game'].LocalClientId)
     available = set()

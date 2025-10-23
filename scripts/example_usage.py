@@ -24,9 +24,10 @@ if __name__ == "__main__":
     random_move_agent = RandomMoveAgent()
     obs, info = env.reset()
     total_reward = 0
-    for _ in range(1000):
+    while True:
         actions = random_move_agent.act(obs)
         obs, reward, terminated, truncated, info = env.step(actions)
+        print(f"Reward: {reward}")
         if terminated or truncated:
             break
         total_reward += reward

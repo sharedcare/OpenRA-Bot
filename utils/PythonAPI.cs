@@ -50,6 +50,8 @@ namespace OpenRA
 		public int LocalFrame;
 		public RLActor[] Actors;
 		public RLResourceCell[] Resources;
+		public ProductionOverview Production;
+		public PlaceableAreaData[] PlaceableAreas;
 	}
 
 	public sealed class RLResourceCell
@@ -58,6 +60,50 @@ namespace OpenRA
 		public int CellY;
 		public int TypeIndex;
 		public int Density;
+	}
+
+	public sealed class PositionData
+	{
+		public int X { get; set; }
+		public int Y { get; set; }
+	}
+
+	// --- Production DTOs for pythonnet interop ---
+	public sealed class ProductionOverview
+	{
+		public ProductionQueueData[] Queues { get; set; } = [];
+	}
+
+	public sealed class ProductionQueueData
+	{
+		public uint ActorId { get; set; }
+		public string Type { get; set; } = "";
+		public string Group { get; set; } = null;
+		public bool Enabled { get; set; }
+		public ProductionQueueItem[] Items { get; set; } = [];
+		public BuildableItem[] Buildable { get; set; } = [];
+	}
+
+	public sealed class ProductionQueueItem
+	{
+		public string Item { get; set; } = "";
+		public int Cost { get; set; }
+		public int Progress { get; set; }
+		public bool Paused { get; set; }
+		public bool Done { get; set; }
+	}
+
+	public sealed class BuildableItem
+	{
+		public string Name { get; set; } = "";
+		public int Cost { get; set; }
+	}
+
+	public sealed class PlaceableAreaData
+	{
+		public uint ActorId { get; set; }
+		public string UnitType { get; set; } = "";
+		public PositionData[] Cells { get; set; } = [];
 	}
 
 	/// <summary>
@@ -312,6 +358,18 @@ namespace OpenRA
 				if (subject == null || subject.Disposed)
 					continue;
 
+				// Special handling for production orders
+				if (string.Equals(a.Order, "StartProduction", StringComparison.OrdinalIgnoreCase))
+				{
+					if (!string.IsNullOrEmpty(a.TargetString))
+					{
+						var prodOrder = Order.StartProduction(subject, a.TargetString, 1, true);
+						orders.Add(prodOrder);
+					}
+
+					continue;
+				}
+
 				var target = ConvertTarget(world, a.Target);
 				var order = new Order(a.Order ?? string.Empty, subject, target, a.Queued)
 				{
@@ -391,7 +449,7 @@ namespace OpenRA
 			var om = Game.OrderManager;
 			var world = om?.World;
 			if (world == null)
-				return new RLState { WorldTick = 0, NetFrame = 0, LocalFrame = 0, Actors = [] };
+				return new RLState { WorldTick = 0, NetFrame = 0, LocalFrame = 0, Actors = [], Resources = [], Production = new ProductionOverview(), PlaceableAreas = [] };
 
 			var list = new List<RLActor>();
 			var localPlayer = world.LocalPlayer ?? world.Players.FirstOrDefault(p => p.ClientIndex == Game.LocalClientId);
@@ -472,8 +530,105 @@ namespace OpenRA
 				NetFrame = Game.NetFrameNumber,
 				LocalFrame = Game.LocalTick,
 				Actors = list.ToArray(),
-				Resources = resourceCells.ToArray()
+				Resources = resourceCells.ToArray(),
+				Production = CollectProductionInfo(world, localPlayer),
+				PlaceableAreas = CollectPlaceableAreas(world, localPlayer)
 			};
+		}
+
+		static ProductionOverview CollectProductionInfo(World world, Player player)
+		{
+			var overview = new ProductionOverview { Queues = [] };
+			var queues = new List<ProductionQueueData>();
+
+			// Resolve ProductionQueue trait type via reflection to avoid hard assembly dependency
+			var pqType = AppDomain.CurrentDomain
+				.GetAssemblies()
+				.Select(a => a.GetType("OpenRA.Mods.Common.Traits.ProductionQueue", false))
+				.FirstOrDefault(t => t != null);
+			if (pqType == null)
+			{
+				overview.Queues = queues.ToArray();
+				return overview;
+			}
+
+			var traitsMethod = typeof(Actor).GetMethod("TraitsImplementing", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+			var traitsGeneric = traitsMethod?.MakeGenericMethod(pqType);
+
+			foreach (var a in world.Actors)
+			{
+				if (player != null && a.Owner != player) continue;
+				if (a.IsDead || !a.IsInWorld) continue;
+
+				if (traitsGeneric?.Invoke(a, null) is not IEnumerable enumerable) continue;
+
+				foreach (var q in enumerable)
+				{
+					var enabledProp = q.GetType().GetProperty("Enabled");
+					var enabled = enabledProp != null && (bool)enabledProp.GetValue(q);
+					if (!enabled) continue;
+
+					// Items
+					var itemsList = new List<ProductionQueueItem>();
+					var allQueued = q.GetType().GetMethod("AllQueued");
+					if (allQueued?.Invoke(q, null) is IEnumerable queuedEnum)
+					{
+						foreach (var pi in queuedEnum)
+						{
+							var item = new ProductionQueueItem();
+							var piType = pi.GetType();
+							item.Item = piType.GetProperty("Item")?.GetValue(pi) as string ?? "";
+							item.Cost = (int)(piType.GetProperty("TotalCost")?.GetValue(pi) ?? 0);
+							var totalTime = (int)(piType.GetProperty("TotalTime")?.GetValue(pi) ?? 0);
+							var remaining = (int)(piType.GetProperty("RemainingTime")?.GetValue(pi) ?? 0);
+							item.Progress = totalTime > 0 ? Math.Clamp((totalTime - remaining) * 100 / totalTime, 0, 100) : 0;
+							item.Paused = (bool)(piType.GetProperty("Paused")?.GetValue(pi) ?? false);
+							item.Done = (bool)(piType.GetProperty("Done")?.GetValue(pi) ?? false);
+							itemsList.Add(item);
+						}
+					}
+
+					// Buildables
+					var buildablesList = new List<BuildableItem>();
+					var buildableItems = q.GetType().GetMethod("BuildableItems");
+					var getCost = q.GetType().GetMethod("GetProductionCost");
+					if (buildableItems?.Invoke(q, null) is IEnumerable buildableEnum)
+					{
+						foreach (var ai in buildableEnum)
+						{
+							var name = ai.GetType().GetProperty("Name")?.GetValue(ai) as string ?? "";
+							var cost = getCost != null ? (int)getCost.Invoke(q, [ai]) : 0;
+							buildablesList.Add(new BuildableItem { Name = name, Cost = cost });
+						}
+					}
+
+					// Queue metadata
+					var infoProp = q.GetType().GetProperty("Info");
+					var infoVal = infoProp?.GetValue(q);
+					var typeStr = infoVal?.GetType().GetProperty("Type")?.GetValue(infoVal) as string ?? "";
+					var groupStr = infoVal?.GetType().GetProperty("Group")?.GetValue(infoVal) as string;
+
+					queues.Add(new ProductionQueueData
+					{
+						ActorId = a.ActorID,
+						Type = typeStr,
+						Group = groupStr,
+						Enabled = enabled,
+						Items = itemsList.ToArray(),
+						Buildable = buildablesList.ToArray()
+					});
+				}
+			}
+
+			overview.Queues = queues.ToArray();
+			return overview;
+		}
+
+		static PlaceableAreaData[] CollectPlaceableAreas(World world, Player player)
+		{
+			// Not available in core Game assembly; requires Mods.Common helpers.
+			// Return empty to keep layout consistent with HTTP bridge.
+			return [];
 		}
 
 		// Strict feasibility check for a specific (actor, order) against a given target.
