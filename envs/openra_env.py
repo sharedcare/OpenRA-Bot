@@ -120,6 +120,18 @@ class OpenRAEnv(gym.Env):
         self._enemy_unit_ids: List[int] = []
         self._recent_actions: deque[Tuple] = deque(maxlen=256)
         self._action_ttl_steps: int = 8
+        # Reward shaping config and previous metrics snapshot
+        self.reward_weights = {
+            'unit': 0.5,
+            'building': 1.0,
+            'low_cash_penalty': 0.2,
+            'min_cash': 500.0,
+        }
+        self._prev_metrics: Dict[str, Optional[float]] = {
+            'units': None,
+            'buildings': None,
+            'cash': None,
+        }
 
         # Remote join settings (optional)
         self.remote_host: Optional[str] = None
@@ -256,12 +268,19 @@ class OpenRAEnv(gym.Env):
         elif self.remote_host and self.remote_port:
             self._join_remote()
         else:
-            api.StartLocalGame(self.mod_id, self.map_uid, self.bin_dir, addBotOpponent=True, explored=True, fog=False)
+            api.StartLocalGame(self.mod_id, self.map_uid, self.bin_dir, addBotOpponent=False, explored=True, fog=False)
 
         # Build first observation and info
         raw = self._get_raw_state()
         obs = self._state_to_observation(raw)
         self._last_obs = obs
+        # Initialize previous metrics for reward shaping
+        m = self._compute_development_metrics(raw)
+        self._prev_metrics = {
+            'units': float(m.get('units', 0.0)),
+            'buildings': float(m.get('buildings', 0.0)),
+            'cash': float(m['cash']) if m.get('cash') is not None else None,
+        }
         info = self._make_info(raw)
         return obs, info
 
@@ -283,7 +302,8 @@ class OpenRAEnv(gym.Env):
         raw = self._get_raw_state()
         new_obs = self._state_to_observation(raw)
 
-        reward = 0.0
+        # Reward shaping: encourage development and sufficient cash reserve
+        reward = self._compute_reward(raw)
         terminated = False
         truncated = False
 
@@ -305,6 +325,65 @@ class OpenRAEnv(gym.Env):
     def _get_raw_state(self) -> Dict[str, Any]:
         return build_observation(self._openra)
 
+    # --- Reward shaping helpers ---
+
+    def _compute_development_metrics(self, raw: Dict[str, Any]) -> Dict[str, Optional[float]]:
+        actors = raw.get('actors') or []
+        my_owner = int(raw.get('my_owner', -1))
+        my_alive = [u for u in actors if int(u.get('owner', -1)) == my_owner and not bool(u.get('dead', False))]
+        units = 0
+        buildings = 0
+        for u in my_alive:
+            orders = set(str(x).lower() for x in (u.get('available_orders') or []))
+            # Heuristic: actors that can Move are units; others are buildings
+            if 'move' in orders:
+                units += 1
+            else:
+                buildings += 1
+        cash = raw.get('cash')
+        try:
+            cash_val: Optional[float] = float(cash) if cash is not None else None
+        except Exception:
+            cash_val = None
+        return {
+            'units': float(units),
+            'buildings': float(buildings),
+            'cash': cash_val,
+        }
+
+    def _compute_reward(self, raw: Dict[str, Any]) -> float:
+        metrics = self._compute_development_metrics(raw)
+        # Initialize if first call
+        if self._prev_metrics['units'] is None:
+            self._prev_metrics['units'] = float(metrics.get('units') or 0.0)
+        if self._prev_metrics['buildings'] is None:
+            self._prev_metrics['buildings'] = float(metrics.get('buildings') or 0.0)
+        if self._prev_metrics['cash'] is None and metrics.get('cash') is not None:
+            self._prev_metrics['cash'] = float(metrics.get('cash') or 0.0)
+
+        du = float(metrics.get('units') or 0.0) - float(self._prev_metrics.get('units') or 0.0)
+        db = float(metrics.get('buildings') or 0.0) - float(self._prev_metrics.get('buildings') or 0.0)
+
+        # Positive reward for new units/buildings
+        rw = self.reward_weights['unit'] * max(0.0, du) + self.reward_weights['building'] * max(0.0, db)
+
+        # Penalty for low cash (only if cash is reported by engine)
+        cash_now = metrics.get('cash')
+        if cash_now is not None:
+            min_cash = float(self.reward_weights['min_cash'])
+            if cash_now < min_cash:
+                # Scale penalty by deficit ratio
+                deficit = (min_cash - float(cash_now)) / max(1.0, min_cash)
+                rw -= self.reward_weights['low_cash_penalty'] * float(deficit)
+
+        # Update previous metrics
+        self._prev_metrics['units'] = float(metrics.get('units') or 0.0)
+        self._prev_metrics['buildings'] = float(metrics.get('buildings') or 0.0)
+        if cash_now is not None:
+            self._prev_metrics['cash'] = float(cash_now)
+
+        return float(rw)
+
     def send_actions(self, actions: List[Dict[str, Any]]) -> None:
         send_actions(self._openra, actions)
 
@@ -319,7 +398,7 @@ class OpenRAEnv(gym.Env):
             # Move to cell
             actor_id = self._resolve_my_unit_id(unit_idx)
             actions.append({
-                'order': 'Move',
+            'order': 'Move',
                 'subject': actor_id,
                 'target_cell': (int(tx), int(ty)),
                 'queued': False,
@@ -403,23 +482,23 @@ class OpenRAEnv(gym.Env):
         self._recent_actions.append((sig, now))
 
     # --- Additional connection helpers ---
-
+    
     def get_connection_state(self) -> str:
         """Get current connection state as string."""
         if not self._initialized:
             return "NotInitialized"
         return get_connection_state(self._openra)
-
+    
     def get_lobby_info(self) -> Dict[str, Any]:
         if not self._initialized:
             return {}
         return dict(self._openra['PythonAPI'].GetLobbyInfo())
-
+    
     def is_connected_to_lobby(self) -> bool:
         if not self._initialized:
             return False
         return is_connected_to_lobby(self._openra)
-
+    
     def wait_for_connection(self, timeout_ms: int = 10000) -> bool:
         if not self._initialized:
             return False
