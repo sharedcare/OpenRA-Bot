@@ -52,6 +52,7 @@ namespace OpenRA
 		public RLResourceCell[] Resources;
 		public ProductionOverview Production;
 		public PlaceableAreaData[] PlaceableAreas;
+		public BuildableCatalogItem[] BuildableCatalog;
 	}
 
 	public sealed class RLResourceCell
@@ -97,6 +98,13 @@ namespace OpenRA
 	{
 		public string Name { get; set; } = "";
 		public int Cost { get; set; }
+	}
+
+	public sealed class BuildableCatalogItem
+	{
+		public string Name { get; set; } = "";
+		public string[] Queues { get; set; } = [];
+		public string ProductionType { get; set; } = "";
 	}
 
 	public sealed class PlaceableAreaData
@@ -449,7 +457,7 @@ namespace OpenRA
 			var om = Game.OrderManager;
 			var world = om?.World;
 			if (world == null)
-				return new RLState { WorldTick = 0, NetFrame = 0, LocalFrame = 0, Actors = [], Resources = [], Production = new ProductionOverview(), PlaceableAreas = [] };
+				return new RLState { WorldTick = 0, NetFrame = 0, LocalFrame = 0, Actors = [], Resources = [], Production = new ProductionOverview(), PlaceableAreas = [], BuildableCatalog = [] };
 
 			var list = new List<RLActor>();
 			var localPlayer = world.LocalPlayer ?? world.Players.FirstOrDefault(p => p.ClientIndex == Game.LocalClientId);
@@ -532,7 +540,8 @@ namespace OpenRA
 				Actors = list.ToArray(),
 				Resources = resourceCells.ToArray(),
 				Production = CollectProductionInfo(world, localPlayer),
-				PlaceableAreas = CollectPlaceableAreas(world, localPlayer)
+				PlaceableAreas = CollectPlaceableAreas(world, localPlayer),
+				BuildableCatalog = CollectBuildableCatalog(world)
 			};
 		}
 
@@ -629,6 +638,54 @@ namespace OpenRA
 			// Not available in core Game assembly; requires Mods.Common helpers.
 			// Return empty to keep layout consistent with HTTP bridge.
 			return [];
+		}
+
+		static BuildableCatalogItem[] CollectBuildableCatalog(World world)
+		{
+			var result = new List<BuildableCatalogItem>();
+			var rules = world?.Map?.Rules;
+			if (rules == null || rules.Actors == null)
+				return result.ToArray();
+
+			// Resolve BuildableInfo via reflection to avoid hard assembly dependency
+			var biType = AppDomain.CurrentDomain
+				.GetAssemblies()
+				.Select(a => a.GetType("OpenRA.Mods.Common.Traits.BuildableInfo", false))
+				.FirstOrDefault(t => t != null);
+			if (biType == null)
+				return result.ToArray();
+
+			foreach (var kv in rules.Actors)
+			{
+				var actorName = kv.Key;
+				var actorInfo = kv.Value;
+				var method = actorInfo.GetType().GetMethod("TraitInfoOrDefault", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+				var generic = method?.MakeGenericMethod(biType);
+				var buildableInfo = generic?.Invoke(actorInfo, null);
+				if (buildableInfo == null)
+					continue;
+
+				string[] queues = [];
+				try
+				{
+					var qObj = biType.GetProperty("Queue")?.GetValue(buildableInfo);
+					if (qObj is IEnumerable enumerable)
+					{
+						var tmp = new List<string>();
+						foreach (var s in enumerable)
+							if (s is string str && !string.IsNullOrEmpty(str))
+								tmp.Add(str);
+						queues = tmp.ToArray();
+					}
+				}
+				catch { }
+
+				var prodType = biType.GetProperty("BuildAtProductionType")?.GetValue(buildableInfo) as string ?? "";
+
+				result.Add(new BuildableCatalogItem { Name = actorName, Queues = queues, ProductionType = prodType });
+			}
+
+			return result.ToArray();
 		}
 
 		// Strict feasibility check for a specific (actor, order) against a given target.

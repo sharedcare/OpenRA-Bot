@@ -93,6 +93,8 @@ class OpenRAEnv(gym.Env):
 
         # Config
         self.observation_type = observation_type
+        if self.observation_type not in ['feature', 'vector', 'image']:
+            raise ValueError(f"Invalid observation type: {self.observation_type}")
         default_actions = ['noop', 'move', 'attack', 'produce', 'build', 'deploy']
         self.action_types: List[str] = enable_actions if enable_actions else default_actions
 
@@ -125,13 +127,21 @@ class OpenRAEnv(gym.Env):
             'unit': 0.5,
             'building': 1.0,
             'low_cash_penalty': 0.2,
-            'min_cash': 500.0,
+            'min_cash': 1500.0,
+            # Production shaping
+            'produce_start': 0.05,           # small reward when a new item is queued
+            'produce_cancel_penalty': 0.1,   # penalty multiplier when an in-progress item is canceled
+            'produce_queue_threshold': 6,     # queue length after which start reward is damped
+            'produce_queue_damp': 0.5,       # start reward scale when beyond threshold
         }
         self._prev_metrics: Dict[str, Optional[float]] = {
             'units': None,
             'buildings': None,
             'cash': None,
+
         }
+        # Track previous production items to detect new starts and cancels
+        self._prev_prod_items: Dict[Tuple[int, str], float] = {}
 
         # Remote join settings (optional)
         self.remote_host: Optional[str] = None
@@ -281,6 +291,8 @@ class OpenRAEnv(gym.Env):
             'buildings': float(m.get('buildings', 0.0)),
             'cash': float(m['cash']) if m.get('cash') is not None else None,
         }
+        # Initialize production item snapshot
+        self._prev_prod_items = self._extract_production_items(raw)
         info = self._make_info(raw)
         return obs, info
 
@@ -345,6 +357,18 @@ class OpenRAEnv(gym.Env):
             cash_val: Optional[float] = float(cash) if cash is not None else None
         except Exception:
             cash_val = None
+
+        # Production progress
+        prod = raw.get('production') or {}
+        progress_sum = 0.0
+        try:
+            for q in (prod.get('Queues', []) or []):
+                for it in (q.get('Items', []) or []):
+                    progress_sum += float(it.get('Progress', 0))
+        except Exception:
+            progress_sum = 0.0
+
+        # Exploration: count new visited cells this step (not part of metrics state; used in reward)
         return {
             'units': float(units),
             'buildings': float(buildings),
@@ -364,8 +388,15 @@ class OpenRAEnv(gym.Env):
         du = float(metrics.get('units') or 0.0) - float(self._prev_metrics.get('units') or 0.0)
         db = float(metrics.get('buildings') or 0.0) - float(self._prev_metrics.get('buildings') or 0.0)
 
-        # Positive reward for new units/buildings
-        rw = self.reward_weights['unit'] * max(0.0, du) + self.reward_weights['building'] * max(0.0, db)
+        # Reward for new units/buildings
+        rw = self.reward_weights['unit'] * du + self.reward_weights['building'] * db
+
+        # Production shaping: reward new starts (small), penalize cancels by progress
+        starts, cancels = self._diff_production_events(raw)
+        if starts > 0:
+            rw += self._production_start_reward(raw, starts)
+        if cancels > 0:
+            rw -= self._production_cancel_penalty(cancels)
 
         # Penalty for low cash (only if cash is reported by engine)
         cash_now = metrics.get('cash')
@@ -382,7 +413,74 @@ class OpenRAEnv(gym.Env):
         if cash_now is not None:
             self._prev_metrics['cash'] = float(cash_now)
 
+        # Update production snapshot
+        self._prev_prod_items = self._extract_production_items(raw)
+
         return float(rw)
+
+    def _extract_production_items(self, raw: Dict[str, Any]) -> Dict[Tuple[int, str], float]:
+        items: Dict[Tuple[int, str], float] = {}
+        prod = raw.get('production') or {}
+        try:
+            for q in (prod.get('Queues', []) or []):
+                q_actor = int(q.get('ActorId', -1))
+                for it in (q.get('Items', []) or []):
+                    name = str(it.get('Item') or it.get('Name') or '')
+                    if not name:
+                        continue
+                    prog = float(it.get('Progress', 0.0))
+                    done = bool(it.get('Done', False))
+                    if done:
+                        # Completed items are not tracked as active production
+                        continue
+                    items[(q_actor, name)] = prog
+        except Exception:
+            return {}
+        return items
+
+    def _diff_production_events(self, raw: Dict[str, Any]) -> Tuple[int, int]:
+        """Return (num_starts, weighted_cancels), where cancels is the count weighted by progress fraction."""
+        prev = self._prev_prod_items or {}
+        cur = self._extract_production_items(raw)
+        # New starts: items present now but not before
+        starts = 0
+        for key in cur.keys():
+            if key not in prev:
+                starts += 1
+        # Cancels: items that disappeared and were not done; weight by last progress fraction
+        cancels_weighted = 0.0
+        for key, prog in prev.items():
+            if key not in cur:
+                cancels_weighted += max(0.0, float(prog) / 100.0)
+        return int(starts), int(round(cancels_weighted * 1000))  # return scaled int; actual penalty computed later
+
+    def _production_start_reward(self, raw: Dict[str, Any], starts: int) -> float:
+        base = float(self.reward_weights.get('produce_start', 0.0))
+        if base <= 0.0 or starts <= 0:
+            return 0.0
+        # Dampen when queue is long to discourage overproduction
+        prod = raw.get('production') or {}
+        q_len = 0
+        try:
+            for q in (prod.get('Queues', []) or []):
+                q_len += len(q.get('Items', []) or [])
+        except Exception:
+            q_len = 0
+        thresh = int(self.reward_weights.get('produce_queue_threshold', 6))
+        damp = float(self.reward_weights.get('produce_queue_damp', 0.5)) if q_len >= thresh else 1.0
+        # Scale by cash ratio to avoid rewarding when broke
+        cash = self._prev_metrics.get('cash')
+        min_cash = float(self.reward_weights.get('min_cash', 0.0))
+        cash_scale = 1.0
+        if cash is not None and min_cash > 0.0:
+            cash_scale = max(0.1, min(1.0, float(cash) / min_cash))
+        return starts * base * damp * cash_scale
+
+    def _production_cancel_penalty(self, cancels_scaled: int) -> float:
+        # Convert back to progress-weighted count
+        cancels_weighted = float(cancels_scaled) / 1000.0
+        coef = float(self.reward_weights.get('produce_cancel_penalty', 0.0))
+        return coef * cancels_weighted
 
     def send_actions(self, actions: List[Dict[str, Any]]) -> None:
         send_actions(self._openra, actions)
@@ -398,7 +496,7 @@ class OpenRAEnv(gym.Env):
             # Move to cell
             actor_id = self._resolve_my_unit_id(unit_idx)
             actions.append({
-            'order': 'Move',
+                'order': 'Move',
                 'subject': actor_id,
                 'target_cell': (int(tx), int(ty)),
                 'queued': False,
@@ -586,11 +684,38 @@ class OpenRAEnv(gym.Env):
             'deploy_mask': deploy_mask,
         }
         if 'produce' in self.action_types:
-            produce_mask = np.zeros((max_units,), dtype=np.uint8)
-            n = min(len(getattr(self, '_queue_actor_ids', []) or []), max_units)
-            if n > 0:
-                produce_mask[:n] = 1
-            mask['produce_mask'] = produce_mask
+            # Producible unit types mask using global catalog if available (fallback to enabled queues)
+            produce_unit_type_mask = np.zeros((len(self.unit_types),), dtype=np.uint8)
+            allowed_names = set()
+            try:
+                catalog = (self._get_raw_state().get('producible_catalog') or [])
+                if catalog:
+                    for b in catalog:
+                        nm = str(b.get('Name') or '').lower()
+                        if nm:
+                            allowed_names.add(nm)
+                else:
+                    # Fallback to per-queue producibles when catalog missing
+                    queues = list(((self._get_raw_state().get('production') or {}).get('Queues') or []))
+                    for q in queues:
+                        if not q.get('Enabled'):
+                            continue
+                        for b in (q.get('Producible') or []):
+                            nm = str(b.get('Name') or '').lower()
+                            if nm:
+                                allowed_names.add(nm)
+            except Exception:
+                allowed_names = set()
+
+            if allowed_names:
+                for idx, name in self.reverse_unit_types.items():
+                    if str(name).lower() in allowed_names:
+                        i = int(idx)
+                        if 0 <= i < produce_unit_type_mask.shape[0]:
+                            produce_unit_type_mask[i] = 1
+            mask['produce_unit_type_mask'] = produce_unit_type_mask
+
+            _disable_if_empty('produce', bool(produce_unit_type_mask.any()))
         if 'build' in self.action_types:
             build_mask = np.zeros((max_units,), dtype=np.uint8)
             # Enable only when PlaceBuilding is available on at least one unit

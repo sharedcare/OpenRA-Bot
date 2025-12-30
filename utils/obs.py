@@ -37,7 +37,33 @@ def build_observation(openra: Dict[str, Any]) -> Dict[str, Any]:
         'resources': resources,
     }
 
-    # Optional production overview and placeable areas if available from engine
+    # Economy (cash/resources) and power
+    try:
+        obs['cash'] = int(getattr(state, 'PlayerCash', 0))
+        obs['resources_total'] = int(getattr(state, 'PlayerResources', 0))
+        obs['resource_capacity'] = int(getattr(state, 'PlayerResourceCapacity', 0))
+        obs['power'] = {
+            'provided': int(getattr(state, 'PowerProvided', 0)),
+            'drained': int(getattr(state, 'PowerDrained', 0)),
+            'state': str(getattr(state, 'PowerState', '') or ''),
+        }
+    except Exception:
+        pass
+
+    # Global producible catalog
+    try:
+        catalog: List[Dict[str, Any]] = []
+        for b in getattr(state, 'ProducibleCatalog', []) or []:
+            name = getattr(b, 'Name', '')
+            cost = int(getattr(b, 'Cost', 0))
+            if name:
+                catalog.append({'Name': name, 'Cost': cost})
+        if catalog:
+            obs['producible_catalog'] = catalog
+    except Exception:
+        pass
+
+    # Production overview and placeable areas
     try:
         prod = getattr(state, 'Production', None)
         if prod is not None and getattr(prod, 'Queues', None) is not None:
@@ -45,27 +71,31 @@ def build_observation(openra: Dict[str, Any]) -> Dict[str, Any]:
             for q in prod.Queues:
                 try:
                     items = []
+                    actor_type = getattr(q, 'Type')
+                    if not actor_type:
+                        continue
                     for it in (q.Items or []):
                         items.append({
                             'Item': getattr(it, 'Item', ''),
                             'Cost': int(getattr(it, 'Cost', 0)),
+                            'RemainingCost': int(getattr(it, 'RemainingCost', 0)),
                             'Progress': int(getattr(it, 'Progress', 0)),
                             'Paused': bool(getattr(it, 'Paused', False)),
                             'Done': bool(getattr(it, 'Done', False)),
                         })
-                    buildable = []
-                    for b in (q.Buildable or []):
-                        buildable.append({
+                    producible = []
+                    for b in (q.Producible or []):
+                        producible.append({
                             'Name': getattr(b, 'Name', ''),
                             'Cost': int(getattr(b, 'Cost', 0)),
                         })
                     queues.append({
                         'ActorId': int(getattr(q, 'ActorId', 0)),
-                        'Type': getattr(q, 'Type', ''),
+                        'Type': actor_type,
                         'Group': getattr(q, 'Group', None),
                         'Enabled': bool(getattr(q, 'Enabled', False)),
                         'Items': items,
-                        'Buildable': buildable,
+                        'Producible': producible,
                     })
                 except Exception:
                     continue

@@ -8,11 +8,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from OpenRA.Bot.envs.openra_env import make_env
     from OpenRA.Bot.models import ActorCritic
-    from OpenRA.Bot.agent import RLAgent
+    from OpenRA.Bot.agent import PPOAgent
 except Exception:  # noqa: BLE001
     from envs.openra_env import make_env  # type: ignore
     from models import ActorCritic  # type: ignore
-    from agent import RLAgent  # type: ignore
+    from agent import PPOAgent  # type: ignore
 
 
 def main():
@@ -38,7 +38,7 @@ def main():
     model = ActorCritic(obs_space=obs_space, action_dims=a_dims, observation_type=observation_type)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    agent = RLAgent(model=model, device=str(device))
+    agent = PPOAgent(model=model, device=str(device))
 
     obs, info = env.reset()
     total_reward = 0.0
