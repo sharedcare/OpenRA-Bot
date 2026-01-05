@@ -48,11 +48,17 @@ namespace OpenRA
 		public int WorldTick;
 		public int NetFrame;
 		public int LocalFrame;
+		public int PlayerCash;
+		public int PlayerResources;
+		public int PlayerResourceCapacity;
+		public int PowerProvided;
+		public int PowerDrained;
+		public string PowerState;
 		public RLActor[] Actors;
 		public RLResourceCell[] Resources;
 		public ProductionOverview Production;
+		public ProducibleItem[] ProducibleCatalog;
 		public PlaceableAreaData[] PlaceableAreas;
-		public BuildableCatalogItem[] BuildableCatalog;
 	}
 
 	public sealed class RLResourceCell
@@ -82,29 +88,23 @@ namespace OpenRA
 		public string Group { get; set; } = null;
 		public bool Enabled { get; set; }
 		public ProductionQueueItem[] Items { get; set; } = [];
-		public BuildableItem[] Buildable { get; set; } = [];
+		public ProducibleItem[] Producible { get; set; } = [];
 	}
 
 	public sealed class ProductionQueueItem
 	{
 		public string Item { get; set; } = "";
 		public int Cost { get; set; }
+		public int RemainingCost { get; set; }
 		public int Progress { get; set; }
 		public bool Paused { get; set; }
 		public bool Done { get; set; }
 	}
 
-	public sealed class BuildableItem
+	public sealed class ProducibleItem
 	{
 		public string Name { get; set; } = "";
 		public int Cost { get; set; }
-	}
-
-	public sealed class BuildableCatalogItem
-	{
-		public string Name { get; set; } = "";
-		public string[] Queues { get; set; } = [];
-		public string ProductionType { get; set; } = "";
 	}
 
 	public sealed class PlaceableAreaData
@@ -457,7 +457,23 @@ namespace OpenRA
 			var om = Game.OrderManager;
 			var world = om?.World;
 			if (world == null)
-				return new RLState { WorldTick = 0, NetFrame = 0, LocalFrame = 0, Actors = [], Resources = [], Production = new ProductionOverview(), PlaceableAreas = [], BuildableCatalog = [] };
+				return new RLState
+				{
+					WorldTick = 0,
+					NetFrame = 0,
+					LocalFrame = 0,
+					PlayerCash = 0,
+					PlayerResources = 0,
+					PlayerResourceCapacity = 0,
+					PowerProvided = 0,
+					PowerDrained = 0,
+					PowerState = "",
+					Actors = [],
+					Resources = [],
+					Production = new ProductionOverview(),
+					ProducibleCatalog = [],
+					PlaceableAreas = []
+				};
 
 			var list = new List<RLActor>();
 			var localPlayer = world.LocalPlayer ?? world.Players.FirstOrDefault(p => p.ClientIndex == Game.LocalClientId);
@@ -532,17 +548,98 @@ namespace OpenRA
 				});
 			}
 
+			var production = CollectProductionInfo(world, localPlayer);
+			var producibleCatalog = AggregateProducibles(production);
+
+			// Reflect economy (cash/resources/capacity) and power from Mods.Common player traits
+			var cash = 0;
+			var resTotal = 0;
+			var resCap = 0;
+			var pProvided = 0;
+			var pDrained = 0;
+			var pState = "";
+
+			var playerActor = localPlayer?.PlayerActor;
+			if (playerActor != null)
+			{
+				var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+				var traitOrDefault = typeof(Actor).GetMethod("TraitOrDefault", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+				// PlayerResources
+				var prType = assemblies.Select(a => a.GetType("OpenRA.Mods.Common.Traits.PlayerResources", false)).FirstOrDefault(t => t != null);
+				if (prType != null && traitOrDefault != null)
+				{
+					var prGeneric = traitOrDefault.MakeGenericMethod(prType);
+					var pr = prGeneric.Invoke(playerActor, null);
+					if (pr != null)
+					{
+						var fCash = pr.GetType().GetField("Cash", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+						cash = (int)(fCash?.GetValue(pr) ?? 0);
+						var fResources = pr.GetType().GetField("Resources", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+						resTotal = (int)(fResources?.GetValue(pr) ?? 0);
+						var fResourceCapacity = pr.GetType().GetField("ResourceCapacity", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+						resCap = (int)(fResourceCapacity?.GetValue(pr) ?? 0);
+					}
+				}
+
+				// PowerManager
+				var pmType = assemblies.Select(a => a.GetType("OpenRA.Mods.Common.Traits.PowerManager", false)).FirstOrDefault(t => t != null);
+				if (pmType != null && traitOrDefault != null)
+				{
+					var pmGeneric = traitOrDefault.MakeGenericMethod(pmType);
+					var pm = pmGeneric.Invoke(playerActor, null);
+					if (pm != null)
+					{
+						var fPowerProvided = pm.GetType().GetField("PowerProvided", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+						pProvided = (int)(fPowerProvided?.GetValue(pm) ?? 0);
+						var fPowerDrained = pm.GetType().GetField("PowerDrained", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+						pDrained = (int)(fPowerDrained?.GetValue(pm) ?? 0);
+						var fPowerState = pm.GetType().GetField("PowerState", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+						pState = fPowerState != null ? fPowerState.GetValue(pm).ToString() : "";
+					}
+				}
+			}
+
 			return new RLState
 			{
 				WorldTick = world.WorldTick,
 				NetFrame = Game.NetFrameNumber,
 				LocalFrame = Game.LocalTick,
+				PlayerCash = cash,
+				PlayerResources = resTotal,
+				PlayerResourceCapacity = resCap,
+				PowerProvided = pProvided,
+				PowerDrained = pDrained,
+				PowerState = pState,
 				Actors = list.ToArray(),
 				Resources = resourceCells.ToArray(),
-				Production = CollectProductionInfo(world, localPlayer),
-				PlaceableAreas = CollectPlaceableAreas(world, localPlayer),
-				BuildableCatalog = CollectBuildableCatalog(world)
+				Production = production,
+				ProducibleCatalog = producibleCatalog,
+				PlaceableAreas = CollectPlaceableAreas(world, localPlayer)
 			};
+		}
+
+		static ProducibleItem[] AggregateProducibles(ProductionOverview prod)
+		{
+			if (prod == null || prod.Queues == null)
+				return [];
+			var map = new Dictionary<string, ProducibleItem>(StringComparer.OrdinalIgnoreCase);
+			foreach (var q in prod.Queues)
+			{
+				if (q == null || !q.Enabled || q.Producible == null)
+					continue;
+				foreach (var b in q.Producible)
+				{
+					if (b == null || string.IsNullOrEmpty(b.Name))
+						continue;
+					if (!map.TryGetValue(b.Name, out var existing))
+						map[b.Name] = new ProducibleItem { Name = b.Name, Cost = b.Cost };
+					else if (b.Cost > 0 && (existing.Cost == 0 || b.Cost < existing.Cost))
+						map[b.Name] = new ProducibleItem { Name = b.Name, Cost = b.Cost };
+				}
+			}
+
+			return map.Values.ToArray();
 		}
 
 		static ProductionOverview CollectProductionInfo(World world, Player player)
@@ -586,8 +683,12 @@ namespace OpenRA
 						{
 							var item = new ProductionQueueItem();
 							var piType = pi.GetType();
-							item.Item = piType.GetProperty("Item")?.GetValue(pi) as string ?? "";
-							item.Cost = (int)(piType.GetProperty("TotalCost")?.GetValue(pi) ?? 0);
+							var fItem = piType.GetField("Item", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+							item.Item = fItem != null ? (fItem.GetValue(pi) as string ?? "") : (piType.GetProperty("Item")?.GetValue(pi) as string ?? "");
+							var fTotalCost = piType.GetField("TotalCost", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+							item.Cost = fTotalCost != null ? (int)(fTotalCost.GetValue(pi) ?? 0)
+								: (int)(piType.GetProperty("TotalCost")?.GetValue(pi) ?? 0);
+							item.RemainingCost = (int)(piType.GetProperty("RemainingCost")?.GetValue(pi) ?? 0);
 							var totalTime = (int)(piType.GetProperty("TotalTime")?.GetValue(pi) ?? 0);
 							var remaining = (int)(piType.GetProperty("RemainingTime")?.GetValue(pi) ?? 0);
 							item.Progress = totalTime > 0 ? Math.Clamp((totalTime - remaining) * 100 / totalTime, 0, 100) : 0;
@@ -597,25 +698,64 @@ namespace OpenRA
 						}
 					}
 
-					// Buildables
-					var buildablesList = new List<BuildableItem>();
-					var buildableItems = q.GetType().GetMethod("BuildableItems");
+					// Producibles
+					var produciblesList = new List<ProducibleItem>();
 					var getCost = q.GetType().GetMethod("GetProductionCost");
-					if (buildableItems?.Invoke(q, null) is IEnumerable buildableEnum)
+					var prodField = q.GetType().GetField("Producible", BindingFlags.Instance | BindingFlags.NonPublic);
+					var t = q.GetType().BaseType;
+					while (prodField == null && t != null)
 					{
-						foreach (var ai in buildableEnum)
+						prodField = t.GetField("Producible", BindingFlags.Instance | BindingFlags.NonPublic);
+						t = t.BaseType;
+					}
+
+					if (prodField != null && prodField.GetValue(q) is IDictionary dict)
+					{
+						foreach (DictionaryEntry de in dict)
 						{
-							var name = ai.GetType().GetProperty("Name")?.GetValue(ai) as string ?? "";
+							var ai = de.Key; // ActorInfo
+							if (ai == null) continue;
+							var stateObj = de.Value; // ProductionState
+							var isVisible = true;
+							if (stateObj != null)
+							{
+								var visField = stateObj.GetType().GetField("Visible", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+								if (visField != null)
+								{
+									try
+									{
+										isVisible = (bool)visField.GetValue(stateObj);
+									}
+									catch
+									{
+										isVisible = true;
+									}
+								}
+							}
+
+							if (!isVisible)
+								continue;
+							var name = ai is ActorInfo actorInfo
+								? actorInfo.Name
+								: (ai?.GetType().GetField("Name", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(ai) as string ?? "");
 							var cost = getCost != null ? (int)getCost.Invoke(q, [ai]) : 0;
-							buildablesList.Add(new BuildableItem { Name = name, Cost = cost });
+							if (!string.IsNullOrEmpty(name))
+								produciblesList.Add(new ProducibleItem { Name = name, Cost = cost });
 						}
 					}
 
-					// Queue metadata
-					var infoProp = q.GetType().GetProperty("Info");
-					var infoVal = infoProp?.GetValue(q);
-					var typeStr = infoVal?.GetType().GetProperty("Type")?.GetValue(infoVal) as string ?? "";
-					var groupStr = infoVal?.GetType().GetProperty("Group")?.GetValue(infoVal) as string;
+					// Queue metadata via fields on ProductionQueue.Info (ProductionQueueInfo)
+					var typeStr = "";
+					string groupStr = null;
+					var infoField = q.GetType().GetField("Info", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+					var infoVal = infoField?.GetValue(q);
+					if (infoVal != null)
+					{
+						var typeField = infoVal.GetType().GetField("Type", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+						var groupField = infoVal.GetType().GetField("Group", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+						typeStr = typeField != null ? (typeField.GetValue(infoVal) as string ?? "") : "";
+						groupStr = groupField != null ? (groupField.GetValue(infoVal) as string) : null;
+					}
 
 					queues.Add(new ProductionQueueData
 					{
@@ -624,7 +764,7 @@ namespace OpenRA
 						Group = groupStr,
 						Enabled = enabled,
 						Items = itemsList.ToArray(),
-						Buildable = buildablesList.ToArray()
+						Producible = produciblesList.ToArray()
 					});
 				}
 			}
@@ -635,57 +775,130 @@ namespace OpenRA
 
 		static PlaceableAreaData[] CollectPlaceableAreas(World world, Player player)
 		{
-			// Not available in core Game assembly; requires Mods.Common helpers.
-			// Return empty to keep layout consistent with HTTP bridge.
-			return [];
-		}
+			// Implement via reflection to avoid hard dependency on Mods.Common
+			if (world == null || player == null)
+				return [];
 
-		static BuildableCatalogItem[] CollectBuildableCatalog(World world)
-		{
-			var result = new List<BuildableCatalogItem>();
-			var rules = world?.Map?.Rules;
-			if (rules == null || rules.Actors == null)
-				return result.ToArray();
-
-			// Resolve BuildableInfo via reflection to avoid hard assembly dependency
-			var biType = AppDomain.CurrentDomain
-				.GetAssemblies()
-				.Select(a => a.GetType("OpenRA.Mods.Common.Traits.BuildableInfo", false))
-				.FirstOrDefault(t => t != null);
-			if (biType == null)
-				return result.ToArray();
-
-			foreach (var kv in rules.Actors)
+			try
 			{
-				var actorName = kv.Key;
-				var actorInfo = kv.Value;
-				var method = actorInfo.GetType().GetMethod("TraitInfoOrDefault", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-				var generic = method?.MakeGenericMethod(biType);
-				var buildableInfo = generic?.Invoke(actorInfo, null);
-				if (buildableInfo == null)
-					continue;
+				// Resolve required Mods.Common types
+				var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+				var pqType = assemblies.Select(a => a.GetType("OpenRA.Mods.Common.Traits.ProductionQueue", false)).FirstOrDefault(t => t != null);
+				var biType = assemblies.Select(a => a.GetType("OpenRA.Mods.Common.Traits.BuildingInfo", false)).FirstOrDefault(t => t != null);
+				var buildingUtilsType = assemblies.Select(a => a.GetType("OpenRA.Mods.Common.Traits.BuildingUtils", false)).FirstOrDefault(t => t != null);
+				if (pqType == null || biType == null || buildingUtilsType == null)
+					return [];
 
-				string[] queues = [];
-				try
+				// Actor.TraitsImplementing<ProductionQueue>()
+				var traitsMethod = typeof(Actor).GetMethod("TraitsImplementing", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+				var traitsGeneric = traitsMethod?.MakeGenericMethod(pqType);
+				if (traitsGeneric == null)
+					return [];
+
+				// BuildingUtils.CanPlaceBuilding(World, CPos, ActorInfo, BuildingInfo, Actor)
+				var canPlace = buildingUtilsType.GetMethod("CanPlaceBuilding", BindingFlags.Public | BindingFlags.Static, null,
+					[typeof(World), typeof(CPos), typeof(ActorInfo), biType, typeof(Actor)], null);
+				if (canPlace == null)
+					return [];
+
+				// BuildingInfo.IsCloseEnoughToBase(World, Player, ActorInfo, CPos)
+				var isCloseEnough = biType.GetMethod("IsCloseEnoughToBase", BindingFlags.Public | BindingFlags.Instance, null,
+					[typeof(World), typeof(Player), typeof(ActorInfo), typeof(CPos)], null);
+				if (isCloseEnough == null)
+					return [];
+
+				var results = new List<PlaceableAreaData>();
+
+				foreach (var a in world.Actors)
 				{
-					var qObj = biType.GetProperty("Queue")?.GetValue(buildableInfo);
-					if (qObj is IEnumerable enumerable)
+					if (a == null || a.Owner != player || a.IsDead || !a.IsInWorld)
+						continue;
+
+					if (traitsGeneric.Invoke(a, null) is not IEnumerable pqEnum)
+						continue;
+
+					foreach (var q in pqEnum)
 					{
-						var tmp = new List<string>();
-						foreach (var s in enumerable)
-							if (s is string str && !string.IsNullOrEmpty(str))
-								tmp.Add(str);
-						queues = tmp.ToArray();
+						if (q == null)
+							continue;
+
+						// q.Enabled
+						var enabledProp = q.GetType().GetProperty("Enabled");
+						var enabled = enabledProp != null && (bool)enabledProp.GetValue(q);
+						if (!enabled)
+							continue;
+
+						// q.AllQueued() and filter Done items, select Item name
+						var finishedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+						var allQueued = q.GetType().GetMethod("AllQueued");
+						if (allQueued?.Invoke(q, null) is IEnumerable queuedEnum)
+						{
+							foreach (var pi in queuedEnum)
+							{
+								if (pi == null) continue;
+								var piType = pi.GetType();
+								var done = (bool)(piType.GetProperty("Done")?.GetValue(pi) ?? false);
+								if (!done) continue;
+
+								var fItem = piType.GetField("Item", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+								var itemName = fItem != null ? (fItem.GetValue(pi) as string ?? "") : (piType.GetProperty("Item")?.GetValue(pi) as string ?? "");
+								if (!string.IsNullOrEmpty(itemName))
+									finishedNames.Add(itemName);
+							}
+						}
+
+						if (finishedNames.Count == 0)
+							continue;
+
+						foreach (var item in finishedNames)
+						{
+							// Resolve ActorInfo
+							if (!world.Map.Rules.Actors.TryGetValue(item, out var actorInfo) || actorInfo == null)
+								continue;
+
+							// actorInfo.TraitInfoOrDefault<BuildingInfo>()
+							var tioMethod = actorInfo.GetType().GetMethod("TraitInfoOrDefault", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+							var tioGeneric = tioMethod?.MakeGenericMethod(biType);
+							var bi = tioGeneric?.Invoke(actorInfo, null);
+							if (bi == null)
+								continue; // not a building
+
+							var cells = new List<PositionData>();
+							foreach (var cell in world.Map.AllCells)
+							{
+								// world.CanPlaceBuilding(cell, actorInfo, bi, null)
+								var okPlace = (bool)(canPlace.Invoke(null, [world, cell, actorInfo, bi, null]) ?? false);
+								if (!okPlace)
+									continue;
+
+								// bi.IsCloseEnoughToBase(world, player, actorInfo, cell)
+								var okNear = (bool)(isCloseEnough.Invoke(bi, [world, player, actorInfo, cell]) ?? false);
+								if (!okNear)
+									continue;
+
+								cells.Add(new PositionData { X = cell.X, Y = cell.Y });
+							}
+
+							if (cells.Count > 0)
+							{
+								results.Add(new PlaceableAreaData
+								{
+									ActorId = a.ActorID,
+									UnitType = item,
+									Cells = cells.ToArray()
+								});
+							}
+						}
 					}
 				}
-				catch { }
 
-				var prodType = biType.GetProperty("BuildAtProductionType")?.GetValue(buildableInfo) as string ?? "";
-
-				result.Add(new BuildableCatalogItem { Name = actorName, Queues = queues, ProductionType = prodType });
+				return results.ToArray();
 			}
-
-			return result.ToArray();
+			catch
+			{
+				// Fall back to empty on any reflection failure to keep interop stable
+				return [];
+			}
 		}
 
 		// Strict feasibility check for a specific (actor, order) against a given target.
