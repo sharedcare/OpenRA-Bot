@@ -8,6 +8,8 @@ import csv
 import numpy as np
 import torch
 
+from models.buffer import Buffer
+
 
 class BaseAgent:
     """
@@ -339,6 +341,8 @@ class PPOAgent(BaseAgent):
               env,
               total_updates: int = 100,
               num_steps: int = 2048,
+              num_envs: int = 1,
+              seq_len: int = 128,
               gamma: float = 0.99,
               gae_lambda: float = 0.95,
               clip_coef: float = 0.2,
@@ -351,6 +355,8 @@ class PPOAgent(BaseAgent):
               target_kl: float = 0.03,
               checkpoint_fn: Optional[Callable[[int, Any], None]] = None,
               log_path: Optional[str] = None) -> None:
+
+        # Setup optimizer and device
         optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
         obs, info = env.reset()
         device = torch.device(self.device)
@@ -367,119 +373,232 @@ class PPOAgent(BaseAgent):
             except Exception:
                 pass
 
-        for update in range(total_updates):
-            obs_buf: List[np.ndarray] = []
-            actions_buf: List[np.ndarray] = []
-            logp_buf: List[float] = []
-            val_buf: List[float] = []
-            rew_buf: List[float] = []
-            done_buf: List[float] = []
-            mask_buf: List[Dict[str, np.ndarray]] = []
+        buffer = Buffer(
+            num_envs=num_envs,
+            seq_len=seq_len,
+            buffer_size=num_steps,
+            observation_space=obs_space,
+            action_space=act_space,
+            device=device,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+            num_lstm_layers=2,  # Match model's LSTM layers
+            hidden_size=256,  # Match model's hidden size
+            has_action_masks=True,
+        )
 
-            for _ in range(num_steps):
-                x = torch.as_tensor(obs, device=device).unsqueeze(0)
-                logits, value = self.model(x)
-                # Build masks from info if available (only action_type used during sampling)
-                masks_t: Dict[str, torch.Tensor] = {}
-                if isinstance(info, dict):
-                    am = info.get("action_mask", {}) or {}
-                    if 'action_type' in am:
-                        t = torch.as_tensor(am['action_type'], device=device)
+        step = 0
+        for update in range(total_updates):
+            buffer.reset()
+            step = 0
+
+            # Reset hidden states for all environments
+            hidden_states = self.model.init_hidden(num_envs, device)
+
+            # Collect rollouts
+            while not buffer.is_full:
+                # Convert obs to tensor
+                if isinstance(obs, np.ndarray):
+                    x = torch.from_numpy(obs).to(device)
+                else:
+                    x = obs.to(device) if isinstance(obs, torch.Tensor) else torch.tensor(obs, device=device)
+
+                # Forward pass
+                with torch.no_grad():
+                    if self.use_lstm:
+                        logits, values, hidden_states = self.model(x, hidden_states)
+                    else:
+                        logits, values = self.model(x)
+
+                # Handle action masks
+                masks_t = {}
+                if "action_mask" in info and "action_type" in info["action_mask"]:
+                    act_mask = info["action_mask"]["action_type"]
+                    if isinstance(act_mask, np.ndarray):
+                        t = torch.from_numpy(act_mask).to(device)
                         if t.dim() == 1:
                             t = t.unsqueeze(0)
-                        masks_t['action_type'] = t
-                action_t, per_head_logps = self.model.policy.sample(logits, masks=masks_t)
-                action_np = action_t.squeeze(0).cpu().numpy()
+                        masks_t["action_type"] = t
 
-                # Store rollout
-                obs_buf.append(obs)
-                actions_buf.append(action_np)
-                logp_buf.append(sum(lp.item() for lp in per_head_logps.values()))
-                val_buf.append(float(value.item()))
-                mask_buf.append({k: v.squeeze(0).detach().cpu().numpy() for k, v in masks_t.items()})
+                # Sample actions
+                actions_t, per_head_logps = self.model.policy_head.sample(
+                    logits, masks=masks_t
+                )
 
-                # Step env
-                next_obs, reward, terminated, truncated, next_info = env.step(action_np)
-                rew_buf.append(float(reward))
-                done_buf.append(float(terminated or truncated))
+            # Step environments
+            actions_np = actions_t.cpu().numpy()
+            next_obs, rewards, dones, truncated, next_info = env.step(actions_np)
 
-                obs, info = next_obs, next_info
-                if terminated or truncated:
-                    obs, info = env.reset()
+            # Handle dones and truncated
+            dones = np.logical_or(dones, truncated)
 
-            # Bootstrap value
-            with torch.no_grad():
-                x = torch.as_tensor(obs, device=device).unsqueeze(0)
+            # Prepare logprobs
+            logprobs_np = np.array([sum(lp.item() for lp in per_head_logps.values()) for _ in range(num_envs)])
+
+            # Store experience in tensor buffer
+            buffer.add(
+                obs=obs,
+                actions=actions_np,
+                rewards=rewards,
+                dones=dones,
+                values=values.cpu().numpy(),
+                logprobs=logprobs_np,
+                masks=masks_t,
+                hidden_state=hidden_states if step % seq_len == 0 else None,
+            )
+
+            # Reset hidden states for done environments
+            if self.use_lstm:
+                done_mask = torch.tensor(dones.astype(np.float32), device=device).view(
+                    1, -1, 1
+                )
+                hidden_states = (
+                    hidden_states[0] * (1 - done_mask),
+                    hidden_states[1] * (1 - done_mask),
+                )
+
+            # Prepare for next step
+            obs = next_obs
+            info = next_info
+            if num_envs == 1 and isinstance(obs, dict) and "vector" in obs:
+                obs = obs["vector"]
+                obs = np.expand_dims(obs, axis=0)
+
+            global_step += num_envs
+
+        # Bootstrap value
+        with torch.no_grad():
+            x = torch.as_tensor(obs, device=device).unsqueeze(0)
+            if self.use_lstm:
+                _, last_v, _ = self.model(x, hidden_states)
+            else:
                 _, last_v = self.model(x)
-                v_last = float(last_v.item())
+            v_last = float(last_v.item())
 
-            values = np.array(val_buf + [v_last], dtype=np.float32)
-            rewards = np.array(rew_buf, dtype=np.float32)
-            dones = np.array(done_buf, dtype=np.float32)
-            advantages, returns = self._gae_returns(rewards, dones, values, gamma=gamma, lam=gae_lambda)
+        # Compute advantages and returns
+        buffer.compute_advantages(v_last, gamma=gamma, lam=gae_lambda)
 
-            # Normalize advantages
-            adv_mean = advantages.mean() if advantages.size > 0 else 0.0
-            adv_std = advantages.std() + 1e-8
-            advantages = (advantages - adv_mean) / adv_std
+        # PPO epochs
+        for epoch in range(update_epochs):
+            for batch in buffer.recurrent_mini_batch_generator(minibatch_size, 1):
+                # Extract batch data
+                mb_obs = batch["obs"]  # (batch_size, seq_len, num_envs, obs_shape)
+                mb_actions = batch[
+                    "actions"
+                ]  # (batch_size, seq_len, num_envs, action_dim)
+                mb_old_logprobs = batch[
+                    "old_logprobs"
+                ]  # (batch_size, seq_len, num_envs)
+                mb_advantages = batch["advantages"]  # (batch_size, seq_len, num_envs)
+                mb_returns = batch["returns"]  # (batch_size, seq_len, num_envs)
+                mb_masks = batch["masks"]
+                mb_hidden = batch[
+                    "hidden_states"
+                ]  # ((batch_size, num_layers, num_envs, hidden_size), ...)
+                mb_attention_mask = batch[
+                    "attention_mask"
+                ]  # (batch_size, seq_len, num_envs)
 
-            # Flatten buffers into tensors
-            b_obs = torch.as_tensor(np.array(obs_buf), device=device)
-            b_actions = torch.as_tensor(np.array(actions_buf), device=device)
-            b_logp = torch.as_tensor(np.array(logp_buf), device=device)
-            b_returns = torch.as_tensor(returns, device=device)
-            b_adv = torch.as_tensor(advantages, device=device)
-            # Only mask we use during recompute is action_type
-            b_masks: Dict[str, torch.Tensor] = {}
-            if mask_buf and ('action_type' in mask_buf[0]):
-                b_masks['action_type'] = torch.as_tensor(np.stack([m.get('action_type') for m in mask_buf], axis=0), device=device)
+                # Reshape for model input: combine batch and env dimensions
+                batch_size, seq_len, num_envs = mb_obs.shape[:3]
+                mb_obs_flat = mb_obs.view(batch_size * num_envs, seq_len, *mb_obs.shape[3:])
+                mb_hidden_flat = (
+                    mb_hidden[0].permute(0, 2, 1, 3).contiguous().view(batch_size * num_envs, self.model.num_lstm_layers, -1),
+                    mb_hidden[1].permute(0, 2, 1, 3).contiguous().view(batch_size * num_envs, self.model.num_lstm_layers, -1)
+                )
 
-            # PPO epochs
-            num_samples = b_obs.shape[0]
-            batch_idx = np.arange(num_samples)
-            for _ in range(update_epochs):
-                np.random.shuffle(batch_idx)
-                for start in range(0, num_samples, minibatch_size):
-                    end = start + minibatch_size
-                    mb_idx = batch_idx[start:end]
+                # Forward pass through model
+                if self.use_lstm:
+                    logits, values_pred, _ = self.model(mb_obs_flat, mb_hidden_flat)
+                else:
+                    logits, values_pred = self.model(mb_obs_flat)
 
-                    mb_obs = b_obs[mb_idx]
-                    mb_actions = b_actions[mb_idx]
-                    mb_old_logp = b_logp[mb_idx]
-                    mb_adv = b_adv[mb_idx]
-                    mb_returns = b_returns[mb_idx]
-                    mb_masks: Dict[str, torch.Tensor] = {}
-                    if 'action_type' in b_masks:
-                        mb_masks['action_type'] = b_masks['action_type'][mb_idx]
+                # Reshape back to (batch_size, num_envs, seq_len, ...)
+                logits = {
+                    k: v.view(batch_size, num_envs, seq_len, -1)
+                    for k, v in logits.items()
+                }
+                values_pred = values_pred.view(batch_size, num_envs, seq_len)
 
-                    logits, values_pred = self.model(mb_obs)
-                    new_logp, entropy = self._logprob_and_entropy(logits, mb_actions, masks=mb_masks)
-                    ratio = (new_logp - mb_old_logp).exp()
+                # Compute logprobs and entropy with masking
+                # Reshape actions to (batch_size * num_envs * seq_len, action_dim)
+                mb_actions_flat = (
+                    mb_actions.permute(0, 2, 1, 3)
+                    .contiguous()
+                    .view(-1, mb_actions.shape[-1])
+                )
+                new_logp, entropy = self._logprob_and_entropy(
+                    {
+                        k: v.permute(0, 1, 3, 2).contiguous().view(-1, v.shape[-1])
+                        for k, v in logits.items()
+                    },
+                    mb_actions_flat,
+                    masks=(
+                        {
+                            k: v.permute(0, 2, 1, 3).contiguous().view(-1, *v.shape[3:])
+                            for k, v in mb_masks.items()
+                        }
+                        if mb_masks
+                        else None
+                    ),
+                )
 
-                    # Policy loss with clipping
-                    unclipped = ratio * mb_adv
-                    clipped = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * mb_adv
-                    policy_loss = -torch.min(unclipped, clipped).mean()
+                # Reshape and apply attention mask
+                new_logp = new_logp.view(batch_size, num_envs, seq_len)
+                entropy = entropy.view(batch_size, num_envs, seq_len)
+                mb_old_logprobs = mb_old_logprobs.permute(
+                    0, 2, 1
+                )  # (batch_size, num_envs, seq_len)
+                mb_advantages = mb_advantages.permute(
+                    0, 2, 1
+                )  # (batch_size, num_envs, seq_len)
+                mb_returns = mb_returns.permute(
+                    0, 2, 1
+                )  # (batch_size, num_envs, seq_len)
+                mb_attention_mask = mb_attention_mask.permute(
+                    0, 2, 1
+                )  # (batch_size, num_envs, seq_len)
 
-                    # Value loss
-                    v_pred = values_pred.squeeze(-1)
-                    value_loss = torch.nn.functional.mse_loss(v_pred, mb_returns)
+                # Apply attention mask
+                valid_steps = mb_attention_mask.sum()
+                if valid_steps == 0:
+                    continue
 
-                    entropy_loss = -entropy.mean()
-                    loss = policy_loss + vf_coef * value_loss + ent_coef * (-entropy_loss)
+                new_logp = new_logp * mb_attention_mask
+                entropy = entropy * mb_attention_mask
+                values_pred = values_pred * mb_attention_mask
+                mb_old_logprobs = mb_old_logprobs * mb_attention_mask
+                mb_advantages = mb_advantages * mb_attention_mask
+                mb_returns = mb_returns * mb_attention_mask
 
-                    optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
-                    optimizer.step()
+                # Compute ratio for PPO
+                ratio = torch.exp(new_logp - mb_old_logprobs)
 
-                # Early stop by KL
-                with torch.no_grad():
-                    logits_full, _ = self.model(b_obs)
-                    new_logp_full, _ = self._logprob_and_entropy(logits_full, b_actions, masks=b_masks)
-                    approx_kl = (b_logp - new_logp_full).mean().item()
-                    if approx_kl > target_kl:
-                        break
+                # Policy loss with clipping
+                unclipped = ratio * mb_advantages
+                clipped = (
+                    torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * mb_advantages
+                )
+                policy_loss = (
+                    -(torch.min(unclipped, clipped) * mb_attention_mask).sum()
+                    / valid_steps
+                )
+
+                # Value loss
+                value_loss = (
+                    0.5 * ((values_pred - mb_returns) ** 2) * mb_attention_mask
+                ).sum() / valid_steps
+
+                # Entropy loss
+                entropy_loss = -(entropy * mb_attention_mask).sum() / valid_steps
+
+                # Total loss
+                loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+                optimizer.step()
 
             # Optional checkpoint callback
             if checkpoint_fn is not None:
@@ -489,24 +608,24 @@ class PPOAgent(BaseAgent):
             try:
                 # Recompute full-batch stats for logging
                 with torch.no_grad():
-                    logits_full, values_full = self.model(b_obs)
-                    new_logp_full, entropy_full = self._logprob_and_entropy(logits_full, b_actions, masks=b_masks)
-                    ratio_full = (new_logp_full - b_logp).exp()
-                    unclipped_full = ratio_full * b_adv
-                    clipped_full = torch.clamp(ratio_full, 1.0 - clip_coef, 1.0 + clip_coef) * b_adv
+                    logits_full, values_full = self.model(mb_obs)
+                    new_logp_full, entropy_full = self._logprob_and_entropy(logits_full, mb_actions, masks=mb_masks)
+                    ratio_full = (new_logp_full - mb_old_logprobs).exp()
+                    unclipped_full = ratio_full * mb_advantages
+                    clipped_full = torch.clamp(ratio_full, 1.0 - clip_coef, 1.0 + clip_coef) * mb_advantages
                     policy_loss_full = -torch.min(unclipped_full, clipped_full).mean().item()
-                    value_loss_full = torch.nn.functional.mse_loss(values_full.squeeze(-1), b_returns).item()
-                    approx_kl = (b_logp - new_logp_full).mean().item()
+                    value_loss_full = torch.nn.functional.mse_loss(values_full.squeeze(-1), mb_returns).item()
+                    approx_kl = (mb_old_logprobs - new_logp_full).mean().item()
                     entropy_mean = entropy_full.mean().item()
 
-                rewards_np = np.array(rew_buf, dtype=np.float32)
+                rewards_np = np.array(rewards, dtype=np.float32)
                 mean_reward = float(rewards_np.mean()) if rewards_np.size else 0.0
                 std_reward = float(rewards_np.std()) if rewards_np.size else 0.0
                 nz_frac = float((np.abs(rewards_np) > 1e-8).sum() / max(1, rewards_np.size))
 
                 # Action-type distribution
                 try:
-                    a_type = np.array(actions_buf, dtype=np.int64)[:, 0]
+                    a_type = np.array(actions_t, dtype=np.int64)[:, 0]
                     unique, counts = np.unique(a_type, return_counts=True)
                     dist = {int(u): int(c) for u, c in zip(unique, counts)}
                 except Exception:

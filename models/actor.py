@@ -5,8 +5,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
+import numpy as np
 
-def _mlp(sizes: Sequence[int], activation=nn.ReLU, out_act: Optional[nn.Module] = None) -> nn.Sequential:
+
+def _mlp(
+    sizes: Sequence[int], activation=nn.ReLU, out_act: Optional[nn.Module] = None
+) -> nn.Sequential:
     layers: List[nn.Module] = []
     for i in range(len(sizes) - 1):
         layers.append(nn.Linear(sizes[i], sizes[i + 1]))
@@ -57,7 +61,12 @@ class VectorEncoder(nn.Module):
     MLP encoder for vector observations used by OpenRA vector env.
     """
 
-    def __init__(self, obs_dim: int, hidden_sizes: Sequence[int] = (512, 256), feature_dim: int = 256) -> None:
+    def __init__(
+        self,
+        obs_dim: int,
+        hidden_sizes: Sequence[int] = (512, 256),
+        feature_dim: int = 256,
+    ) -> None:
         super().__init__()
         self.net = _mlp([obs_dim, *hidden_sizes, feature_dim])
 
@@ -70,9 +79,13 @@ class MixedEncoder(nn.Module):
     Combine vector and vision encoders for hybrid observations.
     """
 
-    def __init__(self, obs_dim: int, in_channels: int = 10, feature_dim: int = 256) -> None:
+    def __init__(
+        self, obs_dim: int, in_channels: int = 10, feature_dim: int = 256
+    ) -> None:
         super().__init__()
-        self.vec = VectorEncoder(obs_dim=obs_dim, hidden_sizes=(512, 256), feature_dim=feature_dim)
+        self.vec = VectorEncoder(
+            obs_dim=obs_dim, hidden_sizes=(512, 256), feature_dim=feature_dim
+        )
         self.vision = VisionEncoder(in_channels=in_channels, feature_dim=feature_dim)
         self.proj = _mlp([feature_dim * 2, feature_dim])
 
@@ -162,23 +175,74 @@ class ActorCritic(nn.Module):
         action_dims: Tuple[int, int, int, int, int, int],
         observation_type: str = "vector",
         feature_dim: int = 256,
+        hidden_size: int = 256,
+        recurrent_type: Optional[str] = None,  # [None, "lstm", "gru"]
+        recurrent_hidden_size: int = 256,
     ) -> None:
         super().__init__()
         self.observation_type = observation_type
+        self.recurrent_type = recurrent_type
+        self.recurrent_hidden_size = recurrent_hidden_size
         if observation_type == "vector":
             obs_dim = int(obs_space.get("vector", 0))
-            self.encoder = VectorEncoder(obs_dim=obs_dim, hidden_sizes=(512, 256), feature_dim=feature_dim)
+            self.encoder = VectorEncoder(
+                obs_dim=obs_dim, hidden_sizes=(512, 256), feature_dim=feature_dim
+            )
         elif observation_type == "image":
             in_ch = int(obs_space.get("channels", 10))
             self.encoder = VisionEncoder(in_channels=in_ch, feature_dim=feature_dim)
         else:
             raise ValueError(f"Unsupported observation_type: {observation_type}")
 
-        self.policy = MultiDiscretePolicy(feature_dim=feature_dim, action_dims=action_dims)
-        self.value_head = _mlp([feature_dim, 256, 1])
+        if self.recurrent_type == "lstm":
+            self.core = nn.LSTM(
+                input_size=feature_dim,
+                hidden_size=recurrent_hidden_size,
+                num_layers=2,
+                batch_first=True,
+            )
+        elif self.recurrent_type == "gru":
+            self.core = nn.GRU(
+                input_size=feature_dim,
+                hidden_size=recurrent_hidden_size,
+                num_layers=2,
+                batch_first=True,
+            )
+        # Init recurrent layer
+        for name, param in self.core.named_parameters():
+            if "bias" in name:
+                nn.init.constant_(param, 0)
+            elif "weight" in name:
+                nn.init.orthogonal_(param, np.sqrt(2))
 
-    def forward(self, obs: torch.Tensor) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        self.hidden_layer = nn.Linear(
+            recurrent_hidden_size, hidden_size
+        )
+
+        self.policy_head = MultiDiscretePolicy(
+            feature_dim=recurrent_hidden_size, action_dims=action_dims
+        )
+        self.value_head = _mlp([recurrent_hidden_size, 256, 1])
+
+    def init_hidden(
+        self, batch_size: int, device: str
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        h = torch.zeros(2, batch_size, self.recurrent_hidden_size, device=device)
+        c = None
+        if self.recurrent_type == "lstm":
+            c = torch.zeros(2, batch_size, self.recurrent_hidden_size, device=device)
+        return (h, c)
+
+    def forward(
+        self, obs: torch.Tensor, hidden: Tuple[torch.Tensor, torch.Tensor], seq_len: int = 1
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         features = self.encoder(obs)
-        logits = self.policy(features)
+        if seq_len == 1:
+            features, hidden = self.core(features.unsqueeze(1), hidden)
+            features = features.squeeze(1)
+        else:
+            bs, feature_dim = features.shape
+
+        logits = self.policy_head(features)
         value = self.value_head(features).squeeze(-1)
         return logits, value
