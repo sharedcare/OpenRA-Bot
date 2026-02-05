@@ -209,8 +209,10 @@ class Buffer:
         # Store hidden state at sequence boundaries
         if self.step_idx % self.seq_len == 0 and hidden_state is not None:
             # hidden_state shape: (num_layers, num_envs, hidden_size)
-            self.hidden_states_h[self.seq_idx] = hidden_state[0]
-            self.hidden_states_c[self.seq_idx] = hidden_state[1]
+            if hidden_state[0] is not None:
+                self.hidden_states_h[self.seq_idx] = hidden_state[0]
+            if hidden_state[1] is not None:
+                self.hidden_states_c[self.seq_idx] = hidden_state[1]
             self.seq_idx += 1
 
         # Track episode statistics
