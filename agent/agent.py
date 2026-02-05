@@ -260,6 +260,8 @@ class PPOAgent(BaseAgent):
         super().__init__()
         self.model = model
         self.device = device
+        self.use_lstm = (getattr(model, "recurrent_type", None) is not None)
+        self._rnn_state = None
 
     # ---------- Acting ----------
     def _obs_to_tensor(self, obs: Any) -> Any:
@@ -372,6 +374,23 @@ class PPOAgent(BaseAgent):
                         w.writerow(["update", "mean_reward", "std_reward", "nz_frac", "approx_kl", "entropy_mean", "policy_loss_full", "value_loss_full"])
             except Exception:
                 pass
+
+        # Determine space shapes for buffer
+        if isinstance(env.observation_space, dict):
+            # Already compatible with buffer
+            obs_space = env.observation_space
+        elif hasattr(env.observation_space, "shape"):
+            # Wrap standard gym space
+            if len(env.observation_space.shape) == 1:
+                obs_space = {"vector": env.observation_space.shape[0]}
+            elif len(env.observation_space.shape) == 3:
+                obs_space = {"channels": env.observation_space.shape[-1]} # assume HWC or similar
+            else:
+                obs_space = {"vector": int(np.prod(env.observation_space.shape))}
+        else:
+            obs_space = {"vector": 1}
+        
+        act_space = env.action_space
 
         buffer = Buffer(
             num_envs=num_envs,
@@ -502,16 +521,21 @@ class PPOAgent(BaseAgent):
                 # Reshape for model input: combine batch and env dimensions
                 batch_size, seq_len, num_envs = mb_obs.shape[:3]
                 mb_obs_flat = mb_obs.view(batch_size * num_envs, seq_len, *mb_obs.shape[3:])
-                mb_hidden_flat = (
-                    mb_hidden[0].permute(0, 2, 1, 3).contiguous().view(batch_size * num_envs, self.model.num_lstm_layers, -1),
-                    mb_hidden[1].permute(0, 2, 1, 3).contiguous().view(batch_size * num_envs, self.model.num_lstm_layers, -1)
-                )
+                
+                if self.use_lstm:
+                    # mb_hidden[0] shape: (batch_size, num_layers, num_envs, hidden_size)
+                    # Target: (num_layers, batch_size * num_envs, hidden_size)
+                    h_flat = mb_hidden[0].permute(1, 0, 2, 3).contiguous().view(self.model.num_lstm_layers, batch_size * num_envs, -1)
+                    c_flat = mb_hidden[1].permute(1, 0, 2, 3).contiguous().view(self.model.num_lstm_layers, batch_size * num_envs, -1)
+                    mb_hidden_flat = (h_flat, c_flat)
+                else:
+                    mb_hidden_flat = None
 
                 # Forward pass through model
                 if self.use_lstm:
-                    logits, values_pred, _ = self.model(mb_obs_flat, mb_hidden_flat)
+                    logits, values_pred, _ = self.model(mb_obs_flat, mb_hidden_flat, seq_len=seq_len)
                 else:
-                    logits, values_pred = self.model(mb_obs_flat)
+                    logits, values_pred, _ = self.model(mb_obs_flat, seq_len=seq_len)
 
                 # Reshape back to (batch_size, num_envs, seq_len, ...)
                 logits = {
@@ -634,9 +658,9 @@ class PPOAgent(BaseAgent):
                 # Mask coverage (action_type)
                 mask_mean = None
                 try:
-                    if mask_buf and ('action_type' in mask_buf[0]):
-                        m = np.stack([m['action_type'] for m in mask_buf], axis=0)
-                        mask_mean = float(m.mean())
+                    stats = buffer.get_mask_statistics()
+                    if stats is not None:
+                        mask_mean = stats
                 except Exception:
                     mask_mean = None
 

@@ -209,11 +209,14 @@ class ActorCritic(nn.Module):
                 batch_first=True,
             )
         # Init recurrent layer
-        for name, param in self.core.named_parameters():
-            if "bias" in name:
-                nn.init.constant_(param, 0)
-            elif "weight" in name:
-                nn.init.orthogonal_(param, np.sqrt(2))
+        if self.recurrent_type:
+            for name, param in self.core.named_parameters():
+                if "bias" in name:
+                    nn.init.constant_(param, 0)
+                elif "weight" in name:
+                    nn.init.orthogonal_(param, np.sqrt(2))
+        else:
+            self.core = nn.Linear(feature_dim, recurrent_hidden_size)
 
         self.hidden_layer = nn.Linear(
             recurrent_hidden_size, hidden_size
@@ -227,6 +230,8 @@ class ActorCritic(nn.Module):
     def init_hidden(
         self, batch_size: int, device: str
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.recurrent_type is None:
+            return None, None
         h = torch.zeros(2, batch_size, self.recurrent_hidden_size, device=device)
         c = None
         if self.recurrent_type == "lstm":
@@ -234,15 +239,41 @@ class ActorCritic(nn.Module):
         return (h, c)
 
     def forward(
-        self, obs: torch.Tensor, hidden: Tuple[torch.Tensor, torch.Tensor], seq_len: int = 1
-    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        features = self.encoder(obs)
-        if seq_len == 1:
-            features, hidden = self.core(features.unsqueeze(1), hidden)
-            features = features.squeeze(1)
+        self, obs: torch.Tensor, hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, seq_len: int = 1
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        # obs shape: (batch_size, seq_len, *obs_dim) or (batch_size, *obs_dim) if seq_len=1
+        
+        # Flatten batch and sequence dimensions for encoder
+        if seq_len > 1:
+            batch_size = obs.shape[0]
+            # obs: (B, L, ...) -> (B*L, ...)
+            obs_flat = obs.reshape(-1, *obs.shape[2:])
+            features_flat = self.encoder(obs_flat)
+            # features: (B*L, D) -> (B, L, D)
+            features = features_flat.view(batch_size, seq_len, -1)
         else:
-            bs, feature_dim = features.shape
+            # obs: (B, ...)
+            features = self.encoder(obs)
+            # features: (B, D) -> (B, 1, D)
+            features = features.unsqueeze(1)
 
-        logits = self.policy_head(features)
-        value = self.value_head(features).squeeze(-1)
-        return logits, value
+        # Recurrent update
+        if self.recurrent_type is not None:
+            # features: (B, L, D)
+            # hidden: (num_layers, B, H)
+            output, hidden = self.core(features, hidden)
+        else:
+            # Feedforward projection
+            output = self.core(features)
+            hidden = None
+        
+        # output: (B, L, H)
+        
+        # Flatten for heads
+        # output: (B, L, H) -> (B*L, H)
+        output_flat = output.reshape(-1, self.recurrent_hidden_size)
+
+        logits = self.policy_head(output_flat)
+        value = self.value_head(output_flat).squeeze(-1)
+        
+        return logits, value, hidden

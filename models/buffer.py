@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union, Generator
 import torch
 import numpy as np
 
@@ -209,8 +209,10 @@ class Buffer:
         # Store hidden state at sequence boundaries
         if self.step_idx % self.seq_len == 0 and hidden_state is not None:
             # hidden_state shape: (num_layers, num_envs, hidden_size)
-            self.hidden_states_h[self.seq_idx] = hidden_state[0]
-            self.hidden_states_c[self.seq_idx] = hidden_state[1]
+            if hidden_state[0] is not None:
+                self.hidden_states_h[self.seq_idx] = hidden_state[0]
+            if hidden_state[1] is not None:
+                self.hidden_states_c[self.seq_idx] = hidden_state[1]
             self.seq_idx += 1
 
         # Track episode statistics
@@ -284,7 +286,7 @@ class Buffer:
             self.advantages = advantages
             self.returns = returns
 
-    def recurrent_mini_batch_generator(self, minibatch_size: int, num_epochs: int) -> torch.Generator[Dict[str, torch.Tensor], None, None]:
+    def recurrent_mini_batch_generator(self, minibatch_size: int, num_epochs: int) -> Generator[Dict[str, torch.Tensor], None, None]:
         """
         Generate minibatches of sequences for recurrent training using tensor slicing.
 
