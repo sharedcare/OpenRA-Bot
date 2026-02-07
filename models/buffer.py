@@ -250,41 +250,29 @@ class Buffer:
                 "Buffer not full. Compute advantages only after collection is complete."
             )
 
-        # Prepare tensors
-        rewards = self.rewards[: self.step_idx]  # (steps, num_envs)
-        dones = self.dones[: self.step_idx]  # (steps, num_envs)
-        values = self.values[: self.step_idx]  # (steps, num_envs)
+        T = self.step_idx
+        rewards = self.rewards[:T]          # (T, N)
+        dones = self.dones[:T]              # (T, N) float 0/1
+        values = self.values[:T]            # (T, N)
 
-        # Add last values for bootstrapping
-        last_values = last_values.view(1, -1)  # (1, num_envs)
-        values = torch.cat([values, last_values], dim=0)  # (steps+1, num_envs)
+        last_values = last_values.view(1, -1)              # (1, N)
+        values_boot = torch.cat([values, last_values], 0)  # (T+1, N)
 
-        # Compute advantages and returns for each environment using tensor operations
-        advantages = torch.zeros_like(rewards)
-        returns = torch.zeros_like(rewards)
+        adv = torch.zeros_like(rewards)
+        gae = torch.zeros(self.num_envs, device=self.device)
 
         with torch.no_grad():
-            advantage = torch.zeros(self.num_envs, device=self.device)
-            for t in reversed(range(self.step_idx)):
-                next_is_not_terminal = 1.0 - dones[t].float()
-                delta = (
-                    rewards[t]
-                    + next_is_not_terminal * gamma * values[t + 1]
-                    - values[t]
-                )
-                advantage = delta + next_is_not_terminal * gamma * lam * advantage
-                advantages[t] = advantage
+            for t in reversed(range(T)):
+                nonterminal = 1.0 - dones[t]  # dones 已是 float
+                delta = rewards[t] + gamma * values_boot[t + 1] * nonterminal - values_boot[t]
+                gae = gae * gamma * lam + delta
+                adv[t] = gae
 
-            returns = advantages + values[:-1]
+            ret = adv + values_boot[:-1]
+            adv = (adv - adv.mean()) / (adv.std() + EPSILON)
 
-            # Compute and normalize the advantages
-            advantages = returns - values
-            advantages = (advantages - advantages.mean()) / torch.clamp(
-                advantages.std(), min=EPSILON
-            )
-
-            self.advantages = advantages
-            self.returns = returns
+        self.advantages = adv
+        self.returns = ret
 
     def recurrent_mini_batch_generator(self, minibatch_size: int, num_epochs: int) -> Generator[Dict[str, torch.Tensor], None, None]:
         """

@@ -8,9 +8,7 @@ import torch.nn as nn
 import numpy as np
 
 
-def _mlp(
-    sizes: Sequence[int], activation=nn.ReLU, out_act: Optional[nn.Module] = None
-) -> nn.Sequential:
+def _mlp(sizes: Sequence[int], activation=nn.ReLU, out_act: Optional[nn.Module] = None) -> nn.Sequential:
     layers: List[nn.Module] = []
     for i in range(len(sizes) - 1):
         layers.append(nn.Linear(sizes[i], sizes[i + 1]))
@@ -79,13 +77,9 @@ class MixedEncoder(nn.Module):
     Combine vector and vision encoders for hybrid observations.
     """
 
-    def __init__(
-        self, obs_dim: int, in_channels: int = 10, feature_dim: int = 256
-    ) -> None:
+    def __init__(self, obs_dim: int, in_channels: int = 10, feature_dim: int = 256) -> None:
         super().__init__()
-        self.vec = VectorEncoder(
-            obs_dim=obs_dim, hidden_sizes=(512, 256), feature_dim=feature_dim
-        )
+        self.vec = VectorEncoder(obs_dim=obs_dim, hidden_sizes=(512, 256), feature_dim=feature_dim)
         self.vision = VisionEncoder(in_channels=in_channels, feature_dim=feature_dim)
         self.proj = _mlp([feature_dim * 2, feature_dim])
 
@@ -97,6 +91,7 @@ class MixedEncoder(nn.Module):
 
 
 class MultiDiscretePolicy(nn.Module):
+    HEADS = ["action_type", "unit_idx", "target_x", "target_y", "target_idx", "unit_type"]
     """
     Multi-head policy for OpenRA MultiDiscrete action space:
     [action_type, unit_idx, target_x, target_y, target_idx, unit_type_idx]
@@ -132,6 +127,23 @@ class MultiDiscretePolicy(nn.Module):
             "unit_type": self.head_unit_type(h),
         }
 
+    @staticmethod
+    def masked_logits(
+        logits: Dict[str, torch.Tensor], masks: Optional[Dict[str, torch.Tensor]] = None
+    ) -> Dict[str, torch.Tensor]:
+        if not masks:
+            return logits
+        out: Dict[str, torch.Tensor] = {}
+        for k, lg in logits.items():
+            m = masks.get(k, None)
+            if m is None:
+                out[k] = lg
+                continue
+            # m: 1(valid) / 0(invalid), broadcastable to lg
+            m = m.to(dtype=lg.dtype, device=lg.device)
+            out[k] = lg + torch.log(m.clamp_min(1e-6))
+        return out
+
     @torch.no_grad()
     def sample(
         self,
@@ -143,23 +155,14 @@ class MultiDiscretePolicy(nn.Module):
         masks: dict of boolean tensors broadcastable to logits.
         Returns (action_tensor, logprobs_per_head)
         """
+        lg = self.masked_logits(logits, masks)
         actions: List[torch.Tensor] = []
         logps: Dict[str, torch.Tensor] = {}
-        out_logits: Dict[str, torch.Tensor] = {}
-        for key, lg in logits.items():
-            if masks and key in masks and masks[key] is not None:
-                # very negative for invalid actions
-                mask = masks[key].to(lg.dtype)
-                # Ensure mask is 1 for valid, 0 for invalid
-                # Convert to additive mask in logit space
-                add = torch.log(mask.clamp(min=1e-6))
-                lg = lg + add
-            dist = torch.distributions.Categorical(logits=lg)
+        for key in self.HEADS:
+            dist = torch.distributions.Categorical(logits=lg[key])
             a = dist.sample()
             actions.append(a)
             logps[key] = dist.log_prob(a)
-            out_logits[key] = lg
-        # Order: action_type, unit_idx, target_x, target_y, target_idx, unit_type
         act = torch.stack(actions, dim=-1)
         return act, logps
 
@@ -185,9 +188,7 @@ class ActorCritic(nn.Module):
         self.recurrent_hidden_size = recurrent_hidden_size
         if observation_type == "vector":
             obs_dim = int(obs_space.get("vector", 0))
-            self.encoder = VectorEncoder(
-                obs_dim=obs_dim, hidden_sizes=(512, 256), feature_dim=feature_dim
-            )
+            self.encoder = VectorEncoder(obs_dim=obs_dim, hidden_sizes=(512, 256), feature_dim=feature_dim)
         elif observation_type == "image":
             in_ch = int(obs_space.get("channels", 10))
             self.encoder = VisionEncoder(in_channels=in_ch, feature_dim=feature_dim)
@@ -218,18 +219,12 @@ class ActorCritic(nn.Module):
         else:
             self.core = nn.Linear(feature_dim, recurrent_hidden_size)
 
-        self.hidden_layer = nn.Linear(
-            recurrent_hidden_size, hidden_size
-        )
+        self.hidden_layer = nn.Linear(recurrent_hidden_size, hidden_size)
 
-        self.policy_head = MultiDiscretePolicy(
-            feature_dim=recurrent_hidden_size, action_dims=action_dims
-        )
+        self.policy_head = MultiDiscretePolicy(feature_dim=recurrent_hidden_size, action_dims=action_dims)
         self.value_head = _mlp([recurrent_hidden_size, 256, 1])
 
-    def init_hidden(
-        self, batch_size: int, device: str
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def init_hidden(self, batch_size: int, device: str) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.recurrent_type is None:
             return None, None
         h = torch.zeros(2, batch_size, self.recurrent_hidden_size, device=device)
@@ -242,7 +237,10 @@ class ActorCritic(nn.Module):
         self, obs: torch.Tensor, hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, seq_len: int = 1
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # obs shape: (batch_size, seq_len, *obs_dim) or (batch_size, *obs_dim) if seq_len=1
-        
+        # Ensure obs is at least 2D
+        if obs.dim() == 1:
+            obs = obs.unsqueeze(0)
+
         # Flatten batch and sequence dimensions for encoder
         if seq_len > 1:
             batch_size = obs.shape[0]
@@ -253,27 +251,41 @@ class ActorCritic(nn.Module):
             features = features_flat.view(batch_size, seq_len, -1)
         else:
             # obs: (B, ...)
+            batch_size = obs.shape[0]
             features = self.encoder(obs)
-            # features: (B, D) -> (B, 1, D)
-            features = features.unsqueeze(1)
+            # features: (B, D) -> (B, 1, D) for batch_first LSTM
+            if features.dim() == 2:
+                features = features.unsqueeze(1)
 
         # Recurrent update
         if self.recurrent_type is not None:
-            # features: (B, L, D)
-            # hidden: (num_layers, B, H)
+            # features: (B, L, D) where L=1 for single step
+            # hidden: (num_layers, B, H) for batch_first=True LSTM
+            # Ensure hidden state shape matches batch size
+            if hidden is not None and hidden[0] is not None:
+                # Check if hidden state batch size matches
+                num_layers = hidden[0].shape[0]
+                if hidden[0].shape[1] != batch_size:
+                    # Reinitialize hidden state with correct batch size
+                    device = hidden[0].device
+                    h = torch.zeros(num_layers, batch_size, self.recurrent_hidden_size, device=device)
+                    c = None
+                    if self.recurrent_type == "lstm" and hidden[1] is not None:
+                        c = torch.zeros(num_layers, batch_size, self.recurrent_hidden_size, device=device)
+                    hidden = (h, c)
+
             output, hidden = self.core(features, hidden)
+            # output: (B, L, H)
+            # Flatten for heads
+            output_flat = output.reshape(-1, self.recurrent_hidden_size)
         else:
             # Feedforward projection
-            output = self.core(features)
+            # features: (B, L, D) -> flatten to (B*L, D) for Linear
+            features_flat = features.reshape(-1, features.shape[-1])
+            output_flat = self.core(features_flat)  # (B*L, H)
             hidden = None
-        
-        # output: (B, L, H)
-        
-        # Flatten for heads
-        # output: (B, L, H) -> (B*L, H)
-        output_flat = output.reshape(-1, self.recurrent_hidden_size)
 
         logits = self.policy_head(output_flat)
         value = self.value_head(output_flat).squeeze(-1)
-        
+
         return logits, value, hidden
