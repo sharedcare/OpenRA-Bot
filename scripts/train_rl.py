@@ -132,7 +132,7 @@ def train(
             base = log_dir
             if not os.path.exists(base):
                 os.makedirs(base)
-            path = os.path.join(base, "model_{}.pth".format(u))
+            path = os.path.join(base, f"model_{u:04d}.pth")
             torch.save(mdl.state_dict(), path)
             print(f"Model saved to {path}")
         except Exception as e:

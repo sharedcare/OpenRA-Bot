@@ -186,6 +186,9 @@ class ActorCritic(nn.Module):
         self.observation_type = observation_type
         self.recurrent_type = recurrent_type
         self.recurrent_hidden_size = recurrent_hidden_size
+        self.num_recurrent_layers = 2
+        # Backward-compatible name used by PPOAgent training code.
+        self.num_lstm_layers = self.num_recurrent_layers
         if observation_type == "vector":
             obs_dim = int(obs_space.get("vector", 0))
             self.encoder = VectorEncoder(obs_dim=obs_dim, hidden_sizes=(512, 256), feature_dim=feature_dim)
@@ -199,14 +202,14 @@ class ActorCritic(nn.Module):
             self.core = nn.LSTM(
                 input_size=feature_dim,
                 hidden_size=recurrent_hidden_size,
-                num_layers=2,
+                num_layers=self.num_recurrent_layers,
                 batch_first=True,
             )
         elif self.recurrent_type == "gru":
             self.core = nn.GRU(
                 input_size=feature_dim,
                 hidden_size=recurrent_hidden_size,
-                num_layers=2,
+                num_layers=self.num_recurrent_layers,
                 batch_first=True,
             )
         # Init recurrent layer
@@ -227,10 +230,10 @@ class ActorCritic(nn.Module):
     def init_hidden(self, batch_size: int, device: str) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.recurrent_type is None:
             return None, None
-        h = torch.zeros(2, batch_size, self.recurrent_hidden_size, device=device)
+        h = torch.zeros(self.num_recurrent_layers, batch_size, self.recurrent_hidden_size, device=device)
         c = None
         if self.recurrent_type == "lstm":
-            c = torch.zeros(2, batch_size, self.recurrent_hidden_size, device=device)
+            c = torch.zeros(self.num_recurrent_layers, batch_size, self.recurrent_hidden_size, device=device)
         return (h, c)
 
     def forward(

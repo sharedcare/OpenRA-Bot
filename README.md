@@ -1,195 +1,245 @@
-# OpenRA Reinforcement Learning Environment (OpenRA.Bot)
+# OpenRA.Bot
 
-A Gymnasium-compatible Python interface and an in-engine C# bridge for training RL agents on [OpenRA](https://github.com/OpenRA/OpenRA).
+`OpenRA.Bot` is a Python-side RL/control package for [OpenRA](https://github.com/OpenRA/OpenRA). It uses `pythonnet` to load the built game assemblies, calls the engine-side `PythonAPI`, and exposes a Gym-style environment for random agents, rule-based agents, and a baseline PPO training loop.
 
-## Features
+This repository currently contains a usable end-to-end baseline, but it is still closer to a research scaffold than a polished RL framework. In particular, the PPO stack, action masking, and observation design are still evolving.
 
-- Gymnasium-compatible API (reset/step/close with `observation, reward, terminated, truncated, info`)
-- Vector and image observations
-- Action space covering move, attack, produce, build, deploy
-- Direct in-engine control via `PythonAPI.cs`
-- Examples for random play, a simple rule-based agent, and Stable-Baselines3
+## What Is In Scope
 
-## Repository Layout
+- Python environment wrapper around the in-engine API
+- Engine-side `PythonAPI` bridge for local game start, stepping, state extraction, and action dispatch
+- Rule-based and random agents for smoke testing
+- A custom `ActorCritic` + `PPOAgent` baseline
+- Local game, local hosted lobby, and remote lobby connection helpers
 
-- `openra_env.py`: Python environment implementation
-- `example_usage.py`: End-to-end examples (random, agent, SB3, vision)
-- `requirements.txt`: Python dependencies
-- `PythonAPI.cs`: In-engine C# bridge (local game/lobby control from Python via pythonnet)
+## Current Layout
 
-## Quick Start (Windows)
+- `envs/openra_env.py`: main Gym environment
+- `envs/openra_env_http.py`: HTTP-based variant
+- `utils/engine.py`: loads `OpenRA.Game.dll` and `PythonAPI` through `pythonnet`
+- `utils/obs.py`: converts `PythonAPI.GetState()` output into Python dictionaries
+- `utils/actions.py`: encodes Python action dicts into `RLAction`
+- `utils/net.py`: local host / remote join / lobby helpers
+- `utils/PythonAPI.cs`: engine bridge source used by the Python side
+- `agent/agent.py`: `RandomMoveAgent`, `RuleBasedAgent`, `PPOAgent`
+- `models/actor.py`: encoders and `ActorCritic`
+- `models/buffer.py`: rollout buffer for PPO
+- `scripts/example_usage.py`: rule-based / random control example
+- `scripts/train_rl.py`: baseline PPO training entry
+- `scripts/rl_smoke_test.py`: quick RL smoke test
 
-### Prerequisites
+## Architecture Overview
+
+The current execution path is:
+
+1. `envs/openra_env.py` calls `utils/engine.py` to load the OpenRA assemblies.
+2. `PythonAPI.StartLocalGame(...)` or the lobby helpers initialize a match.
+3. `PythonAPI.GetState()` returns a simplified `RLState`.
+4. `utils/obs.py` converts that state into Python dicts.
+5. `OpenRAEnv` converts the raw dict into `feature`, `vector`, or `image` observations.
+6. An agent chooses either a legacy dict action list or a `MultiDiscrete` action.
+7. `utils/actions.py` and `PythonAPI.SendActions(...)` translate that into OpenRA orders.
+8. `PythonAPI.Step()` advances the simulation.
+
+## Prerequisites
 
 - Windows 10/11
 - Python 3.8+
-- Clone [OpenRA](http://github.com/OpenRA/OpenRA) repo
-- Add `OpenRA.Bot/utils/PythonAPI.cs` to your OpenRA solution (recommended: `OpenRA.Game` project), then build with Visual Studio 2022 or `dotnet`. This exposes a stable API (StartLocalGame/Step/GetState/SendActions) for Python.
+- A built OpenRA tree with `OpenRA.Game.dll` and `OpenRA.runtimeconfig.json`
+- A mod and map that can be started from code, for example `ra`
 
-The Python environment can start a local game automatically through `PythonAPI.StartLocalGame(...)` when you `reset()` the env (configure `bin_dir`, `mod_id`, and `map_uid`).
+## Engine Bridge Setup
 
-### Python setup
+The Python package expects the compiled `PythonAPI` type to be available from `OpenRA.Game.dll`.
 
-```bash
-cd OpenRA.Bot
-python -m venv .venv  # optional
-.venv\Scripts\activate # PowerShell: .\.venv\Scripts\Activate.ps1
+Recommended workflow:
+
+1. Keep the bridge source in `OpenRA.Bot/utils/PythonAPI.cs`.
+2. Add or sync that file into the `OpenRA.Game` project in your OpenRA solution.
+3. Build OpenRA so that the Python side can load the resulting assemblies from `bin_dir`.
+
+`OpenRAApiBridge.cs` is deprecated and should not be used by new code.
+
+## Python Setup
+
+```powershell
+cd F:\Projects\OpenRA\OpenRA.Bot
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-
-# Run examples
-python example_usage.py
 ```
 
-If you use Stable-Baselines3, install extras from `requirements.txt` (sb3/torch/tensorboard are listed under optional dependencies).
+## Running Existing Scripts
 
-## Basic Usage
+Rule-based / manual smoke test:
+
+```powershell
+python scripts/example_usage.py
+```
+
+Baseline PPO training:
+
+```powershell
+python scripts/train_rl.py
+```
+
+The training script currently contains hard-coded local paths such as `F:/Projects/OpenRA/bin` and a fixed RA map UID, so adjust them before using it on another machine or another map.
+
+## Minimal Usage
 
 ```python
 from envs.openra_env import make_env
 
 env = make_env(
-    bin_dir="OpenRA/bin",
+    bin_dir="F:/Projects/OpenRA/bin",
     mod_id="ra",
     map_uid="b53e25e007666442dbf62b87eec7bfbe8160ef3f",
     ticks_per_step=10,
-    observation_type="feature",
-    enable_actions=['noop','move','attack','produce','build','deploy'],
+    observation_type="vector",
+    enable_actions=["noop", "move", "attack", "produce", "build", "deploy"],
 )
-obs, info = env.reset()     # internally calls PythonAPI.StartLocalGame(...)
+
+obs, info = env.reset()
+
 for _ in range(1000):
-    actions = env.action_space.sample()
-    obs, reward, terminated, truncated, info = env.step(actions)
+    action = env.action_space.sample()
+    obs, reward, terminated, truncated, info = env.step(action)
     if terminated or truncated:
         break
+
 env.close()
 ```
 
-## SB3 Example
+## Observation Modes
 
-```python
-from stable_baselines3 import PPO
-from envs.openra_env import make_env
+`OpenRAEnv` currently supports three observation modes:
 
-env = make_env(
-    bin_dir="OpenRA/bin",
-    mod_id="ra",
-    map_uid="b53e25e007666442dbf62b87eec7bfbe8160ef3f",
-    ticks_per_step=10,
-    observation_type="feature",
-)
-model = PPO("MlpPolicy", env, verbose=1)
-model.learn(total_timesteps=50000)
-model.save("openra_ppo_agent")
+- `feature`: returns the raw Python dict built from `PythonAPI.GetState()`
+- `vector`: flattened numeric observation for MLP policies
+- `image`: `128 x 128 x 10` semantic map for CNN-style policies
+
+### `feature`
+
+This is the most complete mode and is the best option for debugging. It includes:
+
+- `actors`
+- `resources`
+- `production`
+- `producible_catalog`
+- `placeable_areas`
+- `cash`
+- `resources_total`
+- `resource_capacity`
+- `power`
+- `my_owner`
+
+### `vector`
+
+Current vector layout:
+
+- Up to 100 friendly units, 6 features each
+- Up to 100 enemy units, 5 features each
+- 7 resource/power slots
+- 2 map-size slots
+
+Important caveat: the resource/power section is currently placeholder-filled in `envs/openra_env.py`, so the vector observation does not yet fully use the economy state already available from `PythonAPI.GetState()`.
+
+### `image`
+
+Current image layout:
+
+- Shape: `(128, 128, 10)`
+- Channels currently used reliably:
+  - friendly infantry / non-infantry
+  - enemy infantry / non-infantry
+- Channels for resources, cash, and power are not fully populated yet
+
+## Action Space
+
+The RL action space is currently:
+
+```text
+[action_type, unit_idx, target_x, target_y, target_idx, unit_type_idx]
 ```
 
-## PythonAPI (C#) surface
+Supported action types depend on `enable_actions`, but the usual set is:
 
-- `StartLocalGame(modId, mapUid[, binDir][, addBotOpponent, botType, botSlotId, explored, fog])`
-- `Step()` – advances simulation; returns whether a tick occurred
-- `GetState()` – returns `RLState` with `Actors`, `Resources`, `Production`, `PlaceableAreas`, `BuildableCatalog`
-- `SendActions(IEnumerable<RLAction>)` – queue orders; supports standard orders and `StartProduction`
-- Multiplayer helpers: `JoinServer`, `WaitForConnection`, `GetLobbyInfo`, `ClaimSlot`, `AddBotToFreeSlot`, `StartGameFromLobby`, etc.
+- `noop`
+- `move`
+- `attack`
+- `produce`
+- `build`
+- `deploy`
 
-## Observations and Actions
+Semantics:
 
-### Observations
-- Vector: concatenated stats for my units, enemy units, resources/power, and map size
-- Image: multi-channel semantic feature map (CNN-friendly)
+- `move`: uses `unit_idx`, `target_x`, `target_y`
+- `attack`: uses `unit_idx`, `target_idx`
+- `produce`: uses queue actor index + `unit_type_idx`
+- `build`: uses queue actor index + `unit_type_idx` + target cell
+- `deploy`: uses `unit_idx`
 
-#### Vector observation format
-- Shape: `(obs_dim,)`
-- Constants inside the environment: `max_units = 100`
-- Layout (in order):
-  - My units: up to 100 units, 6 values each
-    - `[id_norm, type_norm, x_norm, y_norm, health_norm, is_idle]`
-  - Enemy units: up to 100 units, 5 values each
-    - `[id_norm, type_norm, x_norm, y_norm, health_norm]`
-  - Resources & power: 7 values
-    - `[cash_norm, resource_fill, power_provided_norm, power_drained_norm, power_is_normal, power_is_low, power_is_critical]`
-  - Map size: 2 values
-    - `[map_width/128.0, map_height/128.0]`
+The environment also accepts legacy Python dict actions, which is what the rule-based agent uses.
 
-#### Image observation format
-- Shape: `(128, 128, 10)`
-- Channels:
-  - `0`: my infantry
-  - `1`: my vehicles/others
-  - `2`: allies (all types)
-  - `3`: enemy infantry
-  - `4`: enemy vehicles/others
-  - `5`: resource density (grayscale, from visible resource cells)
-  - `6`: power surplus (global scalar repeated)
-  - `7`: cash (global scalar repeated)
-  - `8`: my low-health mask (<50%)
-  - `9`: enemy low-health mask (<50%)
+## Action Masks
 
-#### Additional state (metadata)
-- Returned via `PythonAPI.GetState()` and available in Python through `info` / `state`:
-  - `Map`: `{ Tileset, Bounds{X,Y,Width,Height}, ResourceCells[{X,Y,Type,Density}] }`
-  - `AllyUnits[]`: allies visible under fog-of-war
-  - `Production`: per-building queues owned by player
-    - `Production.Queues[]` with:
-      - `ActorId`, `Type` (e.g., Building/Infantry/Vehicle), `Group`, `Enabled`
-      - `Items[]`: `{ Item, Cost, Progress(0-100), Paused, Done }`
-      - `Buildable[]`: `{ Name, Cost }`
-  - `PlaceableAreas[]`: legal placement cells for finished building items
-    - Per entry: `{ ActorId, UnitType, Cells: [{X,Y}, ...] }`
+`info["action_mask"]` currently includes some of the following fields:
 
-### Actions (MultiDiscrete)
-- Layout: `[action_type, unit_idx, target_x, target_y, target_idx, unit_type_idx]`
-- `action_type` indexes into a configurable list: `env.action_types`
-  - Default reduced set: `['move', 'attack', 'deploy']`
-  - Full set (optional): `['move','attack','produce','build','deploy']`
-- Semantics:
-  - `move`: uses `unit_idx`, `target_x`, `target_y`
-  - `attack`: uses `unit_idx`, `target_idx`
-  - `produce`: uses `unit_idx` (producer building), `unit_type_idx` (maps to unit type name)
-  - `build`: uses `unit_idx` (queue actor idx), `unit_type_idx`, `target_x`, `target_y`
-  - `deploy`: uses `unit_idx`（e.g., MCV deploy）
+- `action_type`
+- `move_mask`
+- `attack_mask`
+- `deploy_mask`
+- `produce_unit_type_mask`
+- `build_mask`
 
-#### Action mask (provided in `info['action_mask']`)
-- Keys / shapes:
-  - `action_type`: `(len(env.action_types),)`
-  - `move_mask`: `(100,)`
-  - `attack_mask`: `(100, 100)`
-  - `deploy_mask`: `(100,)`
-  - If enabled: `produce_mask`
-  - `build_mask`: `(100,)` enabled when there exists any legal placement derived from `PlaceableAreas`
-- Note: This is a lightweight, heuristic mask to reduce invalid samples. Engine-side checks still apply.
+These masks are heuristic helpers, not strict validity guarantees. Engine-side order checks still decide whether an action is actually legal.
 
-## Configuration
+Important limitation: the current PPO implementation mainly consumes the `action_type` mask. The per-head masks are present in the environment, but they are not yet wired through consistently in training/inference.
 
-- Python env (local game): set `bin_dir`, `mod_id`, `map_uid` in `make_env(...)`
-- Host a lobby from Python: use `env.configure_host(options=[...])`
-- Join a remote lobby: `env.configure_remote(host, port, password="", spectator=False)`
+## Reward Shaping
 
-## Reward (default)
+The default reward in `envs/openra_env.py` is development-oriented, not combat-oriented. It currently rewards and penalizes:
 
-- +10 per enemy unit destroyed
-- -5 per own unit lost
-- +0.1 × (cash / 1000)
-- Power penalties when low/critical
+- increase in owned unit count
+- increase in owned building count
+- starting new production items
+- canceling in-progress production
+- staying below a minimum cash reserve
 
-You can wrap the env to shape rewards (see `example_usage.py`).
+This is useful for bootstrapping a macro baseline, but it is not enough on its own for strong tactical play.
+
+## Connection Modes
+
+`OpenRAEnv.reset()` supports three startup modes:
+
+- local single-player start through `PythonAPI.StartLocalGame(...)`
+- host-local lobby flow through `env.configure_host(...)`
+- remote server join through `env.configure_remote(...)`
+
+See `utils/net.py` for the exact lobby helper flow.
+
+## Known Limitations
+
+- The PPO baseline is not fully stable yet. There are interface mismatches and some recurrent-training code paths still need cleanup.
+- The current training loop is effectively single-environment, even though some APIs are written as if vectorized training were supported.
+- Observation building and action-mask generation still re-read engine state multiple times per step, which is inefficient and can produce slightly inconsistent snapshots.
+- `PythonAPI.GetState()` is expensive because it scans a lot of world state, especially for production and build placement data.
+- Several script paths and defaults are local-machine specific.
+
+## Practical Recommendations
+
+- Use `feature` observations first when debugging action execution.
+- Treat the current PPO stack as a baseline to iterate on, not a final trainer.
+- If you are improving sample efficiency, first optimize state extraction and observation consistency before making the policy larger.
+- If you are improving policy quality, prioritize better state encoding and stricter action masking before switching to a more complex network.
 
 ## Troubleshooting
 
-- Local start fails: ensure `bin_dir` points to your built OpenRA `bin` directory and `map_uid` exists in the mod’s map cache
-- Empty/invalid unit IDs: the unit may have died or be out of vision; refresh state and reselect
-- Production/build actions do nothing: ensure your building has a production queue and use `StartProduction` via `SendActions`
-
-## ID handling (important)
-
-- Each actor has a unique `ActorID` generated by the engine.
-- The environment maps `unit_idx`/`target_idx` to real IDs using the latest `PythonAPI.GetState()` snapshot:
-  - `self._my_unit_ids`, `self._enemy_unit_ids` are refreshed every step.
-  - Out-of-range indices are clamped; prefer using the `action_mask` to avoid invalid picks.
-- For precise targeting, always base your actions on the latest state.
-
-## Contributing
-
-PRs are welcome. Please keep code readable and update examples as needed.
+- Local start fails: check `bin_dir`, `mod_id`, and `map_uid`, and confirm the OpenRA build artifacts exist.
+- Python cannot load the engine: verify `OpenRA.runtimeconfig.json` and the required assemblies are present in `bin_dir`.
+- Production/build actions appear invalid: inspect `production`, `placeable_areas`, and `available_orders` from `feature` observations first.
+- Actor indices behave strangely: remember that `unit_idx` and `target_idx` are mapped through the latest cached unit-id lists, not raw actor IDs.
 
 ## License
 
-MIT (see LICENSE)
+MIT

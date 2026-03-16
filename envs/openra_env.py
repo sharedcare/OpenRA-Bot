@@ -118,6 +118,7 @@ class OpenRAEnv(gym.Env):
         self._setup_spaces()
 
         self._last_obs = None
+        self._last_raw_state: Optional[Dict[str, Any]] = None
         self._my_unit_ids: List[int] = []
         self._enemy_unit_ids: List[int] = []
         self._recent_actions: deque[Tuple] = deque(maxlen=256)
@@ -282,6 +283,7 @@ class OpenRAEnv(gym.Env):
 
         # Build first observation and info
         raw = self._get_raw_state()
+        self._last_raw_state = raw
         obs = self._state_to_observation(raw)
         self._last_obs = obs
         # Initialize previous metrics for reward shaping
@@ -312,6 +314,7 @@ class OpenRAEnv(gym.Env):
             api.Step()
 
         raw = self._get_raw_state()
+        self._last_raw_state = raw
         new_obs = self._state_to_observation(raw)
 
         # Reward shaping: encourage development and sufficient cash reserve
@@ -319,7 +322,7 @@ class OpenRAEnv(gym.Env):
         terminated = False
         truncated = False
 
-        if self.max_episode_ticks is not None and new_obs['world_tick'] >= self.max_episode_ticks:
+        if self.max_episode_ticks is not None and int(raw.get('world_tick', 0)) >= self.max_episode_ticks:
             truncated = True
 
         info = self._make_info(raw)
@@ -336,6 +339,17 @@ class OpenRAEnv(gym.Env):
 
     def _get_raw_state(self) -> Dict[str, Any]:
         return build_observation(self._openra)
+
+    def _get_current_world_tick(self) -> int:
+        if self._last_raw_state is not None:
+            try:
+                return int(self._last_raw_state.get('world_tick', 0))
+            except Exception:
+                pass
+        try:
+            return int(self._openra['PythonAPI'].GetState().WorldTick)
+        except Exception:
+            return 0
 
     # --- Reward shaping helpers ---
 
@@ -556,6 +570,8 @@ class OpenRAEnv(gym.Env):
 
         if actions:
             self.send_actions(actions)
+            for a in actions:
+                self._record_action(self._action_signature(a))
 
     def _action_signature(self, a: Dict[str, Any]) -> Tuple:
         return (
@@ -567,7 +583,7 @@ class OpenRAEnv(gym.Env):
         )
 
     def _is_duplicate_action(self, sig: Tuple) -> bool:
-        now = int(self._openra['PythonAPI'].GetState().WorldTick)
+        now = self._get_current_world_tick()
         # prune by TTL in steps converted to ticks_per_step buckets
         self._recent_actions = deque([(s, t) for (s, t) in self._recent_actions if (now - t) <= (self.ticks_per_step * self._action_ttl_steps)], maxlen=256)
         for s, _ in self._recent_actions:
@@ -576,7 +592,7 @@ class OpenRAEnv(gym.Env):
         return False
 
     def _record_action(self, sig: Tuple) -> None:
-        now = int(self._openra['PythonAPI'].GetState().WorldTick)
+        now = self._get_current_world_tick()
         self._recent_actions.append((sig, now))
 
     # --- Additional connection helpers ---
@@ -612,11 +628,73 @@ class OpenRAEnv(gym.Env):
             return self._state_to_image(raw)
         return raw
 
-    def _make_info(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+    def _split_visible_actors(self, raw: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        actors = raw.get('actors') or []
         my_owner = int(raw.get('my_owner', -1))
-        my_units = [u for u in (raw.get('actors') or []) if u.get('owner') == my_owner and not u.get('dead', False)]
+        my_units = [u for u in actors if int(u.get('owner', -1)) == my_owner and not bool(u.get('dead', False))]
+        enemy_units = [u for u in actors if int(u.get('owner', -1)) != my_owner and not bool(u.get('dead', False))]
+        return my_units, enemy_units
+
+    def _estimate_map_size(self, raw: Dict[str, Any]) -> Tuple[int, int]:
+        xs = [128]
+        ys = [128]
+        for u in raw.get('actors') or []:
+            xs.append(int(u.get('cell_x', 0)) + 1)
+            ys.append(int(u.get('cell_y', 0)) + 1)
+        for r in raw.get('resources') or []:
+            xs.append(int(r.get('cell_x', 0)) + 1)
+            ys.append(int(r.get('cell_y', 0)) + 1)
+        return max(1, max(xs)), max(1, max(ys))
+
+    def _economy_features(self, raw: Dict[str, Any]) -> List[float]:
+        cash = max(0.0, float(raw.get('cash', 0) or 0.0))
+        resources_total = max(0.0, float(raw.get('resources_total', 0) or 0.0))
+        resource_capacity = max(0.0, float(raw.get('resource_capacity', 0) or 0.0))
+        power = raw.get('power') or {}
+        power_provided = max(0.0, float(power.get('provided', 0) or 0.0))
+        power_drained = max(0.0, float(power.get('drained', 0) or 0.0))
+        power_state = str(power.get('state', '') or '').lower()
+
+        cash_norm = min(cash / 10000.0, 1.0)
+        resource_fill = min(resources_total / max(1.0, resource_capacity), 1.0)
+        power_provided_norm = min(power_provided / 500.0, 1.0)
+        power_drained_norm = min(power_drained / 500.0, 1.0)
+        power_is_critical = 1.0 if 'critical' in power_state else 0.0
+        power_is_low = 1.0 if 'low' in power_state else 0.0
+        power_is_normal = 1.0 if power_is_low == 0.0 and power_is_critical == 0.0 else 0.0
+
+        return [
+            cash_norm,
+            resource_fill,
+            power_provided_norm,
+            power_drained_norm,
+            power_is_normal,
+            power_is_low,
+            power_is_critical,
+        ]
+
+    @staticmethod
+    def _actor_health_ratio(actor: Dict[str, Any]) -> float:
+        return float(int(actor.get('hp', 0)) / max(1, int(actor.get('max_hp', 1))))
+
+    @staticmethod
+    def _looks_like_infantry(actor: Dict[str, Any]) -> bool:
+        actor_type = str(actor.get('type', '')).lower()
+        return actor_type.startswith('e') or 'infantry' in actor_type or actor_type in {'dog', 'spy', 'thf'}
+
+    @staticmethod
+    def _project_to_image(cell_x: int, cell_y: int, map_width: int, map_height: int) -> Tuple[int, int]:
+        x = min(127, max(0, int(cell_x * (127.0 / max(1, map_width - 1)))))
+        y = min(127, max(0, int(cell_y * (127.0 / max(1, map_height - 1)))))
+        return x, y
+
+    @staticmethod
+    def _scalar_channel(value: float) -> np.uint8:
+        return np.uint8(np.clip(round(value * 255.0), 0, 255))
+
+    def _make_info(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+        my_units, enemy_units = self._split_visible_actors(raw)
         ally_units = []  # not available from RLState directly
-        enemy_units = [u for u in (raw.get('actors') or []) if u.get('owner') != my_owner and not u.get('dead', False)]
 
         # Cache id lists for action resolution
         self._my_unit_ids = [int(u.get('id')) for u in my_units]
@@ -641,10 +719,12 @@ class OpenRAEnv(gym.Env):
             self._queue_actor_ids = []
         # Include placeable areas map if present
         info['placeable_areas'] = raw.get('placeable_areas', {}) or {}
-        info['action_mask'] = self._get_action_mask(my_units, enemy_units)
+        info['action_mask'] = self._get_action_mask(raw, my_units, enemy_units)
         return info
 
-    def _get_action_mask(self, my_units: List[Dict[str, Any]], enemy_units: List[Dict[str, Any]]) -> Dict[str, np.ndarray]:
+    def _get_action_mask(
+        self, raw: Dict[str, Any], my_units: List[Dict[str, Any]], enemy_units: List[Dict[str, Any]]
+    ) -> Dict[str, np.ndarray]:
         max_units = 100
         move_mask = np.zeros((max_units,), dtype=np.uint8)
         deploy_mask = np.zeros((max_units,), dtype=np.uint8)
@@ -684,26 +764,15 @@ class OpenRAEnv(gym.Env):
             'deploy_mask': deploy_mask,
         }
         if 'produce' in self.action_types:
-            # Producible unit types mask using global catalog if available (fallback to enabled queues)
+            # Producible unit types mask using global catalog if available
             produce_unit_type_mask = np.zeros((len(self.unit_types),), dtype=np.uint8)
             allowed_names = set()
             try:
-                catalog = (self._get_raw_state().get('producible_catalog') or [])
-                if catalog:
-                    for b in catalog:
-                        nm = str(b.get('Name') or '').lower()
-                        if nm:
-                            allowed_names.add(nm)
-                else:
-                    # Fallback to per-queue producibles when catalog missing
-                    queues = list(((self._get_raw_state().get('production') or {}).get('Queues') or []))
-                    for q in queues:
-                        if not q.get('Enabled'):
-                            continue
-                        for b in (q.get('Producible') or []):
-                            nm = str(b.get('Name') or '').lower()
-                            if nm:
-                                allowed_names.add(nm)
+                catalog = raw.get('producible_catalog') or []
+                for b in catalog:
+                    nm = str(b.get('Name') or '').lower()
+                    if nm:
+                        allowed_names.add(nm)
             except Exception:
                 allowed_names = set()
 
@@ -730,16 +799,9 @@ class OpenRAEnv(gym.Env):
 
     def _state_to_vector(self, raw: Dict[str, Any]) -> np.ndarray:
         max_units = 100
-        actors = raw.get('actors') or []
-        my_owner = int(raw.get('my_owner', -1))
-        my_units = [u for u in actors if u.get('owner') == my_owner and not u.get('dead', False)]
-        enemy_units = [u for u in actors if u.get('owner') != my_owner and not u.get('dead', False)]
-
-        # Determine map size if available from any actor positions (fallback 128x128)
-        map_width = max([int(u.get('cell_x', 0)) for u in actors] + [128])
-        map_height = max([int(u.get('cell_y', 0)) for u in actors] + [128])
-        map_width = max(1, map_width)
-        map_height = max(1, map_height)
+        my_units, enemy_units = self._split_visible_actors(raw)
+        map_width, map_height = self._estimate_map_size(raw)
+        unit_type_scale = max(1, len(self.unit_types))
 
         obs = np.zeros(max_units * 6 + max_units * 5 + 7 + 2, dtype=np.float32)
 
@@ -748,10 +810,10 @@ class OpenRAEnv(gym.Env):
             idx = i * 6
             obs[idx:idx+6] = [
                 int(u.get('id', 0)) / 1000.0,
-                self.unit_types.get(str(u.get('type', '')).lower(), 0) / max(1, len(self.unit_types)),
+                self.unit_types.get(str(u.get('type', '')).lower(), 0) / unit_type_scale,
                 int(u.get('cell_x', 0)) / map_width,
                 int(u.get('cell_y', 0)) / map_height,
-                int(u.get('hp', 0)) / max(1, int(u.get('max_hp', 1))),
+                self._actor_health_ratio(u),
                 1.0 if ('idle' in ' '.join(map(str, u.get('available_orders', []))).lower()) else 0.0,
             ]
 
@@ -761,23 +823,15 @@ class OpenRAEnv(gym.Env):
             idx = start_idx + i * 5
             obs[idx:idx+5] = [
                 int(u.get('id', 0)) / 1000.0,
-                self.unit_types.get(str(u.get('type', '')).lower(), 0) / max(1, len(self.unit_types)),
+                self.unit_types.get(str(u.get('type', '')).lower(), 0) / unit_type_scale,
                 int(u.get('cell_x', 0)) / map_width,
                 int(u.get('cell_y', 0)) / map_height,
-                int(u.get('hp', 0)) / max(1, int(u.get('max_hp', 1))),
+                self._actor_health_ratio(u),
             ]
 
-        # Resources/Power placeholders (not available from RLState directly)
+        # Economy and power
         resource_idx = max_units * 6 + max_units * 5
-        obs[resource_idx:resource_idx+7] = [
-            0.0,  # cash
-            0.0,  # resource_fill
-            0.0,  # power provided
-            0.0,  # power drained
-            1.0,  # power normal
-            0.0,  # power low
-            0.0,  # power critical
-        ]
+        obs[resource_idx:resource_idx+7] = self._economy_features(raw)
 
         map_idx = resource_idx + 7
         obs[map_idx:map_idx+2] = [map_width / 128.0, map_height / 128.0]
@@ -785,27 +839,32 @@ class OpenRAEnv(gym.Env):
 
     def _state_to_image(self, raw: Dict[str, Any]) -> np.ndarray:
         img = np.zeros((128, 128, 10), dtype=np.uint8)
-        actors = raw.get('actors') or []
-        # Fallback map size approximation
-        max_x = max([int(u.get('cell_x', 0)) for u in actors] + [1])
-        max_y = max([int(u.get('cell_y', 0)) for u in actors] + [1])
-        scale_x = 128.0 / max(1, max_x)
-        scale_y = 128.0 / max(1, max_y)
+        my_units, enemy_units = self._split_visible_actors(raw)
+        map_width, map_height = self._estimate_map_size(raw)
 
-        my_owner = int(raw.get('my_owner', -1))
-        for u in actors:
-            x = int(int(u.get('cell_x', 0)) * scale_x)
-            y = int(int(u.get('cell_y', 0)) * scale_y)
-            if not (0 <= x < 128 and 0 <= y < 128):
-                continue
-            is_enemy = int(u.get('owner', -1)) != my_owner
-            is_infantry = 'infantry' in str(u.get('type', '')).lower()
-            if int(u.get('owner', -1)) == my_owner:
-                img[y, x, 0 if is_infantry else 1] = 255
-            elif is_enemy:
-                img[y, x, 3 if is_infantry else 4] = 255
+        resource_cells = raw.get('resources') or []
+        max_resource_density = max([int(r.get('density', 0)) for r in resource_cells] + [1])
+        for r in resource_cells:
+            x, y = self._project_to_image(int(r.get('cell_x', 0)), int(r.get('cell_y', 0)), map_width, map_height)
+            density = int(r.get('density', 0))
+            value = int(np.clip(round(255.0 * density / max_resource_density), 0, 255))
+            img[y, x, 5] = max(img[y, x, 5], value)
 
-        # Resource density not available -> leave at zero
+        for actors, base_channel, low_hp_channel in ((my_units, 0, 8), (enemy_units, 3, 9)):
+            for u in actors:
+                x, y = self._project_to_image(int(u.get('cell_x', 0)), int(u.get('cell_y', 0)), map_width, map_height)
+                channel = base_channel if self._looks_like_infantry(u) else base_channel + 1
+                img[y, x, channel] = 255
+                if self._actor_health_ratio(u) < 0.5:
+                    img[y, x, low_hp_channel] = 255
+
+        econ = self._economy_features(raw)
+        power_balance = min(
+            max((float((raw.get('power') or {}).get('provided', 0) or 0) - float((raw.get('power') or {}).get('drained', 0) or 0)) / 500.0, 0.0),
+            1.0,
+        )
+        img[:, :, 6] = self._scalar_channel(power_balance)
+        img[:, :, 7] = self._scalar_channel(econ[0])
         return img
 
     def _resolve_my_unit_id(self, index: int) -> int:
