@@ -80,30 +80,35 @@ class RuleBasedAgent(BaseAgent):
         self._produce_idx: int = 0
         # Fixed cycle with a placeholder token for barracks choice
         self._produce_cycle: List[str] = ["powr", "proc", "barracks", "powr", "proc", "barracks"]
-        self._is_deployed = False
+
+    @staticmethod
+    def _infer_my_owner(actors: List[Dict[str, Any]], hint: Optional[int]) -> Optional[int]:
+        if hint is not None:
+            return int(hint)
+        counts: Dict[int, int] = {}
+        for a in actors:
+            owner = int(a.get("owner", -1))
+            counts[owner] = counts.get(owner, 0) + 1
+        if not counts:
+            return None
+        return max(counts.items(), key=lambda kv: kv[1])[0]
 
     def act(self, obs: Dict[str, Any]) -> List[Dict[str, Any]]:
         actors = obs.get("actors", []) or []
-        my_owner = obs.get("my_owner")
+        my_owner = self._infer_my_owner(actors, obs.get("my_owner"))
         if my_owner is None:
-            # Fallback owner inference
-            counts: Dict[int, int] = {}
-            for a in actors:
-                counts[a.get("owner", -1)] = counts.get(a.get("owner", -1), 0) + 1
-            if counts:
-                my_owner = max(counts.items(), key=lambda kv: kv[1])[0]
+            return []
 
-        my_units = [a for a in actors if a.get("owner") == my_owner and not a.get("dead", True)]
+        my_units = [a for a in actors if int(a.get("owner", -1)) == my_owner and not bool(a.get("dead", True))]
         my_types_lc = [str(a.get("type", "")).lower() for a in my_units]
         has_fact = any(t == "fact" for t in my_types_lc)
 
         # 1) Only MCV present -> deploy
-        if len(my_units) == 1 and my_types_lc and my_types_lc[0] == "mcv" and not has_fact and not self._is_deployed:
+        if len(my_units) == 1 and my_types_lc and my_types_lc[0] == "mcv" and not has_fact:
             mcv = my_units[0]
             # Make sure the unit can deploy now (avoid spamming invalid order)
             orders = set(str(x).lower() for x in (mcv.get("available_orders") or []))
             if "deploytransform" in orders:
-                self._is_deployed = True
                 return [
                     {
                         "order": "DeployTransform",
@@ -136,19 +141,6 @@ class RuleBasedAgent(BaseAgent):
         queues = production.get("Queues") or []
         if not queues:
             return []
-
-        # Build map for selecting a subject that can Build
-        def _has_build_order(u: Dict[str, Any]) -> bool:
-            return "build" in set(str(x).lower() for x in (u.get("available_orders") or []))
-
-        build_subject_id = None
-        for u in my_units:
-            if _has_build_order(u):
-                build_subject_id = int(u["id"])
-                break
-        if build_subject_id is None and my_units:
-            # Fallback to any owned unit if none explicitly offers Build
-            build_subject_id = int(my_units[0]["id"])
 
         # Normalize placeable areas to lowercase keys
         pa_raw = obs.get("placeable_areas") or {}
@@ -205,7 +197,7 @@ class RuleBasedAgent(BaseAgent):
         enabled_producers = set()
         for q in queues:
             try:
-                if not bool(q.get("Enabled", False)) or len(q.get("Items")) >= 1:
+                if not bool(q.get("Enabled", False)) or len(q.get("Items") or []) >= 1:
                     continue
                 items = q.get("Producible") or []
                 if any(str(it.get("Name", "")).lower() == choice for it in items):
@@ -225,8 +217,7 @@ class RuleBasedAgent(BaseAgent):
             fact_like = [a for a in my_producers if str(a.get("type", "")).lower() == "fact"]
             subject_id = int((fact_like[0] if fact_like else my_producers[0]).get("id", -1))
         if subject_id is None:
-            # Fallback: pick any enabled producer
-            subject_id = next(iter(enabled_producers), None)
+            return None
         if subject_id is None:
             return None
 
