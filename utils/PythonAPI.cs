@@ -163,7 +163,7 @@ namespace OpenRA
 			}
 
 			// Join local echo connection and set up a minimal lobby
-			JoinLocalIfNeeded();
+			JoinLocal(force: true);
 
 			// Ensure there is a playable agent bound to a slot and the map is selected
 			EnsurePlayableAgent(mapUid, null);
@@ -197,7 +197,7 @@ namespace OpenRA
 					.Invoke(null, [args]);
 			}
 
-			JoinLocalIfNeeded();
+			JoinLocal(force: true);
 			EnsurePlayableAgent(mapUid, null);
 
 			if (addBotOpponent)
@@ -293,34 +293,28 @@ namespace OpenRA
 			}
 		}
 
-		static void JoinLocalIfNeeded()
+		static void JoinLocal(bool force)
 		{
-			if (Game.OrderManager == null)
+			if (!force && Game.OrderManager != null)
+				return;
+
+			// Use same logic as Game.JoinLocal(), but it's internal. Recreate essential parts here.
+			var om = new OrderManager(new EchoConnection());
+			typeof(Game).GetMethod("JoinInner", BindingFlags.NonPublic | BindingFlags.Static)
+				.Invoke(null, [om]);
+
+			// Add a single ready client matching local id
+			Game.OrderManager.LobbyInfo.Clients.Add(new Session.Client
 			{
-				// Use same logic as Game.JoinLocal(), but it's internal. Recreate essential parts here.
-				var om = new OrderManager(new EchoConnection());
-
-				// Refresh static classes before the game starts
-				TextNotificationsManager.Clear();
-				UnitOrders.Clear();
-
-				Game.OrderManager?.Dispose();
-				typeof(Game).GetMethod("JoinInner", BindingFlags.NonPublic | BindingFlags.Static)
-					.Invoke(null, [om]);
-
-				// Add a single ready client matching local id
-				Game.OrderManager.LobbyInfo.Clients.Add(new Session.Client
-				{
-					Index = Game.OrderManager.Connection.LocalClientId,
-					Name = Game.Settings?.Player?.Name ?? "Python",
-					PreferredColor = Game.Settings?.Player?.Color ?? Color.FromArgb(0xFFFF00FFu),
-					Color = Game.Settings?.Player?.Color ?? Color.FromArgb(0xFFFF00FFu),
-					Faction = "Random",
-					SpawnPoint = 0,
-					Team = 0,
-					State = Session.ClientState.Ready
-				});
-			}
+				Index = Game.OrderManager.Connection.LocalClientId,
+				Name = Game.Settings?.Player?.Name ?? "Python",
+				PreferredColor = Game.Settings?.Player?.Color ?? Color.FromArgb(0xFFFF00FFu),
+				Color = Game.Settings?.Player?.Color ?? Color.FromArgb(0xFFFF00FFu),
+				Faction = "Random",
+				SpawnPoint = 0,
+				Team = 0,
+				State = Session.ClientState.Ready
+			});
 		}
 
 		// Advance one simulation tick, mirroring InnerLogicTick core (no UI timing)
@@ -362,6 +356,9 @@ namespace OpenRA
 			var orders = new List<Order>();
 			foreach (var a in actions ?? [])
 			{
+				if (a == null)
+					continue;
+
 				var subject = world.GetActorById(a.SubjectActorId);
 				if (subject == null || subject.Disposed)
 					continue;
@@ -436,19 +433,19 @@ namespace OpenRA
 
 		static Target ConvertTarget(World world, RLTarget t)
 		{
-			if (t == null || string.IsNullOrEmpty(t.Type) || t.Type == "None")
+			if (t == null || string.IsNullOrEmpty(t.Type) || string.Equals(t.Type, "None", StringComparison.OrdinalIgnoreCase))
 				return Target.Invalid;
 
-			switch (t.Type)
+			if (string.Equals(t.Type, "Cell", StringComparison.OrdinalIgnoreCase))
+				return Target.FromCell(world, new CPos(t.CellBits), (SubCell)t.SubCell);
+
+			if (string.Equals(t.Type, "Actor", StringComparison.OrdinalIgnoreCase))
 			{
-				case "Cell":
-					return Target.FromCell(world, new CPos(t.CellBits), (SubCell)t.SubCell);
-				case "Actor":
-					var a = world.GetActorById(t.ActorId);
-					return a != null ? Target.FromActor(a) : Target.Invalid;
-				default:
-					return Target.Invalid;
+				var a = world.GetActorById(t.ActorId);
+				return a != null ? Target.FromActor(a) : Target.Invalid;
 			}
+
+			return Target.Invalid;
 		}
 
 		// Snapshot the current world state into simple DTOs
@@ -647,126 +644,145 @@ namespace OpenRA
 			var overview = new ProductionOverview { Queues = [] };
 			var queues = new List<ProductionQueueData>();
 
-			// Resolve ProductionQueue trait type via reflection to avoid hard assembly dependency
-			var pqType = AppDomain.CurrentDomain
-				.GetAssemblies()
-				.Select(a => a.GetType("OpenRA.Mods.Common.Traits.ProductionQueue", false))
-				.FirstOrDefault(t => t != null);
-			if (pqType == null)
+			try
 			{
-				overview.Queues = queues.ToArray();
-				return overview;
-			}
+				// Resolve ProductionQueue trait type via reflection to avoid hard assembly dependency
+				var pqType = AppDomain.CurrentDomain
+					.GetAssemblies()
+					.Select(a => a.GetType("OpenRA.Mods.Common.Traits.ProductionQueue", false))
+					.FirstOrDefault(t => t != null);
 
-			var traitsMethod = typeof(Actor).GetMethod("TraitsImplementing", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-			var traitsGeneric = traitsMethod?.MakeGenericMethod(pqType);
-
-			foreach (var a in world.Actors)
-			{
-				if (player != null && a.Owner != player) continue;
-				if (a.IsDead || !a.IsInWorld) continue;
-
-				if (traitsGeneric?.Invoke(a, null) is not IEnumerable enumerable) continue;
-
-				foreach (var q in enumerable)
+				if (pqType == null)
 				{
-					var enabledProp = q.GetType().GetProperty("Enabled");
-					var enabled = enabledProp != null && (bool)enabledProp.GetValue(q);
-					if (!enabled) continue;
+					overview.Queues = queues.ToArray();
+					return overview;
+				}
 
-					// Items
-					var itemsList = new List<ProductionQueueItem>();
-					var allQueued = q.GetType().GetMethod("AllQueued");
-					if (allQueued?.Invoke(q, null) is IEnumerable queuedEnum)
+				var traitsMethod = typeof(Actor).GetMethod("TraitsImplementing", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+				var traitsGeneric = traitsMethod?.MakeGenericMethod(pqType);
+
+				foreach (var a in world.Actors)
+				{
+					if (player != null && a.Owner != player)
+						continue;
+
+					if (a.IsDead || !a.IsInWorld)
+						continue;
+
+					if (traitsGeneric?.Invoke(a, null) is not IEnumerable enumerable)
+						continue;
+
+					foreach (var q in enumerable)
 					{
-						foreach (var pi in queuedEnum)
+						var enabledProp = q.GetType().GetProperty("Enabled");
+						var enabled = enabledProp != null && (bool)enabledProp.GetValue(q);
+						if (!enabled)
+							continue;
+
+						// Items
+						var itemsList = new List<ProductionQueueItem>();
+						var allQueued = q.GetType().GetMethod("AllQueued");
+						if (allQueued?.Invoke(q, null) is IEnumerable queuedEnum)
 						{
-							var item = new ProductionQueueItem();
-							var piType = pi.GetType();
-							var fItem = piType.GetField("Item", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-							item.Item = fItem != null ? (fItem.GetValue(pi) as string ?? "") : (piType.GetProperty("Item")?.GetValue(pi) as string ?? "");
-							var fTotalCost = piType.GetField("TotalCost", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-							item.Cost = fTotalCost != null ? (int)(fTotalCost.GetValue(pi) ?? 0)
-								: (int)(piType.GetProperty("TotalCost")?.GetValue(pi) ?? 0);
-							item.RemainingCost = (int)(piType.GetProperty("RemainingCost")?.GetValue(pi) ?? 0);
-							var totalTime = (int)(piType.GetProperty("TotalTime")?.GetValue(pi) ?? 0);
-							var remaining = (int)(piType.GetProperty("RemainingTime")?.GetValue(pi) ?? 0);
-							item.Progress = totalTime > 0 ? Math.Clamp((totalTime - remaining) * 100 / totalTime, 0, 100) : 0;
-							item.Paused = (bool)(piType.GetProperty("Paused")?.GetValue(pi) ?? false);
-							item.Done = (bool)(piType.GetProperty("Done")?.GetValue(pi) ?? false);
-							itemsList.Add(item);
-						}
-					}
-
-					// Producibles
-					var produciblesList = new List<ProducibleItem>();
-					var getCost = q.GetType().GetMethod("GetProductionCost");
-					var prodField = q.GetType().GetField("Producible", BindingFlags.Instance | BindingFlags.NonPublic);
-					var t = q.GetType().BaseType;
-					while (prodField == null && t != null)
-					{
-						prodField = t.GetField("Producible", BindingFlags.Instance | BindingFlags.NonPublic);
-						t = t.BaseType;
-					}
-
-					if (prodField != null && prodField.GetValue(q) is IDictionary dict)
-					{
-						foreach (DictionaryEntry de in dict)
-						{
-							var ai = de.Key; // ActorInfo
-							if (ai == null) continue;
-							var stateObj = de.Value; // ProductionState
-							var isVisible = true;
-							if (stateObj != null)
+							foreach (var pi in queuedEnum)
 							{
-								var visField = stateObj.GetType().GetField("Visible", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-								if (visField != null)
+								var item = new ProductionQueueItem();
+								var piType = pi.GetType();
+								var fItem = piType.GetField("Item", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+								item.Item = fItem != null ? (fItem.GetValue(pi) as string ?? "") : (piType.GetProperty("Item")?.GetValue(pi) as string ?? "");
+
+								var fTotalCost = piType.GetField("TotalCost", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+								item.Cost = fTotalCost != null ? (int)(fTotalCost.GetValue(pi) ?? 0)
+									: (int)(piType.GetProperty("TotalCost")?.GetValue(pi) ?? 0);
+
+								item.RemainingCost = (int)(piType.GetProperty("RemainingCost")?.GetValue(pi) ?? 0);
+								var totalTime = (int)(piType.GetProperty("TotalTime")?.GetValue(pi) ?? 0);
+								var remaining = (int)(piType.GetProperty("RemainingTime")?.GetValue(pi) ?? 0);
+								item.Progress = totalTime > 0 ? Math.Clamp((totalTime - remaining) * 100 / totalTime, 0, 100) : 0;
+								item.Paused = (bool)(piType.GetProperty("Paused")?.GetValue(pi) ?? false);
+								item.Done = (bool)(piType.GetProperty("Done")?.GetValue(pi) ?? false);
+								itemsList.Add(item);
+							}
+						}
+
+						// Producibles
+						var produciblesList = new List<ProducibleItem>();
+						var getCost = q.GetType().GetMethod("GetProductionCost");
+						var prodField = q.GetType().GetField("Producible", BindingFlags.Instance | BindingFlags.NonPublic);
+						var t = q.GetType().BaseType;
+						while (prodField == null && t != null)
+						{
+							prodField = t.GetField("Producible", BindingFlags.Instance | BindingFlags.NonPublic);
+							t = t.BaseType;
+						}
+
+						if (prodField != null && prodField.GetValue(q) is IDictionary dict)
+						{
+							foreach (DictionaryEntry de in dict)
+							{
+								var ai = de.Key; // ActorInfo
+								if (ai == null)
+									continue;
+
+								var stateObj = de.Value; // ProductionState
+								var isVisible = true;
+								if (stateObj != null)
 								{
-									try
+									var visField = stateObj.GetType().GetField("Visible", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+									if (visField != null)
 									{
-										isVisible = (bool)visField.GetValue(stateObj);
-									}
-									catch
-									{
-										isVisible = true;
+										try
+										{
+											isVisible = (bool)visField.GetValue(stateObj);
+										}
+										catch
+										{
+											isVisible = true;
+										}
 									}
 								}
+
+								if (!isVisible)
+									continue;
+
+								var name = ai is ActorInfo actorInfo
+									? actorInfo.Name
+									: (ai?.GetType().GetField("Name", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(ai) as string ?? "");
+								var cost = getCost != null ? (int)getCost.Invoke(q, [ai]) : 0;
+
+								if (!string.IsNullOrEmpty(name))
+									produciblesList.Add(new ProducibleItem { Name = name, Cost = cost });
 							}
-
-							if (!isVisible)
-								continue;
-							var name = ai is ActorInfo actorInfo
-								? actorInfo.Name
-								: (ai?.GetType().GetField("Name", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(ai) as string ?? "");
-							var cost = getCost != null ? (int)getCost.Invoke(q, [ai]) : 0;
-							if (!string.IsNullOrEmpty(name))
-								produciblesList.Add(new ProducibleItem { Name = name, Cost = cost });
 						}
-					}
 
-					// Queue metadata via fields on ProductionQueue.Info (ProductionQueueInfo)
-					var typeStr = "";
-					string groupStr = null;
-					var infoField = q.GetType().GetField("Info", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-					var infoVal = infoField?.GetValue(q);
-					if (infoVal != null)
-					{
-						var typeField = infoVal.GetType().GetField("Type", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-						var groupField = infoVal.GetType().GetField("Group", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-						typeStr = typeField != null ? (typeField.GetValue(infoVal) as string ?? "") : "";
-						groupStr = groupField != null ? (groupField.GetValue(infoVal) as string) : null;
-					}
+						// Queue metadata via fields on ProductionQueue.Info (ProductionQueueInfo)
+						var typeStr = "";
+						string groupStr = null;
+						var infoField = q.GetType().GetField("Info", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+						var infoVal = infoField?.GetValue(q);
+						if (infoVal != null)
+						{
+							var typeField = infoVal.GetType().GetField("Type", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+							var groupField = infoVal.GetType().GetField("Group", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+							typeStr = typeField != null ? (typeField.GetValue(infoVal) as string ?? "") : "";
+							groupStr = groupField != null ? (groupField.GetValue(infoVal) as string) : null;
+						}
 
-					queues.Add(new ProductionQueueData
-					{
-						ActorId = a.ActorID,
-						Type = typeStr,
-						Group = groupStr,
-						Enabled = enabled,
-						Items = itemsList.ToArray(),
-						Producible = produciblesList.ToArray()
-					});
+						queues.Add(new ProductionQueueData
+						{
+							ActorId = a.ActorID,
+							Type = typeStr,
+							Group = groupStr,
+							Enabled = enabled,
+							Items = itemsList.ToArray(),
+							Producible = produciblesList.ToArray()
+						});
+					}
 				}
+			}
+			catch
+			{
+				// Fall back to empty/partial results on any reflection failure to keep interop stable
 			}
 
 			overview.Queues = queues.ToArray();
@@ -1175,9 +1191,16 @@ namespace OpenRA
 			if (string.IsNullOrEmpty(uid))
 				return [];
 
-			var preview = Game.ModData.MapCache[uid];
-			var types = preview.PlayerActorInfo.TraitInfos<IBotInfo>().Select(t => t.Type).Where(t => t != null).Distinct().ToArray();
-			return types;
+			try
+			{
+				var preview = Game.ModData.MapCache[uid];
+				var types = preview.PlayerActorInfo.TraitInfos<IBotInfo>().Select(t => t.Type).Where(t => t != null).Distinct().ToArray();
+				return types;
+			}
+			catch
+			{
+				return [];
+			}
 		}
 
 		public static bool AddBotToSlot(string slotId, string botType = null)
@@ -1217,8 +1240,10 @@ namespace OpenRA
 				if (!slot.AllowBots)
 					continue;
 				var c = lobby.ClientInSlot(key);
-				if (c == null || c.Bot != null)
-					return AddBotToSlot(key, botType);
+				if (c != null)
+					continue;
+
+				return AddBotToSlot(key, botType);
 			}
 
 			return false;

@@ -4,10 +4,13 @@ from typing import Tuple, Any, List, Dict
 
 import numpy as np
 import torch
+
 try:
     import matplotlib  # type: ignore
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt  # type: ignore
+
     _HAS_MPL = True
 except Exception:  # noqa: BLE001
     _HAS_MPL = False
@@ -24,7 +27,9 @@ except Exception:  # noqa: BLE001
     from agent import PPOAgent  # type: ignore
 
 
-def make_model(env: OpenRAEnv, observation_type: str = "vector") -> Tuple[ActorCritic, Tuple[int, int, int, int, int, int]]:
+def make_model(
+    env: OpenRAEnv, observation_type: str = "vector", recurrent_type: str = "lstm"
+) -> Tuple[ActorCritic, Tuple[int, int, int, int, int, int]]:
     # Infer action dims from env
     a_dims = (
         len(env.action_types),
@@ -38,7 +43,9 @@ def make_model(env: OpenRAEnv, observation_type: str = "vector") -> Tuple[ActorC
         obs_space = {"vector": int(env.observation_space.shape[0])}
     else:
         obs_space = {"channels": int(env.observation_space.shape[-1])}
-    model = ActorCritic(obs_space=obs_space, action_dims=a_dims, observation_type=observation_type)
+    model = ActorCritic(
+        obs_space=obs_space, action_dims=a_dims, observation_type=observation_type, recurrent_type=recurrent_type
+    )
     return model, a_dims
 
 
@@ -114,9 +121,9 @@ def train(
         map_uid="b53e25e007666442dbf62b87eec7bfbe8160ef3f",
         ticks_per_step=10,
         observation_type=observation_type,
-        enable_actions=['noop','move','attack','produce','build','deploy'],
+        enable_actions=["noop", "move", "attack", "produce", "build", "deploy"],
     )
-    model, _ = make_model(env, observation_type=observation_type)
+    model, _ = make_model(env, observation_type=observation_type, recurrent_type="lstm")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     agent = PPOAgent(model=model, device=str(device))
 
@@ -125,7 +132,7 @@ def train(
             base = log_dir
             if not os.path.exists(base):
                 os.makedirs(base)
-            path = os.path.join(base, "model_{}.pth".format(u))
+            path = os.path.join(base, f"model_{u:04d}.pth")
             torch.save(mdl.state_dict(), path)
             print(f"Model saved to {path}")
         except Exception as e:
