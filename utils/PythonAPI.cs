@@ -321,11 +321,17 @@ namespace OpenRA
 		public static bool Step()
 		{
 			var om = Game.OrderManager;
-			if (om == null || om.World == null)
+			if (om == null)
 				return false;
 
 			// Phase 1: receive anything from previous frame
 			om.TickImmediate();
+
+			// In remote lobby mode the world does not exist yet, but we still need to
+			// keep pumping the network connection so that slot claims, ready state, map
+			// acknowledgements, and the host's start-game transition are processed.
+			if (om.World == null)
+				return false;
 
 			var world = om.World;
 			var willTick = om.TryTick();
@@ -1324,7 +1330,14 @@ namespace OpenRA
 		public static bool IsInGame()
 		{
 			var om = Game.OrderManager;
-			return om != null && om.World != null && om.GameStarted;
+			if (om == null)
+				return false;
+
+			// For remote joins there can be a short transition window where the world
+			// has already been created and is visible in-game, but GameStarted has not
+			// yet reflected that on the Python bridge side. Treat a live world as
+			// sufficient evidence that the match has started.
+			return om.World != null || om.GameStarted;
 		}
 	}
 }

@@ -81,12 +81,14 @@ def main() -> None:
     print_obs_summary(obs, info, step=0, action_types=env.action_types)
 
     total_reward = 0.0
-    for step in range(1, args.max_steps + 1):
+    step = 0
+    while True:
         actions = [] if args.spectator else agent.act(obs)
         obs, reward, terminated, truncated, info = env.step(actions)
         total_reward += reward
         print(f"[step] step={step} reward={reward:.4f} actions={actions}")
         print_obs_summary(obs, info, step=step, action_types=env.action_types)
+        step += 1
 
         if terminated or truncated:
             print(f"[remote] game finished terminated={terminated} truncated={truncated}")

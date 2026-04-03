@@ -124,13 +124,13 @@ class RuleBasedAgent(BaseAgent):
         if build_actions:
             return build_actions
 
-        # 3) Produce if we have a factory and a non-empty catalog
-        if has_fact:
-            catalog = obs.get("producible_catalog") or []
-            if catalog:
-                act = self._maybe_produce(obs, catalog)
-                if act is not None:
-                    return [act]
+        # 3) Produce whenever we can see a valid production queue, even if the
+        # deployed MCV/building type naming differs from the hard-coded "fact".
+        catalog = self._get_production_catalog(obs)
+        if has_fact or catalog:
+            act = self._maybe_produce(obs, catalog)
+            if act is not None:
+                return [act]
 
         return []
 
@@ -216,9 +216,24 @@ class RuleBasedAgent(BaseAgent):
         if my_producers:
             fact_like = [a for a in my_producers if str(a.get("type", "")).lower() == "fact"]
             subject_id = int((fact_like[0] if fact_like else my_producers[0]).get("id", -1))
+
+        # Fallback for remote/bridge cases where the global producible catalog is
+        # visible, but production queue reflection has not populated cleanly yet.
+        # The current build cycle only requests structures, so a construction yard
+        # ("fact") is a valid producer fallback here.
         if subject_id is None:
-            return None
-        if subject_id is None:
+            my_owner = int(obs.get("my_owner", -1))
+            fact_actor = next(
+                (
+                    a for a in (obs.get("actors") or [])
+                    if int(a.get("owner", -1)) == my_owner and str(a.get("type", "")).lower() == "fact"
+                ),
+                None,
+            )
+            if fact_actor is not None:
+                subject_id = int(fact_actor.get("id", -1))
+
+        if subject_id is None or subject_id < 0:
             return None
 
         # Issue StartProduction
@@ -231,6 +246,28 @@ class RuleBasedAgent(BaseAgent):
         # Advance cycle after successful selection
         self._advance_cycle()
         return action
+
+    @staticmethod
+    def _get_production_catalog(obs: Dict[str, Any]) -> List[Dict[str, Any]]:
+        catalog = list(obs.get("producible_catalog") or [])
+        if catalog:
+            return catalog
+
+        # Fallback: aggregate producibles from visible production queues.
+        seen: Set[str] = set()
+        derived: List[Dict[str, Any]] = []
+        production = obs.get("production") or {}
+        for q in (production.get("Queues") or []):
+            for item in (q.get("Producible") or []):
+                name = str(item.get("Name") or "").lower()
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                derived.append({
+                    "Name": name,
+                    "Cost": int(item.get("Cost", 0) or 0),
+                })
+        return derived
 
     def _next_build_choice(self, allowed: Set[str]) -> Optional[str]:
         # Try up to the cycle length to find a valid item
