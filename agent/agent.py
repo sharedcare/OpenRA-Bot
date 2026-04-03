@@ -265,6 +265,7 @@ class PPOAgent(BaseAgent):
         self.device = device
         self.use_lstm = getattr(model, "recurrent_type", None) is not None
         self._rnn_state = None
+        self.action_types: List[str] = ["noop", "move", "attack", "produce", "build", "deploy"]
 
     # ---------- Acting ----------
     def _obs_to_tensor(self, obs: Any) -> Any:
@@ -282,12 +283,203 @@ class PPOAgent(BaseAgent):
         for k, v in (mask or {}).items():
             try:
                 t = torch.as_tensor(v, device=self.device)
-                if t.dim() == 1:
+                # The env emits single-environment masks without an explicit env axis.
+                # PPO buffer storage expects shape (num_envs, ...), and the current
+                # training loop only supports num_envs=1, so we add that leading axis.
+                if t.dim() >= 1 and t.shape[0] != 1:
                     t = t.unsqueeze(0)
                 out[k] = t
             except Exception:
                 pass
         return out
+
+    @staticmethod
+    def _policy_masks(mask: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(mask, dict):
+            return {}
+        return dict(mask)
+
+    def _action_type_index(self, name: str) -> Optional[int]:
+        try:
+            return self.action_types.index(name)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _dummy_mask_like(batch_size: int, dim: int, device: torch.device) -> torch.Tensor:
+        mask = torch.zeros((batch_size, dim), dtype=torch.float32, device=device)
+        if dim > 0:
+            mask[:, 0] = 1.0
+        return mask
+
+    @staticmethod
+    def _ensure_batch_mask(mask: Optional[torch.Tensor], batch_size: int, dim: int, device: torch.device) -> torch.Tensor:
+        if mask is None:
+            return PPOAgent._dummy_mask_like(batch_size, dim, device)
+        mask = mask.to(device=device, dtype=torch.float32)
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        return mask
+
+    @staticmethod
+    def _select_rows(mask_3d: torch.Tensor, row_index: torch.Tensor) -> torch.Tensor:
+        row_index = row_index.to(device=mask_3d.device, dtype=torch.long)
+        row_index = row_index.clamp(min=0, max=max(0, mask_3d.shape[1] - 1))
+        batch_idx = torch.arange(mask_3d.shape[0], device=mask_3d.device)
+        return mask_3d[batch_idx, row_index]
+
+    def _build_effective_masks(
+        self,
+        logits: Dict[str, torch.Tensor],
+        raw_masks: Optional[Dict[str, torch.Tensor]],
+        actions: Optional[torch.Tensor] = None,
+        sampled_action_type: Optional[torch.Tensor] = None,
+        sampled_unit_idx: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        raw_masks = raw_masks or {}
+        batch_size = next(iter(logits.values())).shape[0]
+        device = next(iter(logits.values())).device
+
+        action_type_mask = self._ensure_batch_mask(
+            raw_masks.get("action_type"), batch_size, logits["action_type"].shape[-1], device
+        )
+
+        action_type = sampled_action_type
+        if action_type is None and actions is not None:
+            action_type = actions[:, 0]
+
+        unit_idx = sampled_unit_idx
+        if unit_idx is None and actions is not None:
+            unit_idx = actions[:, 1]
+
+        move_idx = self._action_type_index("move")
+        attack_idx = self._action_type_index("attack")
+        produce_idx = self._action_type_index("produce")
+        build_idx = self._action_type_index("build")
+        deploy_idx = self._action_type_index("deploy")
+
+        dummy_unit_idx = self._dummy_mask_like(batch_size, logits["unit_idx"].shape[-1], device)
+        dummy_target_idx = self._dummy_mask_like(batch_size, logits["target_idx"].shape[-1], device)
+        dummy_target_x = self._dummy_mask_like(batch_size, logits["target_x"].shape[-1], device)
+        dummy_target_y = self._dummy_mask_like(batch_size, logits["target_y"].shape[-1], device)
+        dummy_unit_type = self._dummy_mask_like(batch_size, logits["unit_type"].shape[-1], device)
+
+        effective = {"action_type": action_type_mask}
+        if action_type is None:
+            effective["unit_idx"] = self._ensure_batch_mask(
+                raw_masks.get("unit_idx"), batch_size, logits["unit_idx"].shape[-1], device
+            )
+            effective["target_x"] = self._ensure_batch_mask(
+                raw_masks.get("target_x"), batch_size, logits["target_x"].shape[-1], device
+            )
+            effective["target_y"] = self._ensure_batch_mask(
+                raw_masks.get("target_y"), batch_size, logits["target_y"].shape[-1], device
+            )
+            effective["target_idx"] = self._ensure_batch_mask(
+                raw_masks.get("target_idx"), batch_size, logits["target_idx"].shape[-1], device
+            )
+            effective["unit_type"] = self._ensure_batch_mask(
+                raw_masks.get("unit_type"), batch_size, logits["unit_type"].shape[-1], device
+            )
+            return effective
+
+        unit_idx_mask = dummy_unit_idx.clone()
+        if move_idx is not None:
+            move_mask = self._ensure_batch_mask(raw_masks.get("move_mask"), batch_size, logits["unit_idx"].shape[-1], device)
+            unit_idx_mask = torch.where((action_type == move_idx).unsqueeze(-1), move_mask, unit_idx_mask)
+        if attack_idx is not None:
+            attack_mask = raw_masks.get("attack_mask")
+            if attack_mask is not None:
+                attack_mask = attack_mask.to(device=device, dtype=torch.float32)
+                attack_unit_mask = attack_mask.any(dim=-1).to(dtype=torch.float32)
+                unit_idx_mask = torch.where((action_type == attack_idx).unsqueeze(-1), attack_unit_mask, unit_idx_mask)
+        if produce_idx is not None:
+            produce_queue_mask = self._ensure_batch_mask(
+                raw_masks.get("produce_queue_mask"), batch_size, logits["unit_idx"].shape[-1], device
+            )
+            unit_idx_mask = torch.where((action_type == produce_idx).unsqueeze(-1), produce_queue_mask, unit_idx_mask)
+        if build_idx is not None:
+            build_mask = self._ensure_batch_mask(raw_masks.get("build_mask"), batch_size, logits["unit_idx"].shape[-1], device)
+            unit_idx_mask = torch.where((action_type == build_idx).unsqueeze(-1), build_mask, unit_idx_mask)
+        if deploy_idx is not None:
+            deploy_mask = self._ensure_batch_mask(raw_masks.get("deploy_mask"), batch_size, logits["unit_idx"].shape[-1], device)
+            unit_idx_mask = torch.where((action_type == deploy_idx).unsqueeze(-1), deploy_mask, unit_idx_mask)
+        effective["unit_idx"] = unit_idx_mask
+
+        target_x_mask = dummy_target_x.clone()
+        target_y_mask = dummy_target_y.clone()
+        move_or_build = torch.zeros((batch_size,), dtype=torch.bool, device=device)
+        if move_idx is not None:
+            move_or_build |= action_type == move_idx
+        if build_idx is not None:
+            move_or_build |= action_type == build_idx
+        if move_or_build.any():
+            tx_mask = self._ensure_batch_mask(raw_masks.get("target_x"), batch_size, logits["target_x"].shape[-1], device)
+            ty_mask = self._ensure_batch_mask(raw_masks.get("target_y"), batch_size, logits["target_y"].shape[-1], device)
+            target_x_mask = torch.where(move_or_build.unsqueeze(-1), tx_mask, target_x_mask)
+            target_y_mask = torch.where(move_or_build.unsqueeze(-1), ty_mask, target_y_mask)
+        effective["target_x"] = target_x_mask
+        effective["target_y"] = target_y_mask
+
+        target_idx_mask = dummy_target_idx.clone()
+        if attack_idx is not None and unit_idx is not None:
+            attack_mask = raw_masks.get("attack_mask")
+            if attack_mask is not None:
+                attack_mask = attack_mask.to(device=device, dtype=torch.float32)
+                selected_target_mask = self._select_rows(attack_mask, unit_idx)
+                target_idx_mask = torch.where((action_type == attack_idx).unsqueeze(-1), selected_target_mask, target_idx_mask)
+        effective["target_idx"] = target_idx_mask
+
+        unit_type_mask = dummy_unit_type.clone()
+        if produce_idx is not None:
+            produce_unit_type_mask = self._ensure_batch_mask(
+                raw_masks.get("produce_unit_type_mask"), batch_size, logits["unit_type"].shape[-1], device
+            )
+            unit_type_mask = torch.where((action_type == produce_idx).unsqueeze(-1), produce_unit_type_mask, unit_type_mask)
+        if build_idx is not None:
+            build_unit_type_mask = self._ensure_batch_mask(
+                raw_masks.get("build_unit_type_mask"), batch_size, logits["unit_type"].shape[-1], device
+            )
+            unit_type_mask = torch.where((action_type == build_idx).unsqueeze(-1), build_unit_type_mask, unit_type_mask)
+        effective["unit_type"] = unit_type_mask
+
+        return effective
+
+    def _sample_action(
+        self,
+        logits: Dict[str, torch.Tensor],
+        raw_masks: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        batch_size = next(iter(logits.values())).shape[0]
+        device = next(iter(logits.values())).device
+        actions: Dict[str, torch.Tensor] = {}
+        logps: Dict[str, torch.Tensor] = {}
+
+        eff = self._build_effective_masks(logits, raw_masks)
+        action_type_dist = torch.distributions.Categorical(logits=self._masked_logits({"action_type": logits["action_type"]}, {"action_type": eff["action_type"]})["action_type"])
+        actions["action_type"] = action_type_dist.sample()
+        logps["action_type"] = action_type_dist.log_prob(actions["action_type"])
+
+        eff = self._build_effective_masks(logits, raw_masks, sampled_action_type=actions["action_type"])
+        unit_idx_dist = torch.distributions.Categorical(logits=self._masked_logits({"unit_idx": logits["unit_idx"]}, {"unit_idx": eff["unit_idx"]})["unit_idx"])
+        actions["unit_idx"] = unit_idx_dist.sample()
+        logps["unit_idx"] = unit_idx_dist.log_prob(actions["unit_idx"])
+
+        eff = self._build_effective_masks(
+            logits,
+            raw_masks,
+            sampled_action_type=actions["action_type"],
+            sampled_unit_idx=actions["unit_idx"],
+        )
+        for head in ("target_x", "target_y", "target_idx", "unit_type"):
+            dist = torch.distributions.Categorical(
+                logits=self._masked_logits({head: logits[head]}, {head: eff[head]})[head]
+            )
+            actions[head] = dist.sample()
+            logps[head] = dist.log_prob(actions[head])
+
+        ordered = torch.stack([actions[h] for h in self._heads_order()], dim=-1).to(device=device)
+        return ordered, logps
 
     def act(self, obs: Any, info: Optional[Dict[str, Any]] = None) -> Any:  # type: ignore[override]
         self.model.eval()
@@ -297,8 +489,8 @@ class PPOAgent(BaseAgent):
                 logits, _, self._rnn_state = self.model(x, self._rnn_state, seq_len=1)
             else:
                 logits, _, _ = self.model(x, seq_len=1)
-            masks = self._mask_to_tensors((info or {}).get("action_mask", {}))
-            action, _ = self.model.policy_head.sample(logits, masks=masks)
+            masks = self._mask_to_tensors(self._policy_masks((info or {}).get("action_mask", {})))
+            action, _ = self._sample_action(logits, raw_masks=masks)
         return action.squeeze(0).cpu().numpy()
 
     # ---------- PPO Training ----------
@@ -327,7 +519,7 @@ class PPOAgent(BaseAgent):
             masks = {}
         total_logp = torch.zeros(actions.shape[0], device=actions.device)
         total_entropy = torch.zeros(actions.shape[0], device=actions.device)
-        lg = self._masked_logits(logits, masks)
+        lg = self._masked_logits(logits, self._build_effective_masks(logits, masks, actions=actions))
         for i, h in enumerate(self._heads_order()):
             dist = torch.distributions.Categorical(logits=lg[h])
             a = actions[:, i]
@@ -426,6 +618,7 @@ class PPOAgent(BaseAgent):
             raise NotImplementedError("The current PPO training loop only supports num_envs=1.")
         device = torch.device(self.device)
         self.model.to(device)
+        self.action_types = list(getattr(env, "action_types", self.action_types))
         optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
         obs, info = env.reset()
         self._rnn_state = None
@@ -468,6 +661,9 @@ class PPOAgent(BaseAgent):
                 x = torch.as_tensor(obs, device=device)
                 if x.dim() == 1:
                     x = x.unsqueeze(0)
+                rollout_hidden = hidden_states
+                if self.use_lstm and hidden_states is not None:
+                    rollout_hidden = tuple(h.clone() if h is not None else None for h in hidden_states)
 
                 with torch.no_grad():
                     if self.use_lstm:
@@ -475,15 +671,10 @@ class PPOAgent(BaseAgent):
                     else:
                         logits, values, _ = self.model(x, seq_len=1)
 
-                masks_t: Dict[str, torch.Tensor] = {}
-                act_mask = (info.get("action_mask") or {}).get("action_type") if isinstance(info, dict) else None
-                if act_mask is not None:
-                    t = torch.as_tensor(act_mask, device=device)
-                    if t.dim() == 1:
-                        t = t.unsqueeze(0)
-                    masks_t["action_type"] = t
+                raw_mask = self._policy_masks((info.get("action_mask") or {}) if isinstance(info, dict) else {})
+                masks_t = self._mask_to_tensors(raw_mask)
 
-                actions_t, per_head_logps = self.model.policy_head.sample(logits, masks=masks_t)
+                actions_t, per_head_logps = self._sample_action(logits, raw_masks=masks_t)
                 actions_np = actions_t.cpu().numpy()
                 action_for_env = actions_np[0] if actions_np.ndim > 1 else actions_np
 
@@ -508,7 +699,7 @@ class PPOAgent(BaseAgent):
                     values=values_np,
                     logprobs=logprobs_np,
                     masks=masks_t,
-                    hidden_state=hidden_states,
+                    hidden_state=rollout_hidden,
                 )
 
                 if self.use_lstm and hidden_states[0] is not None:
@@ -518,8 +709,13 @@ class PPOAgent(BaseAgent):
                         hidden_states[1] * (1 - done_mask),
                     )
 
-                obs = next_obs
-                info = next_info
+                if dones[0]:
+                    obs, info = env.reset()
+                    if self.use_lstm:
+                        hidden_states = self.model.init_hidden(num_envs, device)
+                else:
+                    obs = next_obs
+                    info = next_info
 
             with torch.no_grad():
                 x = torch.as_tensor(obs, device=device)
@@ -551,7 +747,8 @@ class PPOAgent(BaseAgent):
                     mb_attention_mask = batch["attention_mask"]
 
                     batch_size, seq_len, num_envs = mb_obs.shape[:3]
-                    mb_obs_flat = mb_obs.view(batch_size * num_envs, seq_len, *mb_obs.shape[3:])
+                    mb_obs_flat = mb_obs.permute(0, 2, 1, *range(3, mb_obs.dim())).contiguous()
+                    mb_obs_flat = mb_obs_flat.view(batch_size * num_envs, seq_len, *mb_obs.shape[3:])
 
                     if self.use_lstm:
                         h_flat = (
@@ -578,7 +775,12 @@ class PPOAgent(BaseAgent):
                         {k: v.permute(0, 1, 3, 2).contiguous().view(-1, v.shape[-1]) for k, v in logits.items()},
                         mb_actions_flat,
                         masks=(
-                            {k: v.permute(0, 2, 1, 3).contiguous().view(-1, *v.shape[3:]) for k, v in mb_masks.items()}
+                            {
+                                k: v.permute(0, 2, 1, *range(3, v.dim())).contiguous().view(
+                                    batch_size * num_envs * seq_len, *v.shape[3:]
+                                )
+                                for k, v in mb_masks.items()
+                            }
                             if mb_masks
                             else None
                         ),

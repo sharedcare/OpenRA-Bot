@@ -17,12 +17,12 @@ except Exception:  # noqa: BLE001
 
 def main():
     env = make_env(
-        bin_dir="F:/Projects/OpenRA/bin",
+        bin_dir="/Users/sharedcare/Projects/OpenRA/bin",
         mod_id="ra",
         map_uid="b53e25e007666442dbf62b87eec7bfbe8160ef3f",
         ticks_per_step=5,
         observation_type="vector",
-        enable_actions=['noop','move','attack','produce','build','deploy'],
+        enable_actions=["noop", "move", "attack", "produce", "build", "deploy"],
     )
     observation_type = "vector"
     # Build model
@@ -55,5 +55,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

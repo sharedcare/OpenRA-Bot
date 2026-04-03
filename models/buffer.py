@@ -94,15 +94,10 @@ class Buffer:
             device=device,
         )
 
-        # Action masks
-        if has_action_masks:
-            # Assuming action_type mask is binary with shape (num_actions,)
-            # We'll determine num_actions from the first experience added
-            self.masks_initialized = False
-            self.masks_action_type = None  # Will be initialized on first add
-        else:
-            self.masks_initialized = True
-            self.masks_action_type = None
+        # Action masks keyed by policy head name. Shapes are initialized lazily from
+        # the first rollout step because each head can have a different mask shape.
+        self.masks_initialized = not has_action_masks
+        self.masks: Dict[str, torch.Tensor] = {}
 
         # Tracking indices
         self.step_idx = 0  # Current step index in buffer
@@ -178,25 +173,25 @@ class Buffer:
 
         # Add action masks if available
         if masks and self.has_action_masks:
-            if "action_type" in masks:
-                action_mask = masks["action_type"]
-                if isinstance(action_mask, np.ndarray):
-                    action_mask = torch.from_numpy(action_mask).to(self.device)
+            for mask_name, mask_value in masks.items():
+                if isinstance(mask_value, np.ndarray):
+                    mask_value = torch.from_numpy(mask_value).to(self.device)
+                elif not isinstance(mask_value, torch.Tensor):
+                    mask_value = torch.as_tensor(mask_value, device=self.device)
+                else:
+                    mask_value = mask_value.to(self.device)
 
-                # Initialize masks tensor if first time
-                if not self.masks_initialized:
-                    mask_shape = (
-                        action_mask.shape[1:] if action_mask.dim() > 1 else (1,)
-                    )
-                    self.masks_action_type = torch.zeros(
+                mask_shape = mask_value.shape[1:] if mask_value.dim() > 1 else (1,)
+                if mask_name not in self.masks:
+                    self.masks[mask_name] = torch.zeros(
                         (self.buffer_size, self.num_envs, *mask_shape),
                         dtype=torch.float32,
                         device=self.device,
                     )
-                    self.masks_initialized = True
 
-                # Store mask
-                self.masks_action_type[self.step_idx] = action_mask
+                self.masks[mask_name][self.step_idx] = mask_value
+
+            self.masks_initialized = True
 
         # Store experience
         self.obs[self.step_idx] = obs
@@ -265,7 +260,7 @@ class Buffer:
             for t in reversed(range(T)):
                 nonterminal = 1.0 - dones[t]  # dones 已是 float
                 delta = rewards[t] + gamma * values_boot[t + 1] * nonterminal - values_boot[t]
-                gae = gae * gamma * lam + delta
+                gae = gae * gamma * lam * nonterminal + delta
                 adv[t] = gae
 
             ret = adv + values_boot[:-1]
@@ -374,25 +369,24 @@ class Buffer:
                 ]  # (batch_size, num_layers, num_envs, hidden_size)
 
                 # Prepare masks if available
-                masks_batch = {}
-                if self.masks_initialized and self.masks_action_type is not None:
-                    masks_action_type = torch.zeros(
-                        (
-                            batch_size,
-                            max_seq_len,
-                            self.num_envs,
-                            *self.masks_action_type.shape[2:],
-                        ),
-                        device=self.device,
-                    )
-                    for i, seq_idx in enumerate(seq_idxs):
-                        start_step = seq_idx * self.seq_len
-                        end_step = min(start_step + self.seq_len, self.step_idx)
-                        actual_seq_len = end_step - start_step
-                        masks_action_type[i, :actual_seq_len] = self.masks_action_type[
-                            start_step:end_step
-                        ]
-                    masks_batch["action_type"] = masks_action_type
+                masks_batch: Dict[str, torch.Tensor] = {}
+                if self.masks_initialized and self.masks:
+                    for mask_name, mask_storage in self.masks.items():
+                        mask_batch = torch.zeros(
+                            (
+                                batch_size,
+                                max_seq_len,
+                                self.num_envs,
+                                *mask_storage.shape[2:],
+                            ),
+                            device=self.device,
+                        )
+                        for i, seq_idx in enumerate(seq_idxs):
+                            start_step = seq_idx * self.seq_len
+                            end_step = min(start_step + self.seq_len, self.step_idx)
+                            actual_seq_len = end_step - start_step
+                            mask_batch[i, :actual_seq_len] = mask_storage[start_step:end_step]
+                        masks_batch[mask_name] = mask_batch
 
                 # Yield batch
                 yield {
@@ -431,11 +425,13 @@ class Buffer:
         }
 
         # Add masks if available
-        if self.masks_initialized and self.masks_action_type is not None:
-            masks_flat = self.masks_action_type[: self.step_idx].view(
-                total_steps, *self.masks_action_type.shape[2:]
-            )
-            result["masks"] = masks_flat
+        if self.masks_initialized and self.masks:
+            result["masks"] = {
+                mask_name: mask_storage[: self.step_idx].view(
+                    total_steps, *mask_storage.shape[2:]
+                )
+                for mask_name, mask_storage in self.masks.items()
+            }
 
         return result
 
@@ -454,11 +450,11 @@ class Buffer:
 
     def get_mask_statistics(self) -> Optional[float]:
         """Get statistics about action masks."""
-        if not self.masks_initialized or self.masks_action_type is None:
+        if not self.masks_initialized or "action_type" not in self.masks:
             return None
 
         try:
-            valid_masks = self.masks_action_type[: self.step_idx]
+            valid_masks = self.masks["action_type"][: self.step_idx]
             if valid_masks.numel() == 0:
                 return None
             return float(valid_masks.mean().item())

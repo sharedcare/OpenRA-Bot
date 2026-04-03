@@ -729,6 +729,11 @@ class OpenRAEnv(gym.Env):
         move_mask = np.zeros((max_units,), dtype=np.uint8)
         deploy_mask = np.zeros((max_units,), dtype=np.uint8)
         attack_mask = np.zeros((max_units, max_units), dtype=np.uint8)
+        produce_queue_mask = np.zeros((max_units,), dtype=np.uint8)
+        build_mask = np.zeros((max_units,), dtype=np.uint8)
+        target_idx_mask = np.zeros((max_units,), dtype=np.uint8)
+        target_x_mask = np.ones((128,), dtype=np.uint8)
+        target_y_mask = np.ones((128,), dtype=np.uint8)
 
         # Gate by per-unit available_orders from obs. Supported: Move, Attack, DeployTransform, PlaceBuilding
         for i, u in enumerate(my_units[:max_units]):
@@ -783,10 +788,14 @@ class OpenRAEnv(gym.Env):
                         if 0 <= i < produce_unit_type_mask.shape[0]:
                             produce_unit_type_mask[i] = 1
             mask['produce_unit_type_mask'] = produce_unit_type_mask
+            n = min(len(getattr(self, '_queue_actor_ids', []) or []), max_units)
+            if n > 0:
+                produce_queue_mask[:n] = 1
+            mask['produce_queue_mask'] = produce_queue_mask
 
-            _disable_if_empty('produce', bool(produce_unit_type_mask.any()))
+            _disable_if_empty('produce', bool(produce_unit_type_mask.any()) and bool(produce_queue_mask.any()))
+        build_unit_type_mask = np.zeros((len(self.unit_types),), dtype=np.uint8)
         if 'build' in self.action_types:
-            build_mask = np.zeros((max_units,), dtype=np.uint8)
             # Enable only when PlaceBuilding is available on at least one unit
             has_place_order = any('placebuilding' in set(str(x).lower() for x in (u.get('available_orders') or [])) for u in my_units)
             # Enable indices if we have queues; precise cell-level validity is user logic
@@ -794,7 +803,35 @@ class OpenRAEnv(gym.Env):
             if n > 0:
                 build_mask[:n] = 1
             mask['build_mask'] = build_mask
-            _disable_if_empty('build', bool(build_mask.any()) and has_place_order)
+            placeable_names = {str(k).lower() for k in (raw.get('placeable_areas') or {}).keys()}
+            for idx, name in self.reverse_unit_types.items():
+                if str(name).lower() in placeable_names:
+                    build_unit_type_mask[int(idx)] = 1
+            _disable_if_empty('build', bool(build_mask.any()) and has_place_order and bool(build_unit_type_mask.any()))
+
+        if enemy_units:
+            target_idx_mask[:min(len(enemy_units), max_units)] = 1
+
+        unit_idx_mask = np.maximum.reduce([
+            move_mask,
+            deploy_mask,
+            produce_queue_mask,
+            build_mask,
+            attack_mask.any(axis=1).astype(np.uint8),
+        ])
+
+        unit_type_mask = np.zeros((len(self.unit_types),), dtype=np.uint8)
+        if 'produce_unit_type_mask' in mask:
+            unit_type_mask = np.maximum(unit_type_mask, mask['produce_unit_type_mask'])
+        if 'build' in self.action_types:
+            unit_type_mask = np.maximum(unit_type_mask, build_unit_type_mask)
+            mask['build_unit_type_mask'] = build_unit_type_mask
+
+        mask['unit_idx'] = unit_idx_mask
+        mask['target_idx'] = target_idx_mask
+        mask['target_x'] = target_x_mask
+        mask['target_y'] = target_y_mask
+        mask['unit_type'] = unit_type_mask
         return mask
 
     def _state_to_vector(self, raw: Dict[str, Any]) -> np.ndarray:

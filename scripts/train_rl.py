@@ -116,7 +116,7 @@ def train(
     log_dir: str = "checkpoints",
 ):
     env = make_env(
-        bin_dir="F:/Projects/OpenRA/bin",
+        bin_dir="/Users/sharedcare/Projects/OpenRA/bin",
         mod_id="ra",
         map_uid="b53e25e007666442dbf62b87eec7bfbe8160ef3f",
         ticks_per_step=10,
@@ -160,4 +160,4 @@ def train(
 
 
 if __name__ == "__main__":
-    train(log_dir=r"F:\Projects\OpenRA\OpenRA.Bot\checkpoints")
+    train(log_dir=r"checkpoints")

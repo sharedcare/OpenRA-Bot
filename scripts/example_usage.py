@@ -43,17 +43,17 @@ def print_obs_summary(obs, info, step: int, action_types) -> None:
 if __name__ == "__main__":
     # Example: Start a local game via PythonAPI.StartLocalGame and drive it with a simple agent
     env = make_env(
-        bin_dir="F:/Projects/OpenRA/bin",
+        bin_dir="/Users/sharedcare/Projects/OpenRA/bin",
         mod_id="ra",
         map_uid="b53e25e007666442dbf62b87eec7bfbe8160ef3f",
         ticks_per_step=10,
         observation_type="feature",
-        enable_actions=['noop','move','attack','produce','build','deploy'],
+        enable_actions=["noop", "move", "attack", "produce", "build", "deploy"],
     )
 
     # Use StartLocalGame by default (do not configure remote/host unless desired)
     # To host a lobby instead, uncomment:
-    # env.configure_host(options=["option gamespeed default", "name PythonAgent", "slot Multi0", "state 1"]) 
+    # env.configure_host(options=["option gamespeed default", "name PythonAgent", "slot Multi0", "state 1"])
     # To join a remote lobby instead, uncomment:
     # env.configure_remote(host="10.10.10.120", port=1234, password="1234", spectator=False)
 
