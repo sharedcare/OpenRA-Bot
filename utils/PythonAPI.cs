@@ -41,6 +41,7 @@ namespace OpenRA
 		public int MaxHP;
 		public bool IsDead;
 		public string[] AvailableOrders;
+		public string[] AvailableOrderIds;
 	}
 
 	public sealed class RLState
@@ -506,11 +507,38 @@ namespace OpenRA
 					continue;
 
 				var hpTrait = a.TraitsImplementing<IHealth>().FirstOrDefault();
-				var availableOrders = a.TraitsImplementing<IIssueOrder>()
+				var rawOrderIds = a.TraitsImplementing<IIssueOrder>()
 					.Where(Exts.IsTraitEnabled)
 					.SelectMany(t => t.Orders)
 					.Select(o => o.OrderID)
 					.Distinct()
+					.ToArray();
+				var canMoveNow = false;
+				try
+				{
+					var moveInterface = AppDomain.CurrentDomain.GetAssemblies()
+						.Select(asm => asm.GetType("OpenRA.Mods.Common.IMove", false))
+						.FirstOrDefault(t => t != null);
+					if (moveInterface != null)
+					{
+						var traitsMethod = typeof(Actor).GetMethod("TraitsImplementing", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+						var traitsGeneric = traitsMethod?.MakeGenericMethod(moveInterface);
+						if (traitsGeneric?.Invoke(a, null) is IEnumerable moveTraits)
+						{
+							foreach (var _ in moveTraits)
+							{
+								canMoveNow = true;
+								break;
+							}
+						}
+					}
+				}
+				catch
+				{
+					canMoveNow = false;
+				}
+				var availableOrders = rawOrderIds
+					.Where(o => !string.Equals(o, "Move", StringComparison.OrdinalIgnoreCase) || canMoveNow)
 					.ToArray();
 
 				list.Add(new RLActor
@@ -524,7 +552,8 @@ namespace OpenRA
 					HP = hpTrait?.HP ?? 0,
 					MaxHP = hpTrait?.MaxHP ?? 0,
 					IsDead = false,
-					AvailableOrders = availableOrders
+					AvailableOrders = availableOrders,
+					AvailableOrderIds = rawOrderIds
 				});
 			}
 

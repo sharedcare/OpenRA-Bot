@@ -326,6 +326,9 @@ class OpenRAEnv(gym.Env):
             truncated = True
 
         info = self._make_info(raw)
+        print("actors:", info['actors'])
+        print("production:", info['production'])
+        print("placeable:", info['placeable_areas'])
         self._last_obs = new_obs
         return new_obs, reward, terminated, truncated, info
 
@@ -569,6 +572,7 @@ class OpenRAEnv(gym.Env):
             actions = deduped
 
         if actions:
+            print("actions:", actions)
             self.send_actions(actions)
             for a in actions:
                 self._record_action(self._action_signature(a))
@@ -596,28 +600,27 @@ class OpenRAEnv(gym.Env):
         self._recent_actions.append((sig, now))
 
     # --- Additional connection helpers ---
-    
+
     def get_connection_state(self) -> str:
         """Get current connection state as string."""
         if not self._initialized:
             return "NotInitialized"
         return get_connection_state(self._openra)
-    
+
     def get_lobby_info(self) -> Dict[str, Any]:
         if not self._initialized:
             return {}
         return dict(self._openra['PythonAPI'].GetLobbyInfo())
-    
+
     def is_connected_to_lobby(self) -> bool:
         if not self._initialized:
             return False
         return is_connected_to_lobby(self._openra)
-    
+
     def wait_for_connection(self, timeout_ms: int = 10000) -> bool:
         if not self._initialized:
             return False
         return wait_for_connection(self._openra, timeout_ms)
-
 
     # --- Observation helpers ---
 
@@ -706,6 +709,9 @@ class OpenRAEnv(gym.Env):
             'ally_unit_count': len(ally_units),
             'enemy_unit_count': len(enemy_units),
         }
+        info["actors"] = [
+            actor["type"] + str(actor["id"]) for actor in raw.get("actors", [])
+        ]
         # Include production overview if available from raw
         info['production'] = raw.get('production', {}) or {}
         # Cache queue actor ids to resolve produce/build indices
@@ -732,15 +738,23 @@ class OpenRAEnv(gym.Env):
         produce_queue_mask = np.zeros((max_units,), dtype=np.uint8)
         build_mask = np.zeros((max_units,), dtype=np.uint8)
         target_idx_mask = np.zeros((max_units,), dtype=np.uint8)
-        target_x_mask = np.ones((128,), dtype=np.uint8)
-        target_y_mask = np.ones((128,), dtype=np.uint8)
+        target_x_mask = np.zeros((max_units, 128), dtype=np.uint8)
+        target_y_mask = np.zeros((max_units, 128), dtype=np.uint8)
+        production = raw.get('production') or {}
+        queues = production.get('Queues') or []
 
-        # Gate by per-unit available_orders from obs. Supported: Move, Attack, DeployTransform, PlaceBuilding
+        # Gate by per-unit available_orders from obs and, when available, engine-side
+        # order feasibility checks to better match what the game will actually accept.
         for i, u in enumerate(my_units[:max_units]):
             orders = set(str(x).lower() for x in (u.get('available_orders') or []))
-            if 'move' in orders:
+            if 'move' in orders and self._unit_has_feasible_move(u):
                 move_mask[i] = 1
-            if 'deploytransform' in orders:
+                self._fill_move_target_masks(target_x_mask[i], target_y_mask[i], u)
+            if 'deploytransform' in orders and self._check_order_feasibility(
+                int(u.get('id', -1)),
+                'DeployTransform',
+                target_type='None',
+            ):
                 deploy_mask[i] = 1
 
         if enemy_units:
@@ -748,8 +762,14 @@ class OpenRAEnv(gym.Env):
                 orders = set(str(x).lower() for x in (u.get('available_orders') or []))
                 if 'attack' not in orders:
                     continue
-                for j, _ in enumerate(enemy_units[:max_units]):
-                    attack_mask[i, j] = 1
+                for j, enemy in enumerate(enemy_units[:max_units]):
+                    if self._check_order_feasibility(
+                        int(u.get('id', -1)),
+                        'Attack',
+                        target_type='Actor',
+                        target_actor_id=int(enemy.get('id', -1)),
+                    ):
+                        attack_mask[i, j] = 1
 
         # Start with all action types enabled then prune based on masks
         action_type_mask = np.ones((len(self.action_types),), dtype=np.uint8)
@@ -768,6 +788,17 @@ class OpenRAEnv(gym.Env):
             'attack_mask': attack_mask,
             'deploy_mask': deploy_mask,
         }
+        queue_infos: List[Dict[str, Any]] = []
+        for q in queues:
+            try:
+                queue_infos.append({
+                    'actor_id': int(q.get('ActorId', -1)),
+                    'enabled': bool(q.get('Enabled', False)),
+                    'items': list(q.get('Items') or []),
+                    'producible': list(q.get('Producible') or []),
+                })
+            except Exception:
+                continue
         if 'produce' in self.action_types:
             # Producible unit types mask using global catalog if available
             produce_unit_type_mask = np.zeros((len(self.unit_types),), dtype=np.uint8)
@@ -787,10 +818,18 @@ class OpenRAEnv(gym.Env):
                         i = int(idx)
                         if 0 <= i < produce_unit_type_mask.shape[0]:
                             produce_unit_type_mask[i] = 1
-            mask['produce_unit_type_mask'] = produce_unit_type_mask
-            n = min(len(getattr(self, '_queue_actor_ids', []) or []), max_units)
-            if n > 0:
-                produce_queue_mask[:n] = 1
+            queue_actor_ids = list(getattr(self, '_queue_actor_ids', []) or [])
+            for idx, actor_id in enumerate(queue_actor_ids[:max_units]):
+                info = next((q for q in queue_infos if q['actor_id'] == int(actor_id)), None)
+                if info is None or not info['enabled']:
+                    continue
+                if len(info['items']) >= 1:
+                    continue
+                if allowed_names:
+                    producible_names = {str(it.get('Name', '')).lower() for it in info['producible']}
+                    if not (allowed_names & producible_names):
+                        continue
+                produce_queue_mask[idx] = 1
             mask['produce_queue_mask'] = produce_queue_mask
 
             _disable_if_empty('produce', bool(produce_unit_type_mask.any()) and bool(produce_queue_mask.any()))
@@ -799,11 +838,31 @@ class OpenRAEnv(gym.Env):
             # Enable only when PlaceBuilding is available on at least one unit
             has_place_order = any('placebuilding' in set(str(x).lower() for x in (u.get('available_orders') or [])) for u in my_units)
             # Enable indices if we have queues; precise cell-level validity is user logic
-            n = min(len(getattr(self, '_queue_actor_ids', []) or []), max_units)
-            if n > 0:
-                build_mask[:n] = 1
-            mask['build_mask'] = build_mask
+            queue_actor_ids = list(getattr(self, '_queue_actor_ids', []) or [])
             placeable_names = {str(k).lower() for k in (raw.get('placeable_areas') or {}).keys()}
+            for idx, actor_id in enumerate(queue_actor_ids[:max_units]):
+                info = next((q for q in queue_infos if q['actor_id'] == int(actor_id)), None)
+                if info is None or not info['enabled']:
+                    continue
+                has_done_item = any(bool(it.get('Done', False)) for it in info['items'])
+                if not has_done_item:
+                    continue
+                if not placeable_names:
+                    continue
+                build_mask[idx] = 1
+                for unit_type, cells in (raw.get('placeable_areas') or {}).items():
+                    if not cells:
+                        continue
+                    for cell in cells:
+                        try:
+                            cx, cy = int(cell[0]), int(cell[1])
+                        except Exception:
+                            continue
+                        if 0 <= cx < 128:
+                            target_x_mask[idx, cx] = 1
+                        if 0 <= cy < 128:
+                            target_y_mask[idx, cy] = 1
+            mask['build_mask'] = build_mask
             for idx, name in self.reverse_unit_types.items():
                 if str(name).lower() in placeable_names:
                     build_unit_type_mask[int(idx)] = 1
@@ -833,6 +892,86 @@ class OpenRAEnv(gym.Env):
         mask['target_y'] = target_y_mask
         mask['unit_type'] = unit_type_mask
         return mask
+
+    def _check_order_feasibility(
+        self,
+        subject_actor_id: int,
+        order_id: str,
+        target_type: str = 'None',
+        cell_x: int = 0,
+        cell_y: int = 0,
+        target_actor_id: int = 0,
+        force_attack: bool = False,
+        force_queue: bool = False,
+        force_move: bool = False,
+    ) -> bool:
+        try:
+            api = self._openra['PythonAPI']
+            cell_bits = 0
+            if target_type.lower() == 'cell':
+                cell_bits = int(self._openra['CPos'](int(cell_x), int(cell_y)).Bits)
+            return bool(api.CheckOrderFeasibility(
+                int(subject_actor_id),
+                str(order_id),
+                str(target_type),
+                int(cell_bits),
+                0,
+                int(target_actor_id),
+                bool(force_attack),
+                bool(force_queue),
+                bool(force_move),
+            ))
+        except Exception:
+            return False
+
+    def _unit_has_feasible_move(self, unit: Dict[str, Any]) -> bool:
+        subject_id = int(unit.get('id', -1))
+        ux = int(unit.get('cell_x', 0))
+        uy = int(unit.get('cell_y', 0))
+        for dx, dy in ((0, -1), (1, 0), (0, 1), (-1, 0), (1, -1), (-1, 1)):
+            tx = max(0, ux + dx)
+            ty = max(0, uy + dy)
+            if self._check_order_feasibility(
+                subject_id,
+                'Move',
+                target_type='Cell',
+                cell_x=tx,
+                cell_y=ty,
+                force_move=True,
+            ):
+                return True
+        return False
+
+    def _fill_move_target_masks(self, target_x_mask: np.ndarray, target_y_mask: np.ndarray, unit: Dict[str, Any]) -> None:
+        subject_id = int(unit.get('id', -1))
+        ux = int(unit.get('cell_x', 0))
+        uy = int(unit.get('cell_y', 0))
+        found_any = False
+        for dx in range(-4, 5):
+            for dy in range(-4, 5):
+                if dx == 0 and dy == 0:
+                    continue
+                tx = max(0, min(127, ux + dx))
+                ty = max(0, min(127, uy + dy))
+                if self._check_order_feasibility(
+                    subject_id,
+                    'Move',
+                    target_type='Cell',
+                    cell_x=tx,
+                    cell_y=ty,
+                    force_move=True,
+                ):
+                    target_x_mask[tx] = 1
+                    target_y_mask[ty] = 1
+                    found_any = True
+
+        # Fallback to a small local window so masks stay non-empty even if strict
+        # feasibility probing fails transiently during remote synchronization.
+        if not found_any:
+            for tx in range(max(0, ux - 2), min(128, ux + 3)):
+                target_x_mask[tx] = 1
+            for ty in range(max(0, uy - 2), min(128, uy + 3)):
+                target_y_mask[ty] = 1
 
     def _state_to_vector(self, raw: Dict[str, Any]) -> np.ndarray:
         max_units = 100

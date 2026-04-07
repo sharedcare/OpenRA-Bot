@@ -18,6 +18,7 @@ def build_observation(openra: Dict[str, Any]) -> Dict[str, Any]:
             'max_hp': int(a.MaxHP),
             'dead': bool(a.IsDead),
             'available_orders': list(a.AvailableOrders) if getattr(a, 'AvailableOrders', None) is not None else [],
+            'available_order_ids': list(a.AvailableOrderIds) if getattr(a, 'AvailableOrderIds', None) is not None else [],
         })
 
     resources: List[Dict[str, Any]] = []

@@ -205,23 +205,30 @@ class RuleBasedAgent(BaseAgent):
             except Exception:
                 continue
 
-        # Prefer my producers; among them prefer 'fact' type
+        # Prefer the queue actor ids reported by the production snapshot. These are
+        # the same actors used by the in-game production palette and are more
+        # reliable than guessing from visible actor type names alone.
+        if enabled_producers:
+            subject_id = int(sorted(enabled_producers)[0])
+        else:
+            subject_id = None
+
+        # Prefer my producers; among them prefer 'fact' type when we can match the
+        # queue actor id back to the visible actor list.
         my_owner = int(obs.get("my_owner", -1))
         my_producers = [
             a
             for a in (obs.get("actors") or [])
             if int(a.get("owner", -1)) == my_owner and int(a.get("id", -1)) in enabled_producers
         ]
-        subject_id = None
         if my_producers:
             fact_like = [a for a in my_producers if str(a.get("type", "")).lower() == "fact"]
             subject_id = int((fact_like[0] if fact_like else my_producers[0]).get("id", -1))
 
-        # Fallback for remote/bridge cases where the global producible catalog is
-        # visible, but production queue reflection has not populated cleanly yet.
-        # The current build cycle only requests structures, so a construction yard
-        # ("fact") is a valid producer fallback here.
-        if subject_id is None:
+        # Fallback only when queue reflection is completely unavailable. If queues are
+        # present but none are eligible, we should not issue a speculative order to a
+        # random visible actor because that can silently no-op or hit the wrong queue.
+        if subject_id is None and not queues:
             my_owner = int(obs.get("my_owner", -1))
             fact_actor = next(
                 (
@@ -453,6 +460,10 @@ class PPOAgent(BaseAgent):
         if move_or_build.any():
             tx_mask = self._ensure_batch_mask(raw_masks.get("target_x"), batch_size, logits["target_x"].shape[-1], device)
             ty_mask = self._ensure_batch_mask(raw_masks.get("target_y"), batch_size, logits["target_y"].shape[-1], device)
+            if unit_idx is not None and tx_mask.dim() == 3:
+                tx_mask = self._select_rows(tx_mask, unit_idx)
+            if unit_idx is not None and ty_mask.dim() == 3:
+                ty_mask = self._select_rows(ty_mask, unit_idx)
             target_x_mask = torch.where(move_or_build.unsqueeze(-1), tx_mask, target_x_mask)
             target_y_mask = torch.where(move_or_build.unsqueeze(-1), ty_mask, target_y_mask)
         effective["target_x"] = target_x_mask

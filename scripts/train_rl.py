@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 from typing import Tuple, Any, List, Dict
 
 import numpy as np
@@ -100,6 +101,9 @@ def _plot_series(name: str, arr: np.ndarray, plot_dir: str, update_idx: int) -> 
 
 
 def train(
+    bin_dir: str = "/Users/sharedcare/Projects/OpenRA/bin",
+    mod_id: str = "ra",
+    map_uid: str = "b53e25e007666442dbf62b87eec7bfbe8160ef3f",
     num_steps: int = 2048,
     total_updates: int = 100,
     observation_type: str = "vector",
@@ -114,15 +118,28 @@ def train(
     minibatch_size: int = 256,
     target_kl: float = 0.03,
     log_dir: str = "checkpoints",
+    ticks_per_step: int = 10,
+    remote_host: str = "",
+    remote_port: int = 0,
+    remote_password: str = "",
+    remote_slot: str = "",
 ):
     env = make_env(
-        bin_dir="/Users/sharedcare/Projects/OpenRA/bin",
-        mod_id="ra",
-        map_uid="b53e25e007666442dbf62b87eec7bfbe8160ef3f",
-        ticks_per_step=10,
+        bin_dir=bin_dir,
+        mod_id=mod_id,
+        map_uid=map_uid,
+        ticks_per_step=ticks_per_step,
         observation_type=observation_type,
         enable_actions=["noop", "move", "attack", "produce", "build", "deploy"],
     )
+    if remote_host and remote_port:
+        env.configure_remote(
+            host=remote_host,
+            port=int(remote_port),
+            password=remote_password,
+            slot=(remote_slot or None),
+            spectator=False,
+        )
     model, _ = make_model(env, observation_type=observation_type, recurrent_type="lstm")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     agent = PPOAgent(model=model, device=str(device))
@@ -160,4 +177,52 @@ def train(
 
 
 if __name__ == "__main__":
-    train(log_dir=r"checkpoints")
+    parser = argparse.ArgumentParser(description="Train PPO on OpenRA locally or by joining a remote lobby.")
+    parser.add_argument("--bin-dir", default="/Users/sharedcare/Projects/OpenRA/bin")
+    parser.add_argument("--mod-id", default="ra")
+    parser.add_argument("--map-uid", default="b53e25e007666442dbf62b87eec7bfbe8160ef3f")
+    parser.add_argument("--num-steps", type=int, default=2048)
+    parser.add_argument("--total-updates", type=int, default=100)
+    parser.add_argument("--observation-type", choices=["vector", "image"], default="vector")
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--gae-lambda", type=float, default=0.95)
+    parser.add_argument("--clip-coef", type=float, default=0.2)
+    parser.add_argument("--ent-coef", type=float, default=0.01)
+    parser.add_argument("--vf-coef", type=float, default=0.5)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--learning-rate", type=float, default=1e-2)
+    parser.add_argument("--update-epochs", type=int, default=4)
+    parser.add_argument("--minibatch-size", type=int, default=256)
+    parser.add_argument("--target-kl", type=float, default=0.03)
+    parser.add_argument("--log-dir", default="checkpoints")
+    parser.add_argument("--ticks-per-step", type=int, default=10)
+    parser.add_argument("--remote-host", default="")
+    parser.add_argument("--remote-port", type=int, default=0)
+    parser.add_argument("--remote-password", default="")
+    parser.add_argument("--remote-slot", default="")
+    args = parser.parse_args()
+
+    train(
+        bin_dir=args.bin_dir,
+        mod_id=args.mod_id,
+        map_uid=args.map_uid,
+        num_steps=args.num_steps,
+        total_updates=args.total_updates,
+        observation_type=args.observation_type,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        clip_coef=args.clip_coef,
+        ent_coef=args.ent_coef,
+        vf_coef=args.vf_coef,
+        max_grad_norm=args.max_grad_norm,
+        learning_rate=args.learning_rate,
+        update_epochs=args.update_epochs,
+        minibatch_size=args.minibatch_size,
+        target_kl=args.target_kl,
+        log_dir=args.log_dir,
+        ticks_per_step=args.ticks_per_step,
+        remote_host=args.remote_host,
+        remote_port=args.remote_port,
+        remote_password=args.remote_password,
+        remote_slot=args.remote_slot,
+    )
