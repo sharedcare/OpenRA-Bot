@@ -326,9 +326,6 @@ class OpenRAEnv(gym.Env):
             truncated = True
 
         info = self._make_info(raw)
-        print("actors:", info['actors'])
-        print("production:", info['production'])
-        print("placeable:", info['placeable_areas'])
         self._last_obs = new_obs
         return new_obs, reward, terminated, truncated, info
 
@@ -572,7 +569,6 @@ class OpenRAEnv(gym.Env):
             actions = deduped
 
         if actions:
-            print("actions:", actions)
             self.send_actions(actions)
             for a in actions:
                 self._record_action(self._action_signature(a))
@@ -747,14 +743,10 @@ class OpenRAEnv(gym.Env):
         # order feasibility checks to better match what the game will actually accept.
         for i, u in enumerate(my_units[:max_units]):
             orders = set(str(x).lower() for x in (u.get('available_orders') or []))
-            if 'move' in orders and self._unit_has_feasible_move(u):
+            if 'move' in orders and self._unit_has_feasible_move(u, fallback_to_orders=True):
                 move_mask[i] = 1
                 self._fill_move_target_masks(target_x_mask[i], target_y_mask[i], u)
-            if 'deploytransform' in orders and self._check_order_feasibility(
-                int(u.get('id', -1)),
-                'DeployTransform',
-                target_type='None',
-            ):
+            if 'deploytransform' in orders and self._unit_can_deploy(u):
                 deploy_mask[i] = 1
 
         if enemy_units:
@@ -924,7 +916,7 @@ class OpenRAEnv(gym.Env):
         except Exception:
             return False
 
-    def _unit_has_feasible_move(self, unit: Dict[str, Any]) -> bool:
+    def _unit_has_feasible_move(self, unit: Dict[str, Any], fallback_to_orders: bool = False) -> bool:
         subject_id = int(unit.get('id', -1))
         ux = int(unit.get('cell_x', 0))
         uy = int(unit.get('cell_y', 0))
@@ -940,7 +932,21 @@ class OpenRAEnv(gym.Env):
                 force_move=True,
             ):
                 return True
+        if fallback_to_orders:
+            orders = set(str(x).lower() for x in (unit.get('available_orders') or []))
+            return 'move' in orders
         return False
+
+    def _unit_can_deploy(self, unit: Dict[str, Any]) -> bool:
+        subject_id = int(unit.get('id', -1))
+        if self._check_order_feasibility(
+            subject_id,
+            'DeployTransform',
+            target_type='None',
+        ):
+            return True
+        orders = set(str(x).lower() for x in (unit.get('available_orders') or []))
+        return 'deploytransform' in orders
 
     def _fill_move_target_masks(self, target_x_mask: np.ndarray, target_y_mask: np.ndarray, unit: Dict[str, Any]) -> None:
         subject_id = int(unit.get('id', -1))
