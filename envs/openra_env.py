@@ -123,6 +123,8 @@ class OpenRAEnv(gym.Env):
         self._enemy_unit_ids: List[int] = []
         self._recent_actions: deque[Tuple] = deque(maxlen=256)
         self._action_ttl_steps: int = 8
+        self.auto_place: bool = False
+        self._placement_spiral = self._build_placement_spiral(radius=6)
         # Reward shaping config and previous metrics snapshot
         self.reward_weights = {
             'unit': 0.5,
@@ -295,6 +297,10 @@ class OpenRAEnv(gym.Env):
         }
         # Initialize production item snapshot
         self._prev_prod_items = self._extract_production_items(raw)
+        # Clear action dedup history so stale entries from the previous
+        # episode (with higher world_tick) don't suppress actions in the
+        # new episode where world_tick resets to 0.
+        self._recent_actions.clear()
         info = self._make_info(raw)
         return obs, info
 
@@ -506,6 +512,11 @@ class OpenRAEnv(gym.Env):
         atype = self.action_types[atype_idx] if 0 <= atype_idx < len(self.action_types) else 'noop'
         actions: List[Dict[str, Any]] = []
 
+        # Auto-place completed production items BEFORE the agent's action.
+        # This prevents Done items from being overwritten by new produce orders.
+        if self.auto_place:
+            actions.extend(self._auto_place_done_items())
+
         if atype == 'move':
             # Move to cell
             actor_id = self._resolve_my_unit_id(unit_idx)
@@ -580,6 +591,7 @@ class OpenRAEnv(gym.Env):
             int((a.get('target_cell') or ([-1, -1]))[0]) if a.get('target_cell') else -1,
             int((a.get('target_cell') or ([-1, -1]))[1]) if a.get('target_cell') else -1,
             int(a.get('target_actor', -1)),
+            str(a.get('target_string', '')),
         )
 
     def _is_duplicate_action(self, sig: Tuple) -> bool:
@@ -594,6 +606,83 @@ class OpenRAEnv(gym.Env):
     def _record_action(self, sig: Tuple) -> None:
         now = self._get_current_world_tick()
         self._recent_actions.append((sig, now))
+
+    # --- Auto-placement helpers ---
+
+    @staticmethod
+    def _build_placement_spiral(radius: int = 6) -> List[Tuple[int, int]]:
+        """Offsets sorted by Chebyshev distance from origin."""
+        offsets: List[Tuple[int, int]] = []
+        for r in range(1, radius + 1):
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    if max(abs(dx), abs(dy)) == r:
+                        offsets.append((dx, dy))
+        return offsets
+
+    def _find_base_position(self) -> Optional[Tuple[int, int]]:
+        """Return (cell_x, cell_y) of the first alive building we own."""
+        raw = self._last_raw_state
+        if raw is None:
+            return None
+        my_owner = int(raw.get("my_owner", -1))
+        for u in raw.get("actors") or []:
+            if int(u.get("owner", -1)) != my_owner:
+                continue
+            if bool(u.get("dead", False)):
+                continue
+            orders = {str(x).lower() for x in (u.get("available_orders") or [])}
+            if "move" not in orders:
+                return (int(u.get("cell_x", 0)), int(u.get("cell_y", 0)))
+        return None
+
+    def _auto_place_done_items(self) -> List[Dict[str, Any]]:
+        """Generate PlaceBuilding orders for all Done production items."""
+        raw = self._last_raw_state
+        if raw is None:
+            return []
+
+        prod = raw.get("production") or {}
+        queues = prod.get("Queues") or []
+        if not queues:
+            return []
+
+        base_pos = self._find_base_position()
+        if base_pos is None:
+            return []
+
+        try:
+            api = self._openra['Game']
+            player_actor_id = int(
+                api.OrderManager.World.LocalPlayer.PlayerActor.ActorID
+            )
+        except Exception:
+            return []
+
+        place_orders: List[Dict[str, Any]] = []
+        for q in queues:
+            q_id = int(q.get("ActorId", -1))
+            for it in q.get("Items") or []:
+                if not bool(it.get("Done", False)):
+                    continue
+                name = str(it.get("Item") or it.get("Name") or "")
+                if not name:
+                    continue
+                # Try positions in a spiral around the base.
+                # Send several candidates; the engine accepts the first
+                # valid one and ignores the rest.
+                for dx, dy in self._placement_spiral[:12]:
+                    cx = base_pos[0] + dx
+                    cy = base_pos[1] + dy
+                    place_orders.append({
+                        "order": "PlaceBuilding",
+                        "subject": player_actor_id,
+                        "target_cell": (cx, cy),
+                        "target_string": name,
+                        "extra_data": q_id,
+                        "queued": False,
+                    })
+        return place_orders
 
     # --- Additional connection helpers ---
 
@@ -785,12 +874,25 @@ class OpenRAEnv(gym.Env):
             try:
                 queue_infos.append({
                     'actor_id': int(q.get('ActorId', -1)),
+                    'type': str(q.get('Type', '')).lower(),
                     'enabled': bool(q.get('Enabled', False)),
                     'items': list(q.get('Items') or []),
                     'producible': list(q.get('Producible') or []),
                 })
             except Exception:
                 continue
+
+        # Identify queue types (categories) that already have items.
+        # E.g. if the "Building" queue has an in-progress/Done item, all
+        # produce actions targeting building-type units should be blocked,
+        # even if a different queue (like "Defense") on the same actor is
+        # empty.  This prevents the engine from routing a building-type
+        # StartProduction to an occupied building queue.
+        occupied_queue_types: set = set()
+        for qi in queue_infos:
+            if qi['enabled'] and len(qi['items']) >= 1 and qi['type']:
+                occupied_queue_types.add(qi['type'])
+
         if 'produce' in self.action_types:
             # Producible unit types mask using global catalog if available
             produce_unit_type_mask = np.zeros((len(self.unit_types),), dtype=np.uint8)
@@ -804,9 +906,32 @@ class OpenRAEnv(gym.Env):
             except Exception:
                 allowed_names = set()
 
+            # Build a set of unit type names whose queues are ALL occupied.
+            # A unit type is blocked if every queue that can produce it has
+            # its queue-type in occupied_queue_types.
+            blocked_unit_names: set = set()
+            if occupied_queue_types:
+                for nm in allowed_names:
+                    # Find all queues that list this item as producible
+                    all_occupied = True
+                    found_queue = False
+                    for qi in queue_infos:
+                        if not qi['enabled']:
+                            continue
+                        producible_names = {str(it.get('Name', '')).lower() for it in qi['producible']}
+                        if nm not in producible_names:
+                            continue
+                        found_queue = True
+                        if qi['type'] not in occupied_queue_types:
+                            all_occupied = False
+                            break
+                    if found_queue and all_occupied:
+                        blocked_unit_names.add(nm)
+
             if allowed_names:
                 for idx, name in self.reverse_unit_types.items():
-                    if str(name).lower() in allowed_names:
+                    nm = str(name).lower()
+                    if nm in allowed_names and nm not in blocked_unit_names:
                         i = int(idx)
                         if 0 <= i < produce_unit_type_mask.shape[0]:
                             produce_unit_type_mask[i] = 1
@@ -815,7 +940,10 @@ class OpenRAEnv(gym.Env):
                 info = next((q for q in queue_infos if q['actor_id'] == int(actor_id)), None)
                 if info is None or not info['enabled']:
                     continue
+                # Block this queue if it has items OR its type is occupied
                 if len(info['items']) >= 1:
+                    continue
+                if info['type'] in occupied_queue_types:
                     continue
                 if allowed_names:
                     producible_names = {str(it.get('Name', '')).lower() for it in info['producible']}

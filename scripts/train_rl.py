@@ -1,7 +1,7 @@
 import os
 import sys
 import argparse
-from typing import Tuple, Any, List, Dict
+from typing import Tuple, Any, List, Dict, Optional
 
 import numpy as np
 import torch
@@ -20,32 +20,46 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     from OpenRA.Bot.envs.openra_env import OpenRAEnv, make_env
+    from OpenRA.Bot.envs.wrappers import AugmentedStateWrapper, ShapedRewardWrapper
     from OpenRA.Bot.models import ActorCritic
     from OpenRA.Bot.agent import PPOAgent
 except Exception:  # noqa: BLE001
     from envs.openra_env import OpenRAEnv, make_env  # type: ignore
+    from envs.wrappers import AugmentedStateWrapper, ShapedRewardWrapper  # type: ignore
     from models import ActorCritic  # type: ignore
     from agent import PPOAgent  # type: ignore
 
 
 def make_model(
-    env: OpenRAEnv, observation_type: str = "vector", recurrent_type: str = "lstm"
+    env,
+    observation_type: str = "vector",
+    recurrent_type: str = "lstm",
+    augmented_config: Optional[Dict[str, int]] = None,
 ) -> Tuple[ActorCritic, Tuple[int, int, int, int, int, int]]:
-    # Infer action dims from env
+    # Resolve action_types from possibly-wrapped env.
+    inner = env
+    while hasattr(inner, "env"):
+        if hasattr(inner, "action_types"):
+            break
+        inner = inner.env
     a_dims = (
-        len(env.action_types),
-        int(env.action_space.nvec[1]),
-        int(env.action_space.nvec[2]),
-        int(env.action_space.nvec[3]),
-        int(env.action_space.nvec[4]),
-        int(env.action_space.nvec[5]),
+        len(inner.action_types),
+        int(inner.action_space.nvec[1]),
+        int(inner.action_space.nvec[2]),
+        int(inner.action_space.nvec[3]),
+        int(inner.action_space.nvec[4]),
+        int(inner.action_space.nvec[5]),
     )
     if observation_type == "vector":
         obs_space = {"vector": int(env.observation_space.shape[0])}
     else:
         obs_space = {"channels": int(env.observation_space.shape[-1])}
     model = ActorCritic(
-        obs_space=obs_space, action_dims=a_dims, observation_type=observation_type, recurrent_type=recurrent_type
+        obs_space=obs_space,
+        action_dims=a_dims,
+        observation_type=observation_type,
+        recurrent_type=recurrent_type,
+        augmented_config=augmented_config,
     )
     return model, a_dims
 
@@ -119,10 +133,15 @@ def train(
     target_kl: float = 0.03,
     log_dir: str = "checkpoints",
     ticks_per_step: int = 10,
+    max_episode_ticks: int = 3000,
     remote_host: str = "",
     remote_port: int = 0,
     remote_password: str = "",
     remote_slot: str = "",
+    # Augmented state options
+    augmented: bool = False,
+    frame_stack_k: int = 8,
+    verbose_reward: bool = False,
 ):
     env = make_env(
         bin_dir=bin_dir,
@@ -131,6 +150,7 @@ def train(
         ticks_per_step=ticks_per_step,
         observation_type=observation_type,
         enable_actions=["noop", "move", "attack", "produce", "build", "deploy"],
+        max_episode_ticks=max_episode_ticks,
     )
     if remote_host and remote_port:
         env.configure_remote(
@@ -140,7 +160,24 @@ def train(
             slot=(remote_slot or None),
             spectator=False,
         )
-    model, _ = make_model(env, observation_type=observation_type, recurrent_type="lstm")
+
+    # Optional augmented-state wrappers for delayed-reward credit assignment.
+    augmented_config = None
+    if augmented:
+        env = ShapedRewardWrapper(env, verbose=verbose_reward)
+        env = AugmentedStateWrapper(env, frame_stack_k=frame_stack_k)
+        augmented_config = env.augmentation_config
+        print(f"[augmented] obs_dim={env.aug_obs_dim} "
+              f"(base={env.base_obs_dim}, k={frame_stack_k}, actions={env.num_action_types})")
+        print(f"[augmented] reward=shaped (building+unit+production+deploy+idle)")
+        print(f"[augmented] max_episode_ticks={max_episode_ticks}")
+
+    model, _ = make_model(
+        env,
+        observation_type=observation_type,
+        recurrent_type="lstm",
+        augmented_config=augmented_config,
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     agent = PPOAgent(model=model, device=str(device))
 
@@ -196,10 +233,25 @@ if __name__ == "__main__":
     parser.add_argument("--target-kl", type=float, default=0.03)
     parser.add_argument("--log-dir", default="checkpoints")
     parser.add_argument("--ticks-per-step", type=int, default=10)
+    parser.add_argument("--max-episode-ticks", type=int, default=3000,
+                        help="Truncate episode after this many game ticks (forces reset). 3000 ticks ≈ 300 steps @ ticks_per_step=10.")
     parser.add_argument("--remote-host", default="")
     parser.add_argument("--remote-port", type=int, default=0)
     parser.add_argument("--remote-password", default="")
     parser.add_argument("--remote-slot", default="")
+    # Augmented state options
+    parser.add_argument(
+        "--augmented", action="store_true",
+        help="Wrap env with StateDiffRewardWrapper + AugmentedStateWrapper for delayed-reward credit assignment.",
+    )
+    parser.add_argument(
+        "--frame-stack-k", type=int, default=8,
+        help="Number of past frames to stack (only used with --augmented).",
+    )
+    parser.add_argument(
+        "--verbose-reward", action="store_true",
+        help="Print non-zero reward events to stderr for debugging.",
+    )
     args = parser.parse_args()
 
     train(
@@ -221,8 +273,12 @@ if __name__ == "__main__":
         target_kl=args.target_kl,
         log_dir=args.log_dir,
         ticks_per_step=args.ticks_per_step,
+        max_episode_ticks=args.max_episode_ticks,
         remote_host=args.remote_host,
         remote_port=args.remote_port,
         remote_password=args.remote_password,
         remote_slot=args.remote_slot,
+        augmented=args.augmented,
+        frame_stack_k=args.frame_stack_k,
+        verbose_reward=args.verbose_reward,
     )

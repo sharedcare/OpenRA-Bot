@@ -375,6 +375,14 @@ namespace OpenRA
 				{
 					if (!string.IsNullOrEmpty(a.TargetString))
 					{
+						// Guard: for building-type items, suppress if the target
+						// queue already has an item (in-progress or Done).  This
+						// prevents the agent from accidentally canceling a completed
+						// item before it can be placed.  Unit queues (infantry,
+						// vehicle) are unaffected and allow stacking.
+						if (IsBuildingQueueOccupied(world, subject, a.TargetString))
+							continue;
+
 						var prodOrder = Order.StartProduction(subject, a.TargetString, 1, true);
 						orders.Add(prodOrder);
 					}
@@ -436,6 +444,95 @@ namespace OpenRA
 						list.Add(ra);
 				SendActions(list);
 			}
+		}
+
+		/// <summary>
+		/// Returns true when <paramref name="itemName"/> is a building and the
+		/// production queue on <paramref name="producer"/> that would handle it
+		/// already contains at least one item (in-progress or Done).
+		/// Unit-type queues (infantry, vehicle) always return false so that
+		/// stacking is allowed.
+		/// </summary>
+		static bool IsBuildingQueueOccupied(World world, Actor producer, string itemName)
+		{
+			try
+			{
+				// Resolve the item's ActorInfo to check if it's a building
+				if (!world.Map.Rules.Actors.TryGetValue(itemName, out var actorInfo) || actorInfo == null)
+					return false;
+
+				var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+				var biType = assemblies
+					.Select(a => a.GetType("OpenRA.Mods.Common.Traits.BuildingInfo", false))
+					.FirstOrDefault(t => t != null);
+				if (biType == null)
+					return false;
+
+				var tioMethod = typeof(ActorInfo).GetMethod(
+					"TraitInfoOrDefault",
+					BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+				var tioGeneric = tioMethod?.MakeGenericMethod(biType);
+				if (tioGeneric?.Invoke(actorInfo, null) == null)
+					return false; // Not a building — allow stacking
+
+				// It's a building. Find the queue on this producer that can produce it.
+				var pqType = assemblies
+					.Select(a => a.GetType("OpenRA.Mods.Common.Traits.ProductionQueue", false))
+					.FirstOrDefault(t => t != null);
+				if (pqType == null)
+					return false;
+
+				var traitsGeneric = typeof(Actor)
+					.GetMethod("TraitsImplementing", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+					?.MakeGenericMethod(pqType);
+				if (traitsGeneric?.Invoke(producer, null) is not IEnumerable queues)
+					return false;
+
+				foreach (var q in queues)
+				{
+					if (q == null)
+						continue;
+
+					var enabledProp = q.GetType().GetProperty("Enabled");
+					if (enabledProp == null || !(bool)enabledProp.GetValue(q))
+						continue;
+
+					// Check if this queue's Producible dictionary contains our item
+					var prodField = q.GetType().GetField("Producible", BindingFlags.Instance | BindingFlags.NonPublic);
+					for (var bt = q.GetType().BaseType; prodField == null && bt != null; bt = bt.BaseType)
+						prodField = bt.GetField("Producible", BindingFlags.Instance | BindingFlags.NonPublic);
+
+					if (prodField?.GetValue(q) is not IDictionary dict)
+						continue;
+
+					var canProduceItem = false;
+					foreach (DictionaryEntry de in dict)
+					{
+						if (de.Key is ActorInfo ai && string.Equals(ai.Name, itemName, StringComparison.OrdinalIgnoreCase))
+						{
+							canProduceItem = true;
+							break;
+						}
+					}
+
+					if (!canProduceItem)
+						continue;
+
+					// This queue handles our building type. Check if it has items.
+					var allQueued = q.GetType().GetMethod("AllQueued");
+					if (allQueued?.Invoke(q, null) is IEnumerable items)
+					{
+						foreach (var _ in items)
+							return true; // Has at least one item — block
+					}
+				}
+			}
+			catch
+			{
+				// On reflection failure, allow the order through
+			}
+
+			return false;
 		}
 
 		static Target ConvertTarget(World world, RLTarget t)
@@ -826,120 +923,161 @@ namespace OpenRA
 
 		static PlaceableAreaData[] CollectPlaceableAreas(World world, Player player)
 		{
-			// Implement via reflection to avoid hard dependency on Mods.Common
+			// Return valid placement cells for all producible building types.
+			// Mirrors the placement logic in BaseBuilderQueueManager.ChooseBuildLocation:
+			//   world.CanPlaceBuilding(cell, actorInfo, bi, null)
+			//   bi.IsCloseEnoughToBase(world, player, actorInfo, cell)
+			// Uses Map.FindTilesInAnnulus for efficient spatial search around
+			// existing buildings, rather than iterating all map cells.
 			if (world == null || player == null)
 				return [];
 
 			try
 			{
-				// Resolve required Mods.Common types
 				var assemblies = AppDomain.CurrentDomain.GetAssemblies();
-				var pqType = assemblies.Select(a => a.GetType("OpenRA.Mods.Common.Traits.ProductionQueue", false)).FirstOrDefault(t => t != null);
-				var biType = assemblies.Select(a => a.GetType("OpenRA.Mods.Common.Traits.BuildingInfo", false)).FirstOrDefault(t => t != null);
-				var buildingUtilsType = assemblies.Select(a => a.GetType("OpenRA.Mods.Common.Traits.BuildingUtils", false)).FirstOrDefault(t => t != null);
-				if (pqType == null || biType == null || buildingUtilsType == null)
-					return [];
-
-				// Actor.TraitsImplementing<ProductionQueue>()
-				var traitsMethod = typeof(Actor).GetMethod("TraitsImplementing", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-				var traitsGeneric = traitsMethod?.MakeGenericMethod(pqType);
-				if (traitsGeneric == null)
+				var biType = assemblies
+					.Select(a => a.GetType("OpenRA.Mods.Common.Traits.BuildingInfo", false))
+					.FirstOrDefault(t => t != null);
+				var buildingUtilsType = assemblies
+					.Select(a => a.GetType("OpenRA.Mods.Common.Traits.BuildingUtils", false))
+					.FirstOrDefault(t => t != null);
+				var pqType = assemblies
+					.Select(a => a.GetType("OpenRA.Mods.Common.Traits.ProductionQueue", false))
+					.FirstOrDefault(t => t != null);
+				if (biType == null || buildingUtilsType == null || pqType == null)
 					return [];
 
 				// BuildingUtils.CanPlaceBuilding(World, CPos, ActorInfo, BuildingInfo, Actor)
-				var canPlace = buildingUtilsType.GetMethod("CanPlaceBuilding", BindingFlags.Public | BindingFlags.Static, null,
+				var canPlace = buildingUtilsType.GetMethod(
+					"CanPlaceBuilding", BindingFlags.Public | BindingFlags.Static, null,
 					[typeof(World), typeof(CPos), typeof(ActorInfo), biType, typeof(Actor)], null);
-				if (canPlace == null)
-					return [];
 
 				// BuildingInfo.IsCloseEnoughToBase(World, Player, ActorInfo, CPos)
-				var isCloseEnough = biType.GetMethod("IsCloseEnoughToBase", BindingFlags.Public | BindingFlags.Instance, null,
+				var isCloseEnough = biType.GetMethod(
+					"IsCloseEnoughToBase", BindingFlags.Public | BindingFlags.Instance, null,
 					[typeof(World), typeof(Player), typeof(ActorInfo), typeof(CPos)], null);
-				if (isCloseEnough == null)
+
+				if (canPlace == null || isCloseEnough == null)
 					return [];
 
-				var results = new List<PlaceableAreaData>();
+				// --- Find base center from existing buildings (same idea as BaseBuilderQueueManager) ---
+				var tioMethodInfo = typeof(ActorInfo).GetMethod(
+					"TraitInfoOrDefault", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+				var tioGenericBI = tioMethodInfo?.MakeGenericMethod(biType);
+
+				long sumX = 0, sumY = 0;
+				var buildingCount = 0;
+				foreach (var a in world.Actors)
+				{
+					if (a == null || a.Owner != player || a.IsDead || !a.IsInWorld)
+						continue;
+					if (tioGenericBI?.Invoke(a.Info, null) == null)
+						continue;
+					sumX += a.Location.X;
+					sumY += a.Location.Y;
+					buildingCount++;
+				}
+
+				if (buildingCount == 0)
+					return [];
+
+				var baseCenter = new CPos((int)(sumX / buildingCount), (int)(sumY / buildingCount));
+
+				// --- Collect all producible building type names from enabled queues ---
+				var traitsMethod = typeof(Actor).GetMethod(
+					"TraitsImplementing", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+				var traitsGenericPQ = traitsMethod?.MakeGenericMethod(pqType);
+
+				// name → first queue actor id
+				var buildingTypes = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
 
 				foreach (var a in world.Actors)
 				{
 					if (a == null || a.Owner != player || a.IsDead || !a.IsInWorld)
 						continue;
 
-					if (traitsGeneric.Invoke(a, null) is not IEnumerable pqEnum)
+					if (traitsGenericPQ?.Invoke(a, null) is not IEnumerable pqEnum)
 						continue;
 
 					foreach (var q in pqEnum)
 					{
 						if (q == null)
 							continue;
-
-						// q.Enabled
 						var enabledProp = q.GetType().GetProperty("Enabled");
-						var enabled = enabledProp != null && (bool)enabledProp.GetValue(q);
-						if (!enabled)
+						if (enabledProp == null || !(bool)enabledProp.GetValue(q))
 							continue;
 
-						// q.AllQueued() and filter Done items, select Item name
-						var finishedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-						var allQueued = q.GetType().GetMethod("AllQueued");
-						if (allQueued?.Invoke(q, null) is IEnumerable queuedEnum)
-						{
-							foreach (var pi in queuedEnum)
-							{
-								if (pi == null) continue;
-								var piType = pi.GetType();
-								var done = (bool)(piType.GetProperty("Done")?.GetValue(pi) ?? false);
-								if (!done) continue;
+						// Read the Producible dictionary (private field on ProductionQueue)
+						var prodField = q.GetType().GetField("Producible", BindingFlags.Instance | BindingFlags.NonPublic);
+						for (var bt = q.GetType().BaseType; prodField == null && bt != null; bt = bt.BaseType)
+							prodField = bt.GetField("Producible", BindingFlags.Instance | BindingFlags.NonPublic);
 
-								var fItem = piType.GetField("Item", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-								var itemName = fItem != null ? (fItem.GetValue(pi) as string ?? "") : (piType.GetProperty("Item")?.GetValue(pi) as string ?? "");
-								if (!string.IsNullOrEmpty(itemName))
-									finishedNames.Add(itemName);
-							}
-						}
-
-						if (finishedNames.Count == 0)
+						if (prodField?.GetValue(q) is not IDictionary dict)
 							continue;
 
-						foreach (var item in finishedNames)
+						foreach (DictionaryEntry de in dict)
 						{
-							// Resolve ActorInfo
-							if (!world.Map.Rules.Actors.TryGetValue(item, out var actorInfo) || actorInfo == null)
+							if (de.Key is not ActorInfo ai || string.IsNullOrEmpty(ai.Name))
 								continue;
 
-							// actorInfo.TraitInfoOrDefault<BuildingInfo>()
-							var tioMethod = actorInfo.GetType().GetMethod("TraitInfoOrDefault", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-							var tioGeneric = tioMethod?.MakeGenericMethod(biType);
-							var bi = tioGeneric?.Invoke(actorInfo, null);
-							if (bi == null)
-								continue; // not a building
-
-							var cells = new List<PositionData>();
-							foreach (var cell in world.Map.AllCells)
+							// Check visibility
+							if (de.Value != null)
 							{
-								// world.CanPlaceBuilding(cell, actorInfo, bi, null)
-								var okPlace = (bool)(canPlace.Invoke(null, [world, cell, actorInfo, bi, null]) ?? false);
-								if (!okPlace)
-									continue;
-
-								// bi.IsCloseEnoughToBase(world, player, actorInfo, cell)
-								var okNear = (bool)(isCloseEnough.Invoke(bi, [world, player, actorInfo, cell]) ?? false);
-								if (!okNear)
-									continue;
-
-								cells.Add(new PositionData { X = cell.X, Y = cell.Y });
-							}
-
-							if (cells.Count > 0)
-							{
-								results.Add(new PlaceableAreaData
+								var visField = de.Value.GetType().GetField(
+									"Visible", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+								if (visField != null)
 								{
-									ActorId = a.ActorID,
-									UnitType = item,
-									Cells = cells.ToArray()
-								});
+									try { if (!(bool)visField.GetValue(de.Value)) continue; } catch { }
+								}
 							}
+
+							// Must have BuildingInfo
+							if (tioGenericBI?.Invoke(ai, null) == null)
+								continue;
+
+							buildingTypes.TryAdd(ai.Name, a.ActorID);
 						}
+					}
+				}
+
+				if (buildingTypes.Count == 0)
+					return [];
+
+				// --- For each building type, search around base using FindTilesInAnnulus ---
+				const int maxSearchRadius = 15;
+				var results = new List<PlaceableAreaData>();
+
+				foreach (var (name, queueActorId) in buildingTypes)
+				{
+					if (!world.Map.Rules.Actors.TryGetValue(name, out var actorInfo) || actorInfo == null)
+						continue;
+
+					var bi = tioGenericBI?.Invoke(actorInfo, null);
+					if (bi == null)
+						continue;
+
+					var cells = new List<PositionData>();
+
+					// Mirror BaseBuilderQueueManager.FindPos: search annulus around base center
+					foreach (var cell in world.Map.FindTilesInAnnulus(baseCenter, 0, maxSearchRadius))
+					{
+						if (!(bool)(canPlace.Invoke(null, [world, cell, actorInfo, bi, null]) ?? false))
+							continue;
+
+						if (!(bool)(isCloseEnough.Invoke(bi, [world, player, actorInfo, cell]) ?? false))
+							continue;
+
+						cells.Add(new PositionData { X = cell.X, Y = cell.Y });
+					}
+
+					if (cells.Count > 0)
+					{
+						results.Add(new PlaceableAreaData
+						{
+							ActorId = queueActorId,
+							UnitType = name,
+							Cells = cells.ToArray()
+						});
 					}
 				}
 
@@ -947,7 +1085,6 @@ namespace OpenRA
 			}
 			catch
 			{
-				// Fall back to empty on any reflection failure to keep interop stable
 				return [];
 			}
 		}

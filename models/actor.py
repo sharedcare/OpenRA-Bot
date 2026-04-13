@@ -72,6 +72,76 @@ class VectorEncoder(nn.Module):
         return self.net(x.float())
 
 
+class AugmentedVectorEncoder(nn.Module):
+    """Encoder for augmented observations produced by AugmentedStateWrapper.
+
+    The flat input is split back into structured components and processed by
+    specialised sub-networks:
+
+        frames (k * base_dim) -> shared frame encoder -> mean pool  -> 256
+        delta  (base_dim)     -> same shared encoder                -> 256
+        action_hist + time    -> small context MLP                  -> 64
+                                                     concat (576) -> fusion -> feature_dim
+
+    This is ~7x more parameter-efficient than a single MLP over the full
+    augmented vector and preserves the per-frame spatial structure that a
+    flat MLP would lose.
+    """
+
+    def __init__(
+        self,
+        base_obs_dim: int,
+        frame_stack_k: int,
+        num_action_types: int,
+        feature_dim: int = 256,
+    ) -> None:
+        super().__init__()
+        self.base_obs_dim = base_obs_dim
+        self.k = frame_stack_k
+        self.num_action_types = num_action_types
+
+        # Shared encoder applied to each frame AND to the state delta.
+        self.frame_enc = _mlp([base_obs_dim, 512, 256])
+
+        # Small encoder for the discrete action context.
+        action_ctx_dim = frame_stack_k * num_action_types + num_action_types
+        self.action_enc = _mlp([action_ctx_dim, 64, 64])
+
+        # Fusion: frame_pool(256) + delta(256) + action_ctx(64) -> feature_dim
+        self.fusion = _mlp([256 + 256 + 64, 256, feature_dim])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, aug_dim) where N = B or B*L (ActorCritic flattens before calling).
+        f_end = self.k * self.base_obs_dim
+        a_end = f_end + self.k * self.num_action_types
+        d_end = a_end + self.base_obs_dim
+        # d_end+num_action_types == aug_dim (time features at the tail)
+
+        frames_flat = x[:, :f_end]                     # (N, k*base)
+        action_hist = x[:, f_end:a_end]                 # (N, k*nact)
+        delta = x[:, a_end:d_end]                       # (N, base)
+        time_feat = x[:, d_end:]                        # (N, nact)
+
+        N = x.shape[0]
+
+        # --- per-frame encoding (weight-shared) ---
+        frames = frames_flat.reshape(N * self.k, self.base_obs_dim)
+        frame_feats = self.frame_enc(frames)                # (N*k, 256)
+        frame_feats = frame_feats.reshape(N, self.k, -1)    # (N, k, 256)
+        frame_pool = frame_feats.mean(dim=1)                 # (N, 256)
+
+        # --- delta through same shared encoder ---
+        delta_feat = self.frame_enc(delta)                   # (N, 256)
+
+        # --- action / time context ---
+        ctx = torch.cat([action_hist, time_feat], dim=-1)    # (N, k*nact + nact)
+        ctx_feat = self.action_enc(ctx)                      # (N, 64)
+
+        # --- fusion ---
+        fused = torch.cat([frame_pool, delta_feat, ctx_feat], dim=-1)  # (N, 576)
+        return self.fusion(fused)                                       # (N, feature_dim)
+
+
 class MixedEncoder(nn.Module):
     """
     Combine vector and vision encoders for hybrid observations.
@@ -181,6 +251,7 @@ class ActorCritic(nn.Module):
         hidden_size: int = 256,
         recurrent_type: Optional[str] = None,  # [None, "lstm", "gru"]
         recurrent_hidden_size: int = 256,
+        augmented_config: Optional[Dict[str, int]] = None,
     ) -> None:
         super().__init__()
         self.observation_type = observation_type
@@ -190,8 +261,16 @@ class ActorCritic(nn.Module):
         # Backward-compatible name used by PPOAgent training code.
         self.num_lstm_layers = self.num_recurrent_layers
         if observation_type == "vector":
-            obs_dim = int(obs_space.get("vector", 0))
-            self.encoder = VectorEncoder(obs_dim=obs_dim, hidden_sizes=(512, 256), feature_dim=feature_dim)
+            if augmented_config is not None:
+                self.encoder = AugmentedVectorEncoder(
+                    base_obs_dim=int(augmented_config["base_obs_dim"]),
+                    frame_stack_k=int(augmented_config["frame_stack_k"]),
+                    num_action_types=int(augmented_config["num_action_types"]),
+                    feature_dim=feature_dim,
+                )
+            else:
+                obs_dim = int(obs_space.get("vector", 0))
+                self.encoder = VectorEncoder(obs_dim=obs_dim, hidden_sizes=(512, 256), feature_dim=feature_dim)
         elif observation_type == "image":
             in_ch = int(obs_space.get("channels", 10))
             self.encoder = VisionEncoder(in_channels=in_ch, feature_dim=feature_dim)
