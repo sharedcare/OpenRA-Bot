@@ -980,6 +980,7 @@ class OpenRAEnv(gym.Env):
                         continue
                 produce_queue_mask[idx] = 1
             mask['produce_queue_mask'] = produce_queue_mask
+            mask['produce_unit_type_mask'] = produce_unit_type_mask
 
             _disable_if_empty('produce', bool(produce_unit_type_mask.any()) and bool(produce_queue_mask.any()))
         build_unit_type_mask = np.zeros((len(self.unit_types),), dtype=np.uint8)
