@@ -164,6 +164,8 @@ def train(
     # Optional augmented-state wrappers for delayed-reward credit assignment.
     augmented_config = None
     if augmented:
+        if verbose_reward:
+            env._debug_actions = True
         env = ShapedRewardWrapper(env, verbose=verbose_reward)
         env = AugmentedStateWrapper(env, frame_stack_k=frame_stack_k)
         augmented_config = env.augmentation_config

@@ -553,22 +553,30 @@ class OpenRAEnv(gym.Env):
                 'queued': True,
             })
         elif atype == 'build':
-            # Place finished building items using PlaceBuilding order via PlayerActor
-            try:
-                player_actor_id = int(self._openra['Game'].OrderManager.World.LocalPlayer.PlayerActor.ActorID)
-            except Exception:
-                player_actor_id = self._resolve_my_unit_id(unit_idx)
-            unit_type_name = self.reverse_unit_types.get(int(unit_type_idx), 'barr')
+            # Place finished building item using PlaceBuilding order.
+            # Subject and ExtraData both use the queue actor ID, matching
+            # RuleBasedAgent and BaseBuilderQueueManager.
+            queue_actor_id = self._resolve_queue_actor_id(unit_idx)
+            unit_type_name = self.reverse_unit_types.get(int(unit_type_idx), 'powr')
             actions.append({
                 'order': 'PlaceBuilding',
-                'subject': player_actor_id,
+                'subject': int(queue_actor_id),
                 'target_cell': (int(tx), int(ty)),
                 'target_string': unit_type_name,
-                'extra_data': int(self._resolve_queue_actor_id(unit_idx)),
+                'extra_data': int(queue_actor_id),
                 'queued': False,
             })
         elif atype == 'noop':
             pass
+
+        # Debug logging (controlled by env attribute)
+        if getattr(self, '_debug_actions', False) and atype not in ('noop',):
+            import sys
+            for a in actions:
+                order = a.get('order', '')
+                subj = a.get('subject', '?')
+                tgt = a.get('target_string', '') or a.get('target_cell', '')
+                print(f"[action] {atype} → {order} subj={subj} tgt={tgt}", file=sys.stderr)
 
         # Deduplicate recent identical actions
         if actions:
@@ -577,9 +585,18 @@ class OpenRAEnv(gym.Env):
                 sig = self._action_signature(a)
                 if not self._is_duplicate_action(sig):
                     deduped.append(a)
+                elif getattr(self, '_debug_actions', False):
+                    import sys
+                    print(f"[dedup] BLOCKED {a.get('order','')} tgt={a.get('target_string','')}", file=sys.stderr)
             actions = deduped
 
         if actions:
+            if getattr(self, '_debug_actions', False):
+                import sys
+                for a in actions:
+                    print(f"[send] {a.get('order','')} subj={a.get('subject','?')} "
+                          f"tgt={a.get('target_string','') or a.get('target_cell','')}",
+                          file=sys.stderr)
             self.send_actions(actions)
             for a in actions:
                 self._record_action(self._action_signature(a))
@@ -835,8 +852,20 @@ class OpenRAEnv(gym.Env):
             if 'move' in orders and self._unit_has_feasible_move(u, fallback_to_orders=True):
                 move_mask[i] = 1
                 self._fill_move_target_masks(target_x_mask[i], target_y_mask[i], u)
+            # HACK: Allow deploy for non-building actors (e.g. MCV→fact).
+            # Exclude known building types from undeploying because the
+            # current agent spams deploy and constantly cancels in-progress
+            # production.  In a real game undeploying to relocate is a valid
+            # strategy; this restriction should be removed once the reward
+            # signal is strong enough for the agent to learn the cost of
+            # interrupting production on its own.
+            # TODO: Remove this building-type guard and let the agent learn via reward.
             if 'deploytransform' in orders and self._unit_can_deploy(u):
-                deploy_mask[i] = 1
+                unit_type = str(u.get('type', '')).lower()
+                # Block deploy for buildings that would lose production queues
+                _building_types = {'fact', 'afld', 'weap', 'tent', 'barr', 'spen', 'syrd'}
+                if unit_type not in _building_types:
+                    deploy_mask[i] = 1
 
         if enemy_units:
             for i, u in enumerate(my_units[:max_units]):
@@ -955,11 +984,26 @@ class OpenRAEnv(gym.Env):
             _disable_if_empty('produce', bool(produce_unit_type_mask.any()) and bool(produce_queue_mask.any()))
         build_unit_type_mask = np.zeros((len(self.unit_types),), dtype=np.uint8)
         if 'build' in self.action_types:
-            # Enable only when PlaceBuilding is available on at least one unit
-            has_place_order = any('placebuilding' in set(str(x).lower() for x in (u.get('available_orders') or [])) for u in my_units)
-            # Enable indices if we have queues; precise cell-level validity is user logic
+            # PlaceBuilding is issued via queue actor, not regular units, so
+            # we no longer gate on has_place_order (it was always False).
             queue_actor_ids = list(getattr(self, '_queue_actor_ids', []) or [])
             placeable_names = {str(k).lower() for k in (raw.get('placeable_areas') or {}).keys()}
+
+            # Collect names of Done items so build_unit_type_mask only enables
+            # types the agent can actually place right now.
+            done_item_names: set = set()
+            for qi in queue_infos:
+                if not qi['enabled']:
+                    continue
+                for it in qi['items']:
+                    if bool(it.get('Done', False)):
+                        nm = str(it.get('Item') or it.get('Name') or '').lower()
+                        if nm:
+                            done_item_names.add(nm)
+
+            # Only enable placeable cells for Done item types.
+            buildable_names = done_item_names & placeable_names
+
             for idx, actor_id in enumerate(queue_actor_ids[:max_units]):
                 info = next((q for q in queue_infos if q['actor_id'] == int(actor_id)), None)
                 if info is None or not info['enabled']:
@@ -967,10 +1011,13 @@ class OpenRAEnv(gym.Env):
                 has_done_item = any(bool(it.get('Done', False)) for it in info['items'])
                 if not has_done_item:
                     continue
-                if not placeable_names:
+                if not buildable_names:
                     continue
                 build_mask[idx] = 1
+                # Only populate target cells for the Done item types
                 for unit_type, cells in (raw.get('placeable_areas') or {}).items():
+                    if str(unit_type).lower() not in done_item_names:
+                        continue
                     if not cells:
                         continue
                     for cell in cells:
@@ -984,9 +1031,9 @@ class OpenRAEnv(gym.Env):
                             target_y_mask[idx, cy] = 1
             mask['build_mask'] = build_mask
             for idx, name in self.reverse_unit_types.items():
-                if str(name).lower() in placeable_names:
+                if str(name).lower() in buildable_names:
                     build_unit_type_mask[int(idx)] = 1
-            _disable_if_empty('build', bool(build_mask.any()) and has_place_order and bool(build_unit_type_mask.any()))
+            _disable_if_empty('build', bool(build_mask.any()) and bool(build_unit_type_mask.any()))
 
         if enemy_units:
             target_idx_mask[:min(len(enemy_units), max_units)] = 1

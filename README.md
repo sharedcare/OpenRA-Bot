@@ -283,6 +283,12 @@ Recent bridge changes were specifically made to keep network traffic progressing
 - `target_x` / `target_y` masking is improved but still factorized rather than fully cell-joint.
 - Several scripts still assume a local development workflow and should be treated as baseline utilities rather than final UX.
 
+## Known Hacks / TODOs
+
+- **Deploy mask blocks building undeploy** (`openra_env.py`): The deploy action mask excludes known building types (`fact`, `afld`, `weap`, etc.) from undeploying via DeployTransform. This prevents the agent from constantly undeploying the Construction Yard and canceling in-progress production. In a real game, undeploying to relocate the base is a valid strategy. **TODO**: Remove the building-type blocklist and let the agent learn the cost of interrupting production via reward penalties (e.g. production-cancel penalty, time-waste penalty).
+- **Building queue single-item guard** (`PythonAPI.cs`): `SendActions` suppresses `StartProduction` for building-type items when the target queue already has an item (in-progress or Done). This prevents the agent from accidentally overwriting completed items before they can be placed. Unit-type queues (infantry, vehicle) are unaffected. **TODO**: Consider whether this should eventually be relaxed for advanced queue management strategies.
+- **Per-category produce mask** (`openra_env.py`): The `produce_unit_type_mask` blocks unit types whose production queue category (e.g. "building") is already occupied. This is the soft counterpart of the C#-side guard above. **TODO**: Re-evaluate once the agent can reliably complete the produce→build cycle.
+
 ## Practical Recommendations
 
 - Use `feature` observations first when debugging action execution.
