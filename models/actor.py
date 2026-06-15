@@ -209,9 +209,11 @@ class MultiDiscretePolicy(nn.Module):
             if m is None:
                 out[k] = lg
                 continue
-            # m: 1(valid) / 0(invalid), broadcastable to lg
+            # m: 1(valid) / 0(invalid), broadcastable to lg.
+            # Use -inf for fully masked actions so that even extremely
+            # high learned logits cannot override the mask penalty.
             m = m.to(dtype=lg.dtype, device=lg.device)
-            out[k] = lg + torch.log(m.clamp_min(1e-6))
+            out[k] = torch.where(m > 0.5, lg, torch.tensor(float('-inf'), device=lg.device, dtype=lg.dtype))
         return out
 
     @torch.no_grad()
@@ -271,6 +273,13 @@ class ActorCritic(nn.Module):
             else:
                 obs_dim = int(obs_space.get("vector", 0))
                 self.encoder = VectorEncoder(obs_dim=obs_dim, hidden_sizes=(512, 256), feature_dim=feature_dim)
+        elif observation_type == "entity":
+            from .entity_encoder import SimpleEntityEncoder  # type: ignore[import]
+            self.encoder = SimpleEntityEncoder(
+                entity_dim=obs_space.get("entity_dim", 14),
+                scalar_dim=obs_space.get("scalar_dim", 10),
+                feature_dim=feature_dim,
+            )
         elif observation_type == "image":
             in_ch = int(obs_space.get("channels", 10))
             self.encoder = VisionEncoder(in_channels=in_ch, feature_dim=feature_dim)
@@ -316,8 +325,12 @@ class ActorCritic(nn.Module):
         return (h, c)
 
     def forward(
-        self, obs: torch.Tensor, hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, seq_len: int = 1
+        self, obs, hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, seq_len: int = 1
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        # Handle entity-based observation (dict of tensors)
+        if isinstance(obs, dict):
+            return self._forward_entity(obs, hidden, seq_len)
+
         # obs shape: (batch_size, seq_len, *obs_dim) or (batch_size, *obs_dim) if seq_len=1
         # Ensure obs is at least 2D
         if obs.dim() == 1:
@@ -370,4 +383,47 @@ class ActorCritic(nn.Module):
         logits = self.policy_head(output_flat)
         value = self.value_head(output_flat).squeeze(-1)
 
+        return logits, value, hidden
+
+    def _forward_entity(
+        self, obs: Dict[str, torch.Tensor],
+        hidden: Optional[Tuple[torch.Tensor, torch.Tensor]], seq_len: int,
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        """Forward pass for entity-based dict observations."""
+        entities = obs['entities']
+        entity_mask = obs['entity_mask']
+        scalar = obs['scalar']
+
+        # Flatten batch + seq_len for the encoder if needed
+        if seq_len > 1:
+            batch_size = entities.shape[0]
+            e_flat = entities.reshape(-1, *entities.shape[2:])
+            m_flat = entity_mask.reshape(-1, *entity_mask.shape[2:])
+            s_flat = scalar.reshape(-1, *scalar.shape[2:])
+            features_flat = self.encoder(e_flat, m_flat, s_flat)
+            features = features_flat.view(batch_size, seq_len, -1)
+        else:
+            batch_size = entities.shape[0]
+            features = self.encoder(entities, entity_mask, scalar)
+            if features.dim() == 2:
+                features = features.unsqueeze(1)
+
+        # Recurrent / feedforward core
+        if self.recurrent_type is not None:
+            if hidden is not None and hidden[0] is not None:
+                num_layers = hidden[0].shape[0]
+                if hidden[0].shape[1] != batch_size:
+                    device = hidden[0].device
+                    h = torch.zeros(num_layers, batch_size, self.recurrent_hidden_size, device=device)
+                    c = torch.zeros(num_layers, batch_size, self.recurrent_hidden_size, device=device) if self.recurrent_type == "lstm" and hidden[1] is not None else None
+                    hidden = (h, c) if c is not None else (h, None)
+            output, hidden = self.core(features, hidden)
+            output_flat = output.reshape(-1, self.recurrent_hidden_size)
+        else:
+            features_flat = features.reshape(-1, features.shape[-1])
+            output_flat = self.core(features_flat)
+            hidden = None
+
+        logits = self.policy_head(output_flat)
+        value = self.value_head(output_flat).squeeze(-1)
         return logits, value, hidden

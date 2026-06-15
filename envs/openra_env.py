@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Set, Tuple
 import os
 import sys
 from collections import deque
@@ -93,7 +93,7 @@ class OpenRAEnv(gym.Env):
 
         # Config
         self.observation_type = observation_type
-        if self.observation_type not in ['feature', 'vector', 'image']:
+        if self.observation_type not in ['feature', 'vector', 'image', 'entity']:
             raise ValueError(f"Invalid observation type: {self.observation_type}")
         default_actions = ['noop', 'move', 'attack', 'produce', 'build', 'deploy']
         self.action_types: List[str] = enable_actions if enable_actions else default_actions
@@ -123,19 +123,22 @@ class OpenRAEnv(gym.Env):
         self._enemy_unit_ids: List[int] = []
         self._recent_actions: deque[Tuple] = deque(maxlen=256)
         self._action_ttl_steps: int = 8
-        self.auto_place: bool = False
-        self._placement_spiral = self._build_placement_spiral(radius=6)
+        self.auto_place: bool = True
         # Reward shaping config and previous metrics snapshot
         self.reward_weights = {
-            'unit': 0.5,
+            'unit': 0.3,
             'building': 1.0,
             'low_cash_penalty': 0.2,
             'min_cash': 1500.0,
             # Production shaping
-            'produce_start': 0.05,           # small reward when a new item is queued
+            'produce_start': 0.5,            # reward when a new item is queued (increased for clearer signal)
             'produce_cancel_penalty': 0.1,   # penalty multiplier when an in-progress item is canceled
-            'produce_queue_threshold': 6,     # queue length after which start reward is damped
+            'produce_queue_threshold': 6,    # queue length after which start reward is damped
             'produce_queue_damp': 0.5,       # start reward scale when beyond threshold
+            # Bootstrapping
+            'deploy_bonus': 0.5,             # one-time reward when first building appears (MCV deployed)
+            # Differential per-step rewards (only active during specific actions, NOT constant background)
+            'producing_per_step': 0.005,     # reward per in-progress production item each step
         }
         self._prev_metrics: Dict[str, Optional[float]] = {
             'units': None,
@@ -145,6 +148,11 @@ class OpenRAEnv(gym.Env):
         }
         # Track previous production items to detect new starts and cancels
         self._prev_prod_items: Dict[Tuple[int, str], float] = {}
+        # One-time deploy bonus tracking
+        self._deployed_once: bool = False
+        # Build-order progress tracker (DI-star inspired)
+        self._bo_tracker = self.BuildOrderTracker(self.TARGET_BUILD_ORDER)
+        self._prev_building_types: Set[str] = set()
 
         # Remote join settings (optional)
         self.remote_host: Optional[str] = None
@@ -172,13 +180,23 @@ class OpenRAEnv(gym.Env):
         ])
 
         if self.observation_type == "vector":
+            # Per-type: 3 features × num_types + 4 queue-summary
+            prod_dim = len(self.unit_types) * 3 + 4
             obs_dim = (
                 max_units * 6 +
                 max_units * 5 +
                 7 +
-                2
+                2 +
+                prod_dim
             )
             self.observation_space = spaces.Box(low=-1, high=max_coord, shape=(obs_dim,), dtype=np.float32)
+        elif self.observation_type == "entity":
+            from utils.entity_obs import ENTITY_FEATURE_DIM, MAX_ENTITIES, EntityObservationBuilder
+            self.observation_space = spaces.Dict({
+                'entities': spaces.Box(-1, 1, (MAX_ENTITIES, ENTITY_FEATURE_DIM), dtype=np.float32),
+                'entity_mask': spaces.Box(0, 1, (MAX_ENTITIES,), dtype=bool),
+                'scalar': spaces.Box(-1, 1, (EntityObservationBuilder.SCALAR_DIM,), dtype=np.float32),
+            })
         elif self.observation_type == "image":
             self.observation_space = spaces.Box(low=0, high=255, shape=(128, 128, 10), dtype=np.uint8)
         else:
@@ -297,6 +315,11 @@ class OpenRAEnv(gym.Env):
         }
         # Initialize production item snapshot
         self._prev_prod_items = self._extract_production_items(raw)
+        # Reset deploy bonus eligibility for the new episode
+        self._deployed_once = int(m.get('buildings', 0)) > 0
+        # Reset build-order tracker for the new episode
+        self._bo_tracker.reset()
+        self._prev_building_types.clear()
         # Clear action dedup history so stale entries from the previous
         # episode (with higher world_tick) don't suppress actions in the
         # new episode where world_tick resets to 0.
@@ -323,8 +346,7 @@ class OpenRAEnv(gym.Env):
         self._last_raw_state = raw
         new_obs = self._state_to_observation(raw)
 
-        # Reward shaping: encourage development and sufficient cash reserve
-        reward = self._compute_reward(raw)
+        reward = self._compute_reward(raw, action if isinstance(action, np.ndarray) else None)
         terminated = False
         truncated = False
 
@@ -359,6 +381,90 @@ class OpenRAEnv(gym.Env):
 
     # --- Reward shaping helpers ---
 
+    # Target build order for RA mod (standard macro opening).
+    # The BuildOrderTracker rewards the agent for matching this sequence
+    # using a longest-common-subsequence metric (inspired by DI-star).
+    TARGET_BUILD_ORDER: List[str] = ['powr', 'proc', 'barr']
+
+    class BuildOrderTracker:
+        """Tracks build progress via longest matching subsequence to a target order.
+
+        reward = improvement in match length.
+        Building the *next* target building gives +1.0; building an unrelated
+        building gives 0.0; building a target building out-of-order still
+        counts toward the match (forgiving).
+        """
+
+        def __init__(self, target: List[str]):
+            self._target = [t.lower() for t in target]
+            self._built: List[str] = []
+            self._last_match: int = 0
+
+        def update(self, actor_type: str) -> float:
+            atype = actor_type.lower().strip()
+            if atype not in self._target:
+                return 0.0
+            self._built.append(atype)
+            new_match = self._lcs_match(self._built, self._target)
+            reward = float(new_match - self._last_match)
+            self._last_match = new_match
+            return reward
+
+        def reset(self) -> None:
+            self._built.clear()
+            self._last_match = 0
+
+        @staticmethod
+        def _lcs_match(built: List[str], target: List[str]) -> int:
+            """Length of longest subsequence of `built` that matches a prefix
+            of `target` (each target item used at most once, in order)."""
+            idx = 0
+            for b in built:
+                for i in range(idx, len(target)):
+                    if target[i] == b:
+                        idx = i + 1
+                        break
+            return idx
+
+        @property
+        def last_match(self) -> int:
+            return self._last_match
+
+    # Actor types that are always buildings regardless of available_orders.
+    _BUILDING_TYPES: set = {'fact', 'powr', 'proc', 'barr', 'tent', 'weap',
+                             'afld', 'spen', 'syrd', 'dome', 'hpad', 'eye',
+                             'atek', 'stek', 'fix', 'gap', 'gun', 'iron',
+                             'pbox', 'hbox', 'sbiz', 'agun'}
+    # Actor types that are always mobile units (workers, vehicles, infantry).
+    _MOBILE_TYPES: set = {'mcv', 'e1', 'e2', 'e3', 'e4', 'e6', 'e7', 'dog',
+                           'jeep', '1tnk', '2tnk', '3tnk', '4tnk', 'arty',
+                           'apc', 'mgg', 'mrj', 'lstr', 'mnly', 'c17', 'harv',
+                           'shok', 'gren', 'flmr', 'spy', 'thf', 'medi'}
+
+    def _detect_new_buildings(self, raw: Dict[str, Any]) -> List[str]:
+        """Return list of building types that appeared since last call."""
+        actors = raw.get('actors') or []
+        my_owner = raw.get('my_owner', -1)
+        current = set()
+        for a in actors:
+            if int(a.get('owner', -1)) == my_owner and not bool(a.get('dead', False)):
+                if self._is_building(a):
+                    current.add(str(a.get('type', '')).lower())
+        new = current - self._prev_building_types
+        self._prev_building_types = current
+        return list(new)
+
+    def _is_building(self, actor: Dict[str, Any]) -> bool:
+        """Determine if an actor is a building based on type and orders."""
+        atype = str(actor.get('type', '')).lower()
+        if atype in self._BUILDING_TYPES:
+            return True
+        if atype in self._MOBILE_TYPES:
+            return False
+        # Fallback: use available_orders heuristic
+        orders = set(str(x).lower() for x in (actor.get('available_orders') or []))
+        return 'move' not in orders
+
     def _compute_development_metrics(self, raw: Dict[str, Any]) -> Dict[str, Optional[float]]:
         actors = raw.get('actors') or []
         my_owner = int(raw.get('my_owner', -1))
@@ -366,12 +472,10 @@ class OpenRAEnv(gym.Env):
         units = 0
         buildings = 0
         for u in my_alive:
-            orders = set(str(x).lower() for x in (u.get('available_orders') or []))
-            # Heuristic: actors that can Move are units; others are buildings
-            if 'move' in orders:
-                units += 1
-            else:
+            if self._is_building(u):
                 buildings += 1
+            else:
+                units += 1
         cash = raw.get('cash')
         try:
             cash_val: Optional[float] = float(cash) if cash is not None else None
@@ -395,7 +499,7 @@ class OpenRAEnv(gym.Env):
             'cash': cash_val,
         }
 
-    def _compute_reward(self, raw: Dict[str, Any]) -> float:
+    def _compute_reward(self, raw: Dict[str, Any], action: Optional[np.ndarray] = None) -> float:
         metrics = self._compute_development_metrics(raw)
         # Initialize if first call
         if self._prev_metrics['units'] is None:
@@ -408,8 +512,21 @@ class OpenRAEnv(gym.Env):
         du = float(metrics.get('units') or 0.0) - float(self._prev_metrics.get('units') or 0.0)
         db = float(metrics.get('buildings') or 0.0) - float(self._prev_metrics.get('buildings') or 0.0)
 
-        # Reward for new units/buildings
-        rw = self.reward_weights['unit'] * du + self.reward_weights['building'] * db
+        rw = self.reward_weights['unit'] * du
+
+        # Build-order progress reward (DI-star inspired):
+        # reward = improvement in longest matching subsequence to target order.
+        # Each correct building gives +1.0 immediately (no 20-step delay).
+        for btype in self._detect_new_buildings(raw):
+            bo_r = self._bo_tracker.update(btype)
+            if bo_r > 0:
+                rw += self.reward_weights['building'] * bo_r
+
+        # Deploy bonus: one-time reward when first building appears
+        buildings_now = int(metrics.get('buildings') or 0)
+        if not self._deployed_once and buildings_now > 0:
+            rw += self.reward_weights['deploy_bonus']
+            self._deployed_once = True
 
         # Production shaping: reward new starts (small), penalize cancels by progress
         starts, cancels = self._diff_production_events(raw)
@@ -423,9 +540,23 @@ class OpenRAEnv(gym.Env):
         if cash_now is not None:
             min_cash = float(self.reward_weights['min_cash'])
             if cash_now < min_cash:
-                # Scale penalty by deficit ratio
                 deficit = (min_cash - float(cash_now)) / max(1.0, min_cash)
                 rw -= self.reward_weights['low_cash_penalty'] * float(deficit)
+
+        # Per-step differential rewards: only reward actions that differentiate
+        # "producing" from "nooping".  Do NOT add a constant background reward
+        # (like per-building bonus) — it would let the value function predict
+        # a near-constant baseline and drive TD errors / policy gradient to zero.
+        prod = raw.get('production') or {}
+        active_items = 0
+        try:
+            for q in (prod.get('Queues', []) or []):
+                for it in (q.get('Items', []) or []):
+                    if not bool(it.get('Done', False)):
+                        active_items += 1
+        except Exception:
+            active_items = 0
+        rw += self.reward_weights.get('producing_per_step', 0.0) * float(active_items)
 
         # Update previous metrics
         self._prev_metrics['units'] = float(metrics.get('units') or 0.0)
@@ -512,6 +643,10 @@ class OpenRAEnv(gym.Env):
         atype = self.action_types[atype_idx] if 0 <= atype_idx < len(self.action_types) else 'noop'
         actions: List[Dict[str, Any]] = []
 
+        # Auto-deploy MCV when it's the only unit and hasn't deployed yet.
+        if self.auto_place:
+            actions.extend(self._auto_deploy_mcv())
+
         # Auto-place completed production items BEFORE the agent's action.
         # This prevents Done items from being overwritten by new produce orders.
         if self.auto_place:
@@ -571,7 +706,6 @@ class OpenRAEnv(gym.Env):
 
         # Debug logging (controlled by env attribute)
         if getattr(self, '_debug_actions', False) and atype not in ('noop',):
-            import sys
             for a in actions:
                 order = a.get('order', '')
                 subj = a.get('subject', '?')
@@ -586,13 +720,11 @@ class OpenRAEnv(gym.Env):
                 if not self._is_duplicate_action(sig):
                     deduped.append(a)
                 elif getattr(self, '_debug_actions', False):
-                    import sys
                     print(f"[dedup] BLOCKED {a.get('order','')} tgt={a.get('target_string','')}", file=sys.stderr)
             actions = deduped
 
         if actions:
             if getattr(self, '_debug_actions', False):
-                import sys
                 for a in actions:
                     print(f"[send] {a.get('order','')} subj={a.get('subject','?')} "
                           f"tgt={a.get('target_string','') or a.get('target_cell','')}",
@@ -626,16 +758,31 @@ class OpenRAEnv(gym.Env):
 
     # --- Auto-placement helpers ---
 
-    @staticmethod
-    def _build_placement_spiral(radius: int = 6) -> List[Tuple[int, int]]:
-        """Offsets sorted by Chebyshev distance from origin."""
-        offsets: List[Tuple[int, int]] = []
-        for r in range(1, radius + 1):
-            for dx in range(-r, r + 1):
-                for dy in range(-r, r + 1):
-                    if max(abs(dx), abs(dy)) == r:
-                        offsets.append((dx, dy))
-        return offsets
+    def _auto_deploy_mcv(self) -> List[Dict[str, Any]]:
+        """Auto-deploy the MCV when it is the only owned mobile unit."""
+        raw = self._last_raw_state
+        if raw is None:
+            return []
+        actors = raw.get('actors') or []
+        my_owner = int(raw.get('my_owner', -1))
+        my_alive = [
+            u for u in actors
+            if int(u.get('owner', -1)) == my_owner and not bool(u.get('dead', False))
+        ]
+        # Only auto-deploy when there's exactly one unit and it's an MCV
+        if len(my_alive) != 1:
+            return []
+        mcv = my_alive[0]
+        if str(mcv.get('type', '')).lower() != 'mcv':
+            return []
+        orders = {str(x).lower() for x in (mcv.get('available_orders') or [])}
+        if 'deploytransform' not in orders:
+            return []
+        return [{
+            'order': 'DeployTransform',
+            'subject': int(mcv['id']),
+            'queued': False,
+        }]
 
     def _find_base_position(self) -> Optional[Tuple[int, int]]:
         """Return (cell_x, cell_y) of the first alive building we own."""
@@ -654,7 +801,11 @@ class OpenRAEnv(gym.Env):
         return None
 
     def _auto_place_done_items(self) -> List[Dict[str, Any]]:
-        """Generate PlaceBuilding orders for all Done production items."""
+        """Generate PlaceBuilding orders for all Done production items.
+
+        Uses engine-provided placeable_areas to find valid build cells
+        instead of guessing positions around the base.
+        """
         raw = self._last_raw_state
         if raw is None:
             return []
@@ -664,9 +815,11 @@ class OpenRAEnv(gym.Env):
         if not queues:
             return []
 
-        base_pos = self._find_base_position()
-        if base_pos is None:
+        placeable_areas = raw.get("placeable_areas") or {}
+        if not placeable_areas:
             return []
+
+        base_pos = self._find_base_position()
 
         try:
             api = self._openra['Game']
@@ -685,20 +838,26 @@ class OpenRAEnv(gym.Env):
                 name = str(it.get("Item") or it.get("Name") or "")
                 if not name:
                     continue
-                # Try positions in a spiral around the base.
-                # Send several candidates; the engine accepts the first
-                # valid one and ignores the rest.
-                for dx, dy in self._placement_spiral[:12]:
-                    cx = base_pos[0] + dx
-                    cy = base_pos[1] + dy
-                    place_orders.append({
-                        "order": "PlaceBuilding",
-                        "subject": player_actor_id,
-                        "target_cell": (cx, cy),
-                        "target_string": name,
-                        "extra_data": q_id,
-                        "queued": False,
-                    })
+
+                cells = placeable_areas.get(name) or placeable_areas.get(name.lower(), [])
+                if not cells:
+                    continue
+
+                # Pick the cell nearest to base (or first if no base reference)
+                if base_pos is not None:
+                    bx, by = base_pos
+                    best = min(cells, key=lambda c: abs(c[0] - bx) + abs(c[1] - by))
+                else:
+                    best = cells[0]
+
+                place_orders.append({
+                    "order": "PlaceBuilding",
+                    "subject": player_actor_id,
+                    "target_cell": (int(best[0]), int(best[1])),
+                    "target_string": name,
+                    "extra_data": q_id,
+                    "queued": False,
+                })
         return place_orders
 
     # --- Additional connection helpers ---
@@ -729,9 +888,19 @@ class OpenRAEnv(gym.Env):
     def _state_to_observation(self, raw: Dict[str, Any]):
         if self.observation_type == 'vector':
             return self._state_to_vector(raw)
+        elif self.observation_type == 'entity':
+            return self._state_to_entity(raw)
         elif self.observation_type == 'image':
             return self._state_to_image(raw)
         return raw
+
+    def _state_to_entity(self, raw: Dict[str, Any]) -> Dict[str, np.ndarray]:
+        from utils.entity_obs import EntityObservationBuilder  # type: ignore[import]
+        builder = getattr(self, '_entity_builder', None)
+        if builder is None:
+            builder = EntityObservationBuilder()
+            self._entity_builder = builder
+        return builder.build(raw)
 
     def _split_visible_actors(self, raw: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         actors = raw.get('actors') or []
@@ -750,6 +919,63 @@ class OpenRAEnv(gym.Env):
             xs.append(int(r.get('cell_x', 0)) + 1)
             ys.append(int(r.get('cell_y', 0)) + 1)
         return max(1, max(xs)), max(1, max(ys))
+
+    def _production_features(self, raw: Dict[str, Any]) -> List[float]:
+        """Encode production queue state and placeable-area availability.
+
+        Returns a fixed-size list aligned with ``self.unit_types`` so the
+        policy can learn which produce / build actions are feasible without
+        relying entirely on LSTM memory or action masks.
+        """
+        prod = raw.get('production') or {}
+        queues = prod.get('Queues') or []
+        catalog = raw.get('producible_catalog') or []
+        catalog_names: set = {str(b.get('Name', '')).lower() for b in catalog}
+        placeable = raw.get('placeable_areas') or {}
+
+        # Per-unit-type features (ordered by self.unit_types insertion order).
+        num_types = len(self.unit_types)
+        type_feats: List[float] = []
+        for name in self.unit_types:
+            nl = name.lower()
+            # 1) Producible?
+            type_feats.append(1.0 if nl in catalog_names else 0.0)
+            # 2) Has any placeable cell?
+            has_cells = any(
+                str(k).lower() == nl and len(v) > 0
+                for k, v in placeable.items()
+            )
+            type_feats.append(1.0 if has_cells else 0.0)
+            # 3) Has a Done item waiting to be placed?
+            has_done = False
+            for q in queues:
+                for it in (q.get('Items') or []):
+                    if bool(it.get('Done', False)) and str(it.get('Item', '')).lower() == nl:
+                        has_done = True
+                        break
+                if has_done:
+                    break
+            type_feats.append(1.0 if has_done else 0.0)
+
+        # Queue-level summary.
+        n_queues = len(queues)
+        any_empty = any(
+            len(q.get('Items', [])) == 0 and q.get('Enabled', False)
+            for q in queues
+        )
+        any_done = any(
+            any(bool(it.get('Done', False)) for it in (q.get('Items') or []))
+            for q in queues
+        )
+        total_items = sum(len(q.get('Items', [])) for q in queues)
+        queue_feats = [
+            min(n_queues / 3.0, 1.0),
+            1.0 if any_empty else 0.0,
+            1.0 if any_done else 0.0,
+            min(total_items / 6.0, 1.0),
+        ]
+
+        return type_feats + queue_feats
 
     def _economy_features(self, raw: Dict[str, Any]) -> List[float]:
         cash = max(0.0, float(raw.get('cash', 0) or 0.0))
@@ -1161,7 +1387,10 @@ class OpenRAEnv(gym.Env):
         map_width, map_height = self._estimate_map_size(raw)
         unit_type_scale = max(1, len(self.unit_types))
 
-        obs = np.zeros(max_units * 6 + max_units * 5 + 7 + 2, dtype=np.float32)
+        # Compute obs_dim same as _setup_spaces
+        prod_dim = len(self.unit_types) * 3 + 4
+        obs_dim = max_units * 6 + max_units * 5 + 7 + 2 + prod_dim
+        obs = np.zeros(obs_dim, dtype=np.float32)
 
         # My units
         for i, u in enumerate(my_units[:max_units]):
@@ -1191,8 +1420,15 @@ class OpenRAEnv(gym.Env):
         resource_idx = max_units * 6 + max_units * 5
         obs[resource_idx:resource_idx+7] = self._economy_features(raw)
 
+        # Map dimensions
         map_idx = resource_idx + 7
         obs[map_idx:map_idx+2] = [map_width / 128.0, map_height / 128.0]
+
+        # Production state (per-unit-type + queue summary)
+        prod_idx = map_idx + 2
+        prod_feats = self._production_features(raw)
+        obs[prod_idx:prod_idx + len(prod_feats)] = prod_feats
+
         return obs
 
     def _state_to_image(self, raw: Dict[str, Any]) -> np.ndarray:

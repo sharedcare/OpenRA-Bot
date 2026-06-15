@@ -314,10 +314,14 @@ class PPOAgent(BaseAgent):
     # ---------- Acting ----------
     def _obs_to_tensor(self, obs: Any) -> Any:
         if isinstance(obs, dict):
+            if "entities" in obs:
+                # Entity-based dict observation
+                return {k: torch.as_tensor(v, device=self.device).unsqueeze(0)
+                        for k, v in obs.items()}
             if "vector" in obs:
                 x = obs["vector"]
             else:
-                raise ValueError("Unsupported dict observation for RLAgent")
+                raise ValueError(f"Unsupported dict observation keys: {list(obs.keys())}")
         else:
             x = obs
         return torch.as_tensor(x, device=self.device).unsqueeze(0)
@@ -557,7 +561,9 @@ class PPOAgent(BaseAgent):
                 out[k] = lg
             else:
                 m = m.to(dtype=lg.dtype, device=lg.device)
-                out[k] = lg + torch.log(m.clamp_min(1e-6))
+                # Use -inf for fully masked actions — otherwise very high
+                # learned logits (e.g. 20+) can overwhelm the clamp penalty.
+                out[k] = torch.where(m > 0.5, lg, torch.tensor(float('-inf'), device=lg.device, dtype=lg.dtype))
         return out
 
     def _logprob_and_entropy(
@@ -668,19 +674,34 @@ class PPOAgent(BaseAgent):
         self.model.to(device)
         self.action_types = list(getattr(env, "action_types", self.action_types))
         optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
+        # When the encoder was pre-trained via BC warm-start, freeze it so the
+        # value-loss gradients do not overwrite the productive-action features.
+        _freeze_encoder = getattr(self.model, 'freeze_encoder', False)
+        if _freeze_encoder:
+            for n, p in self.model.named_parameters():
+                if n.startswith('encoder.'):
+                    p.requires_grad = False
+            print("[PPO] encoder frozen (BC warm-start mode)")
         obs, info = env.reset()
         self._rnn_state = None
         self._prepare_log_file(log_path)
 
-        if isinstance(env.observation_space, dict):
-            obs_space = env.observation_space
-        elif hasattr(env.observation_space, "shape"):
-            if len(env.observation_space.shape) == 1:
-                obs_space = {"vector": env.observation_space.shape[0]}
-            elif len(env.observation_space.shape) == 3:
-                obs_space = {"channels": env.observation_space.shape[-1]}
+        obs_sp = env.observation_space
+        if hasattr(obs_sp, 'spaces') and 'entities' in getattr(obs_sp, 'spaces', {}):
+            obs_space = {
+                "entity_dim": int(obs_sp['entities'].shape[1]),
+                "scalar_dim": int(obs_sp['scalar'].shape[0]),
+                "entities": True,  # marker for Buffer
+            }
+        elif isinstance(obs_sp, dict) and 'vector' in obs_sp:
+            obs_space = obs_sp
+        elif hasattr(obs_sp, "shape"):
+            if len(obs_sp.shape) == 1:
+                obs_space = {"vector": obs_sp.shape[0]}
+            elif len(obs_sp.shape) == 3:
+                obs_space = {"channels": obs_sp.shape[-1]}
             else:
-                obs_space = {"vector": int(np.prod(env.observation_space.shape))}
+                obs_space = {"vector": int(np.prod(obs_sp.shape))}
         else:
             obs_space = {"vector": 1}
 
@@ -706,9 +727,13 @@ class PPOAgent(BaseAgent):
             action_type_counts: Dict[int, int] = {}
 
             while not buffer.is_full:
-                x = torch.as_tensor(obs, device=device)
-                if x.dim() == 1:
-                    x = x.unsqueeze(0)
+                if isinstance(obs, dict):
+                    x = {k: torch.as_tensor(v, device=device).unsqueeze(0)
+                         for k, v in obs.items()}
+                else:
+                    x = torch.as_tensor(obs, device=device)
+                    if x.dim() == 1:
+                        x = x.unsqueeze(0)
                 rollout_hidden = hidden_states
                 if self.use_lstm and hidden_states is not None:
                     rollout_hidden = tuple(h.clone() if h is not None else None for h in hidden_states)
@@ -766,9 +791,13 @@ class PPOAgent(BaseAgent):
                     info = next_info
 
             with torch.no_grad():
-                x = torch.as_tensor(obs, device=device)
-                if x.dim() == 1:
-                    x = x.unsqueeze(0)
+                if isinstance(obs, dict):
+                    x = {k: torch.as_tensor(v, device=device).unsqueeze(0)
+                         for k, v in obs.items()}
+                else:
+                    x = torch.as_tensor(obs, device=device)
+                    if x.dim() == 1:
+                        x = x.unsqueeze(0)
                 if self.use_lstm:
                     _, last_v, _ = self.model(x, hidden_states, seq_len=1)
                 else:
@@ -794,9 +823,19 @@ class PPOAgent(BaseAgent):
                     mb_hidden = batch["hidden_states"]
                     mb_attention_mask = batch["attention_mask"]
 
-                    batch_size, seq_len, num_envs = mb_obs.shape[:3]
-                    mb_obs_flat = mb_obs.permute(0, 2, 1, *range(3, mb_obs.dim())).contiguous()
-                    mb_obs_flat = mb_obs_flat.view(batch_size * num_envs, seq_len, *mb_obs.shape[3:])
+                    if isinstance(mb_obs, dict):
+                        # Entity dict observation
+                        any_key = next(iter(mb_obs.values()))
+                        batch_size, seq_len, num_envs = any_key.shape[:3]
+                        mb_obs_flat = {
+                            k: v.permute(0, 2, 1, *range(3, v.dim())).contiguous()
+                               .view(batch_size * num_envs, seq_len, *v.shape[3:])
+                            for k, v in mb_obs.items()
+                        }
+                    else:
+                        batch_size, seq_len, num_envs = mb_obs.shape[:3]
+                        mb_obs_flat = mb_obs.permute(0, 2, 1, *range(3, mb_obs.dim())).contiguous()
+                        mb_obs_flat = mb_obs_flat.view(batch_size * num_envs, seq_len, *mb_obs.shape[3:])
 
                     if self.use_lstm:
                         h_flat = (
@@ -845,13 +884,30 @@ class PPOAgent(BaseAgent):
                     if valid_steps.item() == 0:
                         continue
 
+                    # Decision-step mask: only compute policy gradient on steps
+                    # where the agent had >1 valid action (i.e. an actual choice).
+                    # 80% of steps are forced-noop during production waits — their
+                    # gradient is zero or noise and drowns out the 20% decision steps.
+                    action_type_mask = mb_masks.get('action_type') if mb_masks else None
+                    if action_type_mask is not None:
+                        # action_type_mask after reshape: (B*N*L, n_actions)
+                        n_valid = action_type_mask.sum(dim=-1)
+                        decision_mask = (n_valid > 1.0).float()
+                        decision_mask = decision_mask.view(batch_size, num_envs, seq_len)
+                        decision_mask = decision_mask.permute(0, 2, 1).float()  # (B, L, N)
+                        decision_valid = (decision_mask * mb_attention_mask).sum().clamp_min(1)
+                    else:
+                        decision_mask = mb_attention_mask
+                        decision_valid = valid_steps
+
                     ratio = torch.exp(new_logp - mb_old_logprobs)
                     approx_kl = ((mb_old_logprobs - new_logp) * mb_attention_mask).sum() / valid_steps
                     unclipped = ratio * mb_advantages
                     clipped = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * mb_advantages
-                    policy_loss = -(torch.min(unclipped, clipped) * mb_attention_mask).sum() / valid_steps
+                    policy_loss = -(torch.min(unclipped, clipped) * mb_attention_mask * decision_mask).sum() / decision_valid
                     value_loss = (0.5 * ((values_pred - mb_returns) ** 2) * mb_attention_mask).sum() / valid_steps
                     entropy_loss = -(entropy * mb_attention_mask).sum() / valid_steps
+
                     loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss
 
                     optimizer.zero_grad()

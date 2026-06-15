@@ -1,17 +1,14 @@
 """
-Gym wrappers for augmented state and shaped reward.
+Gym wrappers for augmented state and diagnostic logging.
 
 Wrapping order (inner to outer):
     env = OpenRAEnv(...)
     env = ShapedRewardWrapper(env)
     env = AugmentedStateWrapper(env)
 
-ShapedRewardWrapper provides a multi-component reward that is dense enough
-for an RL agent to bootstrap from random exploration:
-    - building count change (+1 per new building, -1 per lost)
-    - production start bonus (encourages queuing)
-    - deploy bonus (encourages MCV deployment)
-    - idle penalty (discourages doing nothing)
+ShapedRewardWrapper is now a transparent pass-through — all reward shaping
+lives in OpenRAEnv._compute_reward. The wrapper only adds optional verbose
+diagnostics for debugging reward signals.
 
 AugmentedStateWrapper enriches the vector observation with temporal context
 so that the RL agent (PPO + LSTM) can learn delayed credit assignment:
@@ -25,7 +22,7 @@ from __future__ import annotations
 
 import sys
 from collections import deque
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -48,95 +45,42 @@ def _get_base_env(env: gym.Env):
 
 
 class ShapedRewardWrapper(gym.Wrapper):
-    """Multi-component shaped reward for bootstrapping macro play.
+    """Transparent reward pass-through with optional diagnostic logging.
 
-    Reward components (per step):
-        +1.0  per new building
-        -1.0  per lost building
-        +0.3  per new unit (non-building)
-        -0.3  per lost unit
-        +0.1  when a new production item is queued
-        +0.5  one-time bonus when MCV deploys (fact appears for the first time)
-        -0.01 per step where the agent takes noop and has idle mobile units
-
-    All values are configurable via ``reward_weights``.
+    All reward shaping now lives in OpenRAEnv._compute_reward so this
+    wrapper only adds verbose diagnostics for debugging reward signals.
     """
 
     def __init__(self, env: gym.Env, verbose: bool = False) -> None:
         super().__init__(env)
         self.verbose = verbose
-
-        self.reward_weights: Dict[str, float] = {
-            "building": 1.0,
-            "unit": 0.3,
-            "production_start": 0.1,
-            "deploy_bonus": 0.5,
-            "idle_penalty": 0.01,
-        }
-
-        # State tracking.
-        self._prev_building_count: int = 0
-        self._prev_unit_count: int = 0
-        self._prev_prod_keys: Set[Tuple[int, str]] = set()
-        self._deployed_once: bool = False
         self._step_idx: int = 0
 
     def reset(self, **kwargs: Any) -> Tuple[Any, Dict[str, Any]]:
         obs, info = self.env.reset(**kwargs)
-        buildings, units = self._count_actors()
-        self._prev_building_count = buildings
-        self._prev_unit_count = units
-        self._prev_prod_keys = self._production_keys()
-        self._deployed_once = buildings > 0  # already deployed if fact exists at start
         self._step_idx = 0
         if self.verbose:
-            print(f"[reward] reset  buildings={buildings} units={units} deployed={self._deployed_once}",
-                  file=sys.stderr)
+            raw = getattr(self.env, "_last_raw_state", None)
+            if raw is not None:
+                my_owner = int(raw.get("my_owner", -1))
+                actors = raw.get("actors") or []
+                my_actors = [
+                    f"{a.get('type','?')}(id={a.get('id','?')})"
+                    for a in actors if int(a.get("owner", -1)) == my_owner and not bool(a.get("dead", False))
+                ]
+                print(f"[reward] reset  actors={my_actors}", file=sys.stderr)
         return obs, info
 
     def step(self, action: Any) -> Tuple[Any, float, bool, bool, Dict[str, Any]]:
-        obs, _orig_reward, terminated, truncated, info = self.env.step(action)
+        obs, reward, terminated, truncated, info = self.env.step(action)
         self._step_idx += 1
-        reward = 0.0
-
-        buildings, units = self._count_actors()
-
-        # --- building diff ---
-        db = buildings - self._prev_building_count
-        reward += self.reward_weights["building"] * db
-
-        # --- unit diff ---
-        du = units - self._prev_unit_count
-        reward += self.reward_weights["unit"] * du
-
-        # --- deploy bonus (one-time) ---
-        if not self._deployed_once and buildings > 0:
-            reward += self.reward_weights["deploy_bonus"]
-            self._deployed_once = True
-
-        # --- production start ---
-        cur_prod = self._production_keys()
-        new_starts = cur_prod - self._prev_prod_keys
-        if new_starts:
-            reward += self.reward_weights["production_start"] * len(new_starts)
-
-        # --- idle penalty ---
-        action_type = int(action[0]) if hasattr(action, "__len__") else int(action)
-        if action_type == 0 and units > 0:  # noop with idle units
-            reward -= self.reward_weights["idle_penalty"]
 
         if self.verbose and reward != 0.0:
-            print(f"[reward] step={self._step_idx} r={reward:+.3f} "
-                  f"db={db} du={du} starts={len(new_starts)} buildings={buildings} units={units}",
-                  file=sys.stderr)
+            print(f"[reward] step={self._step_idx} r={reward:+.3f}", file=sys.stderr)
 
-        # Periodic diagnostic dump (every 50 steps) to debug build availability.
         if self.verbose and self._step_idx % 20 == 0:
             self._dump_build_diagnostic()
 
-        self._prev_building_count = buildings
-        self._prev_unit_count = units
-        self._prev_prod_keys = cur_prod
         return obs, reward, terminated, truncated, info
 
     # ------------------------------------------------------------------
@@ -180,43 +124,6 @@ class ShapedRewardWrapper(gym.Wrapper):
               f"queues=[{' | '.join(queue_summary) or 'EMPTY'}] "
               f"placeable={pa_summary or 'EMPTY'}",
               file=sys.stderr)
-
-    def _count_actors(self) -> Tuple[int, int]:
-        """Return (building_count, mobile_unit_count) for my alive actors."""
-        raw = getattr(self.env, "_last_raw_state", None)
-        if raw is None:
-            return 0, 0
-        actors = raw.get("actors") or []
-        my_owner = int(raw.get("my_owner", -1))
-        buildings = 0
-        units = 0
-        for u in actors:
-            if int(u.get("owner", -1)) != my_owner:
-                continue
-            if bool(u.get("dead", False)):
-                continue
-            orders = {str(x).lower() for x in (u.get("available_orders") or [])}
-            if "move" not in orders:
-                buildings += 1
-            else:
-                units += 1
-        return buildings, units
-
-    def _production_keys(self) -> Set[Tuple[int, str]]:
-        """Extract set of (queue_actor_id, item_name) for in-progress items."""
-        raw = getattr(self.env, "_last_raw_state", None)
-        if raw is None:
-            return set()
-        keys: Set[Tuple[int, str]] = set()
-        prod = raw.get("production") or {}
-        for q in prod.get("Queues") or []:
-            q_id = int(q.get("ActorId", -1))
-            for it in q.get("Items") or []:
-                name = str(it.get("Item") or it.get("Name") or "")
-                if name and not bool(it.get("Done", False)):
-                    keys.add((q_id, name))
-        return keys
-
 
 # Keep the old name as an alias for backward compatibility.
 StateDiffRewardWrapper = ShapedRewardWrapper

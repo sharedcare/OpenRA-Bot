@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Tuple, Union, Generator
+from typing import Any, Dict, List, Optional, Tuple, Union, Generator
 import torch
 import numpy as np
 
@@ -48,13 +48,28 @@ class Buffer:
         self.hidden_size = hidden_size
         self.has_action_masks = has_action_masks
 
-        # Determine observation shape
-        if hasattr(observation_space, "shape"):
+        # Determine observation type (gym.spaces.Dict is NOT a plain dict)
+        obs_spaces = getattr(observation_space, 'spaces', None)
+        if obs_spaces is not None and isinstance(obs_spaces, dict) and 'entities' in obs_spaces:
+            self.is_dict_obs = True
+        elif isinstance(observation_space, dict) and ('entities' in observation_space or observation_space.get('entities') is True):
+            self.is_dict_obs = True
+        else:
+            self.is_dict_obs = False
+        if self.is_dict_obs:
+            from utils.entity_obs import ENTITY_FEATURE_DIM, MAX_ENTITIES, EntityObservationBuilder
+            self.dict_fields = {
+                'entities': (MAX_ENTITIES, ENTITY_FEATURE_DIM),
+                'entity_mask': (MAX_ENTITIES,),
+                'scalar': (EntityObservationBuilder.SCALAR_DIM,),
+            }
+            obs_shape = None  # dict obs uses separate storage
+        elif hasattr(observation_space, "shape") and observation_space.shape is not None:
             obs_shape = observation_space.shape
         elif isinstance(observation_space, dict) and "vector" in observation_space:
             obs_shape = (observation_space["vector"],)
         else:
-            raise ValueError("Unsupported observation space")
+            raise ValueError(f"Unsupported observation space: {type(observation_space)}")
 
         # Determine action dimension
         if hasattr(action_space, "nvec"):  # MultiDiscrete
@@ -63,9 +78,16 @@ class Buffer:
             raise ValueError("Unsupported action space")
 
         # Pre-allocate tensors on device
-        self.obs = torch.zeros(
-            (buffer_size, num_envs, *obs_shape), dtype=torch.float32, device=device
-        )
+        if self.is_dict_obs:
+            self.obs: Dict[str, torch.Tensor] = {}
+            for k, shape in self.dict_fields.items():
+                self.obs[k] = torch.zeros(
+                    (buffer_size, num_envs, *shape), dtype=torch.float32, device=device
+                )
+        else:
+            self.obs = torch.zeros(
+                (buffer_size, num_envs, *obs_shape), dtype=torch.float32, device=device
+            )
         self.actions = torch.zeros(
             (buffer_size, num_envs, action_dim), dtype=torch.int64, device=device
         )
@@ -194,7 +216,14 @@ class Buffer:
             self.masks_initialized = True
 
         # Store experience
-        self.obs[self.step_idx] = obs
+        if self.is_dict_obs:
+            for k in self.dict_fields:
+                v = obs[k] if isinstance(obs, dict) else getattr(obs, k)
+                if isinstance(v, np.ndarray):
+                    v = torch.from_numpy(v).to(self.device)
+                self.obs[k][self.step_idx] = v
+        else:
+            self.obs[self.step_idx] = obs
         self.actions[self.step_idx] = actions
         self.rewards[self.step_idx] = rewards
         self.dones[self.step_idx] = dones
@@ -303,10 +332,18 @@ class Buffer:
 
                 # Prepare batch tensors by slicing the pre-allocated buffers
                 # Shape: (batch_size, seq_len, num_envs, ...)
-                obs_batch = torch.zeros(
-                    (batch_size, max_seq_len, self.num_envs, *self.obs.shape[2:]),
-                    device=self.device,
-                )
+                if self.is_dict_obs:
+                    obs_batch = {}
+                    for k, shape in self.dict_fields.items():
+                        obs_batch[k] = torch.zeros(
+                            (batch_size, max_seq_len, self.num_envs, *shape),
+                            device=self.device,
+                        )
+                else:
+                    obs_batch = torch.zeros(
+                        (batch_size, max_seq_len, self.num_envs, *self.obs.shape[2:]),
+                        device=self.device,
+                    )
                 actions_batch = torch.zeros(
                     (batch_size, max_seq_len, self.num_envs, self.actions.shape[2]),
                     device=self.device,
@@ -332,7 +369,11 @@ class Buffer:
                     actual_seq_len = end_step - start_step
 
                     # Slice data for this sequence
-                    obs_batch[i, :actual_seq_len] = self.obs[start_step:end_step]
+                    if self.is_dict_obs:
+                        for k in self.dict_fields:
+                            obs_batch[k][i, :actual_seq_len] = self.obs[k][start_step:end_step]
+                    else:
+                        obs_batch[i, :actual_seq_len] = self.obs[start_step:end_step]
                     actions_batch[i, :actual_seq_len] = self.actions[
                         start_step:end_step
                     ]
