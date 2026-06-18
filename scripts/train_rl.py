@@ -68,19 +68,24 @@ def make_model(
 
 
 def _do_warmstart(
-    env, num_episodes: int, epochs: int, lr: float, observation_type: str
-) -> None:
+    env, num_episodes: int, epochs: int, lr: float, observation_type: str,
+    warmstart_path: str,
+    max_steps_per_episode: int,
+) -> bool:
     """Collect demonstrations from RuleBasedAgent and pre-train the model."""
     from scripts.warmstart import collect_demonstrations, pretrain_policy
     from models import ActorCritic  # type: ignore
 
     print(f"[warmstart] collecting {num_episodes} episodes from RuleBasedAgent ...")
     observations, labels = collect_demonstrations(
-        env, num_episodes=num_episodes, verbose=True,
+        env,
+        num_episodes=num_episodes,
+        max_steps_per_episode=max_steps_per_episode,
+        verbose=True,
     )
     if len(observations) == 0:
         print("[warmstart] WARNING: no demonstrations collected, skipping")
-        return
+        return False
 
     # Build a temporary model just for pre-training the encoder + action_type head.
     a_dims = (
@@ -107,8 +112,12 @@ def _do_warmstart(
         epochs=epochs, lr=lr, device="cpu",
     )
     # Save the pre-trained weights for the real model to load later.
-    torch.save(pretrain_model.state_dict(), "checkpoints/warmstart_pretrain.pth")
-    print("[warmstart] saved pre-trained weights to checkpoints/warmstart_pretrain.pth")
+    warmstart_dir = os.path.dirname(warmstart_path)
+    if warmstart_dir:
+        os.makedirs(warmstart_dir, exist_ok=True)
+    torch.save(pretrain_model.state_dict(), warmstart_path)
+    print(f"[warmstart] saved pre-trained weights to {warmstart_path}")
+    return True
 
 
 def _ensure_plot_dir(plot_dir: str) -> None:
@@ -193,7 +202,18 @@ def train(
     warmstart_episodes: int = 0,
     warmstart_epochs: int = 20,
     warmstart_lr: float = 1e-3,
+    freeze_encoder: bool = True,
+    load_bc_action_head: bool = True,
+    decision_point_skip: bool = False,
+    action_space_mode: str = "multidiscrete",
+    headless: bool = False,
+    num_envs: int = 1,
 ):
+    # OpenRA initialization may change the process working directory to the
+    # engine bin dir. Resolve user-provided relative output paths up front so
+    # checkpoints and CSV logs stay under the launcher cwd.
+    log_dir = os.path.abspath(log_dir)
+
     env = make_env(
         bin_dir=bin_dir,
         mod_id=mod_id,
@@ -202,6 +222,9 @@ def train(
         observation_type=observation_type,
         enable_actions=["noop", "move", "attack", "produce", "build", "deploy"],
         max_episode_ticks=max_episode_ticks,
+        decision_point_skip=decision_point_skip,
+        action_space_mode=action_space_mode,
+        headless=headless,
     )
     if remote_host and remote_port:
         env.configure_remote(
@@ -216,33 +239,63 @@ def train(
     # and pre-train the action-type head BEFORE PPO.  This gives the policy
     # a strong initial bias toward productive actions instead of collapsing
     # to noop during early exploration.
+    _warmstart_path = os.path.join(log_dir, "warmstart_pretrain.pth")
+    _has_fresh_warmstart = False
     if warmstart_episodes > 0:
-        _do_warmstart(env, warmstart_episodes, warmstart_epochs,
-                      warmstart_lr, observation_type)
+        warmstart_max_steps = max(
+            1,
+            int(max_episode_ticks // max(1, ticks_per_step))
+            if max_episode_ticks
+            else 300,
+        )
+        _has_fresh_warmstart = _do_warmstart(
+            env, warmstart_episodes, warmstart_epochs,
+            warmstart_lr, observation_type, _warmstart_path,
+            warmstart_max_steps,
+        )
         # Warm-start uses raw vector observations; skip augmentation so
         # the model architecture matches.
         augmented = False
 
-    # Optional augmented-state wrappers for delayed-reward credit assignment.
+    # Build the training env. For num_envs>1, replace the single env with a
+    # SubprocVecEnv (each worker spawns its own CLR + headless engine). The
+    # single `env` above is still used for warm-start demonstration collection.
     augmented_config = None
-    if augmented:
-        if verbose_reward:
-            env._debug_actions = True
-        env = ShapedRewardWrapper(env, verbose=verbose_reward)
-        env = AugmentedStateWrapper(env, frame_stack_k=frame_stack_k)
-        augmented_config = env.augmentation_config
-        print(f"[augmented] obs_dim={env.aug_obs_dim} "
-              f"(base={env.base_obs_dim}, k={frame_stack_k}, actions={env.num_action_types})")
-        print(f"[augmented] reward shaping is handled by OpenRAEnv._compute_reward")
+    if num_envs > 1:
+        from envs.vector_env import EnvFactory, SubprocVecEnv
+        print(f"[vec] building SubprocVecEnv with {num_envs} headless envs ...")
+        fns = [
+            EnvFactory(
+                bin_dir=bin_dir, mod_id=mod_id, map_uid=map_uid,
+                ticks_per_step=ticks_per_step, observation_type=observation_type,
+                enable_actions=["noop", "move", "attack", "produce", "build", "deploy"],
+                max_episode_ticks=max_episode_ticks,
+                decision_point_skip=decision_point_skip,
+                action_space_mode=action_space_mode,
+            )
+            for _ in range(num_envs)
+        ]
+        train_env = SubprocVecEnv(fns)
+    else:
+        # Optional augmented-state wrappers for delayed-reward credit assignment.
+        if augmented:
+            if verbose_reward:
+                env._debug_actions = True
+            env = ShapedRewardWrapper(env, verbose=verbose_reward)
+            env = AugmentedStateWrapper(env, frame_stack_k=frame_stack_k)
+            augmented_config = env.augmentation_config
+            print(f"[augmented] obs_dim={env.aug_obs_dim} "
+                  f"(base={env.base_obs_dim}, k={frame_stack_k}, actions={env.num_action_types})")
+            print(f"[augmented] reward shaping is handled by OpenRAEnv._compute_reward")
+        train_env = env
 
     # When using BC warm-start, skip the LSTM — the encoder was pre-trained on
     # single-frame observations and a randomly-initialised LSTM would scramble
     # its output, undoing the pre-training.
-    _warmstart_path = "checkpoints/warmstart_pretrain.pth"
-    _use_lstm = "lstm" if not os.path.isfile(_warmstart_path) else None
+    _use_lstm = "lstm" if not _has_fresh_warmstart else None
 
     model, _ = make_model(
-        env,
+        train_env,
         observation_type=observation_type,
         recurrent_type=_use_lstm,
         augmented_config=augmented_config,
@@ -250,18 +303,31 @@ def train(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Load pre-trained encoder + action_type head from warm-start if available.
-    if os.path.isfile(_warmstart_path):
+    if _has_fresh_warmstart and os.path.isfile(_warmstart_path):
         print(f"[warmstart] loading pre-trained weights from {_warmstart_path}")
         print(f"[warmstart] using feed-forward model (no LSTM) to preserve BC features")
         pretrained = torch.load(_warmstart_path, map_location=device, weights_only=True)
         model_state = model.state_dict()
         for key in list(pretrained.keys()):
-            if key.startswith("encoder.") or key.startswith("policy_head.head_action_type."):
+            load_key = (
+                key.startswith("encoder.")
+                or key.startswith("core.")
+                or key.startswith("policy_head.trunk.")
+            )
+            # The action_type head encodes RuleBasedAgent's action mix (which
+            # never produces combat units). Loading it anchors the policy to
+            # that behavior; skip it when we want PPO to explore the army-value
+            # headroom under the asset reward.
+            if load_bc_action_head and key.startswith("policy_head.head_action_type."):
+                load_key = True
+            if load_key:
                 if key in model_state and pretrained[key].shape == model_state[key].shape:
                     model_state[key] = pretrained[key]
         model.load_state_dict(model_state)
-        model.freeze_encoder = True
-        os.remove(_warmstart_path)
+        model.freeze_encoder = bool(freeze_encoder)
+        print(f"[warmstart] freeze_encoder={model.freeze_encoder} "
+              f"load_bc_action_head={load_bc_action_head}")
+        print(f"[warmstart] keeping BC weights at {_warmstart_path}")
 
     agent = PPOAgent(model=model, device=str(device))
 
@@ -277,9 +343,10 @@ def train(
             print(f"Failed to save model: {e}")
 
     agent.train(
-        env=env,
+        env=train_env,
         total_updates=total_updates,
         num_steps=num_steps,
+        num_envs=num_envs,
         gamma=gamma,
         gae_lambda=gae_lambda,
         clip_coef=clip_coef,
@@ -294,7 +361,15 @@ def train(
         log_path=os.path.join(log_dir, "training.csv"),
     )
 
-    env.close()
+    try:
+        train_env.close()
+    except Exception:
+        pass
+    if num_envs > 1:
+        try:
+            env.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
@@ -349,6 +424,36 @@ if __name__ == "__main__":
         "--warmstart-lr", type=float, default=1e-3,
         help="Learning rate for warm-start pre-training.",
     )
+    parser.add_argument(
+        "--freeze-encoder", action=argparse.BooleanOptionalAction, default=True,
+        help="Freeze the BC-pretrained encoder during PPO. Use --no-freeze-encoder "
+             "to let PPO fine-tune features and exploit the asset-reward headroom.",
+    )
+    parser.add_argument(
+        "--load-bc-action-head", action=argparse.BooleanOptionalAction, default=True,
+        help="Load the BC action_type head. Use --no-load-bc-action-head to avoid "
+             "anchoring the policy to RuleBasedAgent's (no-combat-unit) action mix.",
+    )
+    parser.add_argument(
+        "--decision-point-skip", action="store_true",
+        help="Skip forced-noop ticks inside env.step so every gym step is a real "
+             "decision (denser PPO gradient; ~10-20x fewer wasted steps).",
+    )
+    parser.add_argument(
+        "--action-space-mode", choices=["multidiscrete", "macro"], default="multidiscrete",
+        help="'macro' collapses the 6-head action space to a single 'produce:<type>' "
+             "categorical (dev-only; auto-deploy/auto-place handle the rest).",
+    )
+    parser.add_argument(
+        "--headless", action="store_true",
+        help="Run the engine with the no-op Null renderer (no window/GL). Required "
+             "for parallel multi-process training.",
+    )
+    parser.add_argument(
+        "--num-envs", type=int, default=1,
+        help="Number of parallel environments (SubprocVecEnv). >1 forces headless "
+             "workers. Warm-start still runs on a single env.",
+    )
     args = parser.parse_args()
 
     train(
@@ -381,4 +486,10 @@ if __name__ == "__main__":
         warmstart_episodes=args.warmstart_episodes,
         warmstart_epochs=args.warmstart_epochs,
         warmstart_lr=args.warmstart_lr,
+        freeze_encoder=args.freeze_encoder,
+        load_bc_action_head=args.load_bc_action_head,
+        decision_point_skip=args.decision_point_skip,
+        action_space_mode=args.action_space_mode,
+        headless=args.headless,
+        num_envs=args.num_envs,
     )

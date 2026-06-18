@@ -32,9 +32,22 @@ def _action_dict_to_type_idx(
 
     Returns the index of the first non-noop action in ``action_types``,
     or 0 (noop) if the list is empty / only contains unrecognised orders.
+
+    Macro mode: action_types are ['noop', 'produce:<t>', ...]. A
+    StartProduction maps to the matching 'produce:<target>' entry; deploy and
+    placement are auto-handled by the env in macro mode, so they map to noop.
     """
+    macro_mode = any(str(a).startswith("produce:") for a in action_types)
     for a in (action_dicts or []):
         order = str(a.get("order", "")).lower()
+        if macro_mode:
+            if order == "startproduction":
+                tgt = str(a.get("target_string", "")).lower().strip()
+                cand = f"produce:{tgt}"
+                if cand in action_types:
+                    return action_types.index(cand)
+            # deploy / placebuilding / move / attack are not macro decisions
+            continue
         name = _ORDER_TO_ACTION_TYPE.get(order)
         if name is not None and name in action_types:
             return action_types.index(name)
@@ -141,8 +154,16 @@ def pretrain_policy(
     model.to(device_t)
     model.train()
 
-    # Freeze everything except the encoder and action_type head.
-    _trainable_prefixes = ("encoder.", "policy_head.head_action_type.")
+    # Freeze everything except the stateless policy path used by PPO:
+    # encoder -> core projection -> policy trunk -> action_type head.
+    # Training only encoder -> head_action_type overstates BC accuracy because
+    # the real forward pass also includes core and policy_head.trunk.
+    _trainable_prefixes = (
+        "encoder.",
+        "core.",
+        "policy_head.trunk.",
+        "policy_head.head_action_type.",
+    )
     for name, param in model.named_parameters():
         ok = any(name.startswith(p) for p in _trainable_prefixes)
         param.requires_grad = ok
@@ -151,11 +172,15 @@ def pretrain_policy(
         [p for p in model.parameters() if p.requires_grad], lr=lr
     )
     # Compute class weights to handle label imbalance (noop dominates).
+    # Size the weight vector to the FULL action_type head (not just the labels
+    # seen), since CrossEntropyLoss requires one weight per class. Unseen
+    # classes get weight 1.0 (they never appear in the loss anyway).
+    num_classes = int(model.policy_head.head_action_type.out_features)
     unique, counts = np.unique(labels, return_counts=True)
     n_total = len(labels)
-    weight_dict = {u: n_total / (len(unique) * c) for u, c in zip(unique, counts)}
+    weight_dict = {int(u): n_total / (len(unique) * c) for u, c in zip(unique, counts)}
     class_weights = torch.tensor(
-        [weight_dict.get(i, 1.0) for i in range(max(unique) + 1)],
+        [weight_dict.get(i, 1.0) for i in range(num_classes)],
         dtype=torch.float32, device=device_t,
     )
     criterion = nn.CrossEntropyLoss(weight=class_weights)
@@ -189,16 +214,10 @@ def pretrain_policy(
                 x = obs_tensor[batch_idx]
             y = labels_tensor[batch_idx]
 
-            # Run encoder only (no LSTM — we want a stateless warm-start).
-            if isinstance(x, dict):
-                features = model.encoder(x['entities'], x['entity_mask'], x['scalar'])
-            else:
-                features = model.encoder(x)
-            # features may be (B, D) or (B, 1, D); flatten to (B, D).
-            if features.dim() == 3:
-                features = features.squeeze(1)
-
-            logits = model.policy_head.head_action_type(features)
+            # Run the same stateless forward path PPO will use after loading
+            # warm-start weights.  recurrent_type=None is required here.
+            logits_dict, _, _ = model(x, seq_len=1)
+            logits = logits_dict["action_type"]
             loss = criterion(logits, y)
 
             optimizer.zero_grad()

@@ -1,7 +1,7 @@
 # OpenRA-Bot 实验报告
 
-> **日期**: 2026-06-15
-> **状态**: PPO 训练稳定，学到 RuleBasedAgent 基线水平。瓶颈在 observation 表达力。
+> **日期**: 2026-06-15，更新至 2026-06-18
+> **状态**: PPO 链路已经可训练，entity obs、macro action、asset reward、headless 和多环境 rollout 均已打通。最新瓶颈不是单一 bug，而是弱专家先验、缺少 teacher-KL / goal-conditioning，以及 RTS 长周期 credit assignment。
 
 ## 目录
 
@@ -11,6 +11,7 @@
 4. [当前架构状态](#4-当前架构状态)
 5. [训练结果汇总](#5-训练结果汇总)
 6. [下次 Session 接续指南](#6-下次-session-接续指南)
+7. [2026-06-18 实验更新：PPO 已能跑通，但缺强先验](#7-2026-06-18-实验更新ppo-已能跑通但缺强先验)
 
 ---
 
@@ -177,10 +178,101 @@ low_cash_penalty                        -0.2 * deficit
 - **PPO 50 轮**: produce 率 3-9%，无上升趋势，每轮 early_stop
 - **结论**: Entity encoder 完美学到 RuleBasedAgent 行为，但 PPO 仍无法超越基线。确认瓶颈不在 observation 表达力，而在 PPO 的 credit assignment 能力（300 步仅 15 个决策点）
 
-### 未解决问题
+### Round 12: Asset-value reward + 三项消融 (2026-06-15)
 
-- **PPO credit assignment 极限**: 无论 flat vector 还是 entity obs，PPO 都无法在 15 决策点/300 步的稀疏场景中超越 BC 基线。需要简化 action space 或换算法
-- **无 headless 模式**: 每次训练打开 OpenGL 窗口
+**动机**: RuleBasedAgent 只建固定建筑、零作战单位，且旧 reward（BO distance）建完 `[powr,proc,barr]` 即封顶 → RL 在该 reward 下无余量可超。重构为开放式净资产 reward。
+
+**实现**:
+- `reward_mode="asset"`（默认）+ `AssetValueTracker`（`envs/openra_env.py`）：reward = 新增 owned actor 的造价总和 / 1000，无上限，事件式按 actor id 去重，catalog 成本摄取 + seed fallback
+- **关键教训**: per-step 惩罚（idle_cash / power_deficit）随 episode 长度累积，淹没一次性资产收益（破坏净资产 telescoping）→ 默认关掉
+- `scripts/verify_asset_reward.py`：headroom 验证（RuleBasedAgent vs GreedyDevAgent）
+
+**余量验证（PASS）**: Greedy（rule-based 经济 + 持续造步兵）严格 > RuleBasedAgent，且 gap 随时长增长：150步 +0.1，400步 +0.7（greedy 造 32 个 e1）。证明 army value 是 rule-based 留下的余量。
+
+**意外发现**: RuleBasedAgent 其实没卡在 3 建筑 — 它的 cycle 持续造经济（400步: 3powr/3proc/3harv）。但**零作战单位**，这才是真正的余量来源。
+
+**三项消融（均失败，PPO 仍平）**:
+| 实验 | 配置 | 结果 |
+|------|------|------|
+| 解 BC 锚 | `--no-freeze-encoder --no-load-bc-action-head` | mean_reward 平 0.02–0.05，25 轮无趋势 |
+| 决策步跳过 | `--decision-point-skip`（env.step 内跳过 forced-noop tick） | noop 仍 ~90%，无变化 |
+| 激进探索 | lr 1e-3, ent 0.25, target_kl 0.2, clip 0.2 | **更差**：KL 爆到 0.3-0.66，每轮 early_stop，produce↓ noop↑(251)，reward 跌到 0.03 |
+
+**精炼诊断（推翻旧"forced noop"框架）**:
+- 旧 REPORT 称"80% forced noop"。实测 `_has_choice`（raw-only：有空队列/可动单位/可放建筑）**几乎总为 True** → 决策步跳过几乎不触发 → 那 90% noop 是策略**主动选** noop，**不是被迫**
+- 所有 run 的 **KL ≈ 0.01** = 策略几乎不动。瓶颈不是 observation / reward 余量 / BC 锚 / forced-noop 密度（逐一排除），而是 **on-policy PPO 在 6-head 分解动作空间 + 单环境下的样本效率**：要造一个兵需联合命中 `produce + 正确队列 unit_idx + unit_type=e1`，低概率联合事件，单环境 256 步/轮几乎采不到成功样本去强化
+
+**下一步候选（按杠杆）**:
+1. **简化动作空间** — 把"produce e1"塌成单一动作（而非 3-head 联合），直接抬高有效动作被采样+强化的概率。最可能破墙
+2. **并行环境（Phase 4）** — 8–64× 样本/wall-clock，但依赖 headless（每实例开 OpenGL 窗口）
+3. 激进探索 hypers（Round 12 进行中测试）— 若仍平则确认非"更新太怯"
+
+**激进探索结论**: 已测，**确认非"更新太怯"**。保守 hypers → 平（KL 0.01）；激进 hypers → KL 爆炸、early_stop、策略反而退化（produce↓ noop↑）。无论怎么调探索，PPO 都无法在单环境下采到足够的成功 produce-unit 样本去强化 → 锁定杠杆 #1/#2。
+
+### Round 13: Macro 动作空间 + auto_place bug 修复 (2026-06-15)
+
+**动机**: 选定杠杆 #1（简化动作空间）。把 6-head 联合动作塌成单一 `action_type` 类别。
+
+**实现** (`action_space_mode="macro"`):
+- action_type = `['noop'] + ['produce:<t>' for t in MACRO_PRODUCE_TYPES]`（18 类，覆盖经济/防御/步兵/车辆）
+- 其余 5 个 head 经 agent 的 `_dummy_mask_like` 自动塌到 index 0（零熵、零梯度）→ **复用整套 model/agent/buffer，零改动**
+- env 解析 `produce:<t>` → `_find_producer_for` 找队列 → StartProduction；MCV 部署 + 建筑放置全靠 auto_place
+- warmstart 做了 macro-aware 标签映射（StartProduction→`produce:<target>`）
+
+**修复 3 个执行 bug**（diag_macro.py 定位）:
+1. **dedup 阻塞重复 produce**: `_action_ttl_steps=8` 窗口挡住连续同类生产 → macro 模式跳过 dedup
+2. **auto_place 死守卫**: `_auto_place_done_items` 里一个 `player_actor_id` try-block 异常即 `return []`，导致 Done 建筑**永不放置** → 删除。**此 bug 影响所有模式**（非 macro 靠 agent 手动 build 动作掩盖了它）
+3. **auto_place subject 错**: 用 `player_actor_id` 应为队列 actor id（对齐 RuleBasedAgent）→ 改 `q_id`
+
+**结果**（macro + BC warmstart + asset reward, 50 轮, entity obs）:
+- 修复后 produce→build→auto-place→actor→reward 闭环打通（diag 验证 actors 1→2→3 持续增长）
+- mean_reward 变**连续**值 ~0.045（修复前卡在 {0.0156, 0.0312} = 只有 MCV+conyard）
+- **agent 确实造兵了**（atype_dist 常见 9/10/11 = e1/e3/e2，rule-based 从不造兵）
+- 但 mean_reward 仍在基线附近震荡（峰值 ~0.056 vs rule-based ~0.048），**未决定性超越**。方差大、频繁 early_stop
+
+**最终诊断**: Macro 让框架真正**能用**（造兵、开放式资产增长、auto_place 修好），但单环境 PPO 仍无法稳定超基线 —— 高方差 + 样本不足。**剩余唯一杠杆 = 样本吞吐（并行环境 Phase 4，依赖 headless）**。
+
+### Round 14: Headless 渲染器（Phase 4 前置） (2026-06-15)
+
+**动机**: 杠杆 = 样本吞吐（并行环境）。前置 = headless（每实例不开 OpenGL 窗口，否则多开崩）。
+
+**实现**:
+- 新项目 **`OpenRA.Platforms.Null`** — `NullPlatform : IPlatform` + 全套 no-op stub（window/context/vbuf/ibuf/texture/framebuffer/shader/font/sound）。`Renderer` 构造能跑通但永不真正绘制
+- 关键洞察: `PythonAPI.Step()` **只 tick 模拟**（TickImmediate/TryTick/world.Tick），从不渲染 → Null renderer 只需活过 `Game.Initialize` 构造
+- `StartLocalGame(..., headless=true)` → 给 `Game.Initialize` 传 `Game.Platform=Null` → `CreatePlatform` 加载 `OpenRA.Platforms.Null.dll`（失败回退 Default，安全）
+- env `headless` 参数 + train_rl `--headless` 开关
+
+**验证**: diag + 训练全程 headless 跑通 —— **零 SDL/OpenGL 行**（对比非 headless 会打印 "Using SDL 2 with OpenGL (ANGLE)…"），warmstart + PPO + macro 闭环正常，exit 0。actors 1→2→3 正常增长。
+
+**状态**: headless **完成**。下一步 = `SubprocVecEnv`（spawn 多进程，每进程独立 CLR + headless 引擎）+ PPO 多环境支持（当前 `agent.py` 写死 `num_envs=1`）。
+
+### Round 15: 并行环境 SubprocVecEnv + PPO 多环境 (2026-06-16)
+
+**实现**:
+- `envs/vector_env.py` — `SubprocVecEnv`（multiprocessing **spawn**，每进程独立 CLR + headless 引擎）+ `EnvFactory`（可 pickle，强制 headless）。worker 内 auto-reset，obs 跨环境 stack
+- `agent.py` — 解除 `num_envs=1` 限制；新增向量化 rollout 分支（批量 forward + `_stack_env_masks` 把 per-env mask 堆成 `(num_envs,...)`）。单环境路径保留
+- **修复潜在 bug**: decision_mask 多了一次 `permute(0,2,1)` → `(B,L,N)` 与 `mb_attention_mask (B,N,L)` 不匹配。N=1 时被广播掩盖，N>1 崩。删除
+- `train_rl --num-envs N`（warmstart 仍在单环境跑，再建 venv）
+
+**验证**:
+- 2-env smoke: 两 CLR + headless 共存，40 步 3.6s = 22 env-steps/s，obs stack `(2,128,14)`，干净退出
+- 4-env 训练: 5 CLR（1 warmstart + 4 worker）共存无错，40 轮，atype 计数 ~512/轮，**~4× 吞吐**
+
+**结果**（4 env, macro+BC, 40 轮）: first10 0.0432 → last10 0.0458，max 0.0564 —— **仍贴基线，未决定性超越**。21/40 轮 early_stop（target_kl=0.03 太紧，切断学习）。
+
+**判断**: 并行**基建完整交付**（headless + SubprocVecEnv + PPO 多环境 + 4× 吞吐）。但 4 env/40 轮 + 当前 hypers 仍未破墙。下一步调参方向: 放宽 target_kl（0.03→0.1+，现在一半轮被 early_stop）、加 env 数（8-16）、加 num_steps/总轮数。基建已就位，剩下是 scale + 调参。
+
+**调参冲刺（8 env, 1024 transitions/轮）结果**:
+- target_kl 0.15 + ent 0.05 → **崩**：KL 爆到 2.0，entropy→2.0（near-uniform），reward 跌到地板 0.0312
+- target_kl 0.05 + ent 0.01 + clip 0.1（保守）→ 前期稳（~0.045，峰 0.055），但 **120 轮后期 late-collapse 到地板**（last15 avg 0.027，末 5 轮 = 0.0312）
+- **结论**: 更多更新 → 最终塌缩，非改善。调参/scale 解不了；PPO 在此任务上既不超基线也无法长期稳定
+
+**最终定论（跨极多配置）**: 试遍 obs(flat/entity) × reward(BO/asset) × BC(冻/解/不载) × 动作(6head/macro) × 探索(保守/激进) × 并行(1/4/8) × KL(0.03/0.05/0.15)。**PPO 始终匹配但不决定性超越 rule-based/BC 基线（~0.048），且长跑会塌缩。** 根因非基建（已全交付）—— 是任务余量太薄（asset-optimal 发展策略 ≈ BC 已学的高效建经济，多造兵边际增益 < 方差）+ PPO 长程 credit assignment 极限。要破需换方向：**加对手 + 战斗/胜负 reward 把余量做厚**，或换算法（off-policy/model-based）。
+
+### 历史未解决问题与当前状态
+
+- **PPO credit assignment 极限**: 仍然成立，但表述需要更新。macro action 和并行环境已经缓解了采样问题，PPO 仍无法在发展-only 任务中稳定超越 BC/RuleBased 基线。下一步应补 teacher-KL、goal conditioning、combat/winloss，或评估 off-policy 方法。
+- **无 headless 模式**: 已解决。`OpenRA.Platforms.Null` + `--headless` 已可支持本地训练和 `SubprocVecEnv`。
 
 ---
 
@@ -188,12 +280,9 @@ low_cash_penalty                        -0.2 * deficit
 
 ### 启动训练
 
-```bash
-cd /Users/sharedcare/Projects/OpenRA/OpenRA-Bot
-rm -rf checkpoints && mkdir checkpoints
-python scripts/train_rl.py \
-    --num-steps 512 --total-updates 80 --max-episode-ticks 1500 \
-    --warmstart-episodes 10 --warmstart-epochs 15
+```powershell
+cd F:\Projects\OpenRA\OpenRA.Bot
+.\scripts\train_best.ps1 -Updates 100 -RunName stronger_teacher_no_head_repeat
 ```
 
 ### 修改代码后需注意
@@ -210,5 +299,103 @@ python scripts/train_rl.py \
 | `scripts/train_rl.py` | 训练入口、超参数 |
 | `scripts/warmstart.py` | BC 数据采集和预训练 |
 
-### 下一步计划 (Phase 1)
-参考 `PLAN.md` Phase 1，将 flat vector observation 升级为 entity-based + spatial 结构。
+### 下一步计划
+参考 `PLAN.md` 的 2026-06-18 修订版路线。当前不再把 flat vector → entity 当作下一步主线；entity obs 已经可用，下一步主线是实验记录收口、soft teacher-KL、goal conditioning、强化脚本专家，以及引入对手/战斗/胜负信号。
+
+---
+
+## 7. 2026-06-18 实验更新：PPO 已能跑通，但缺强先验
+
+### 7.1 本轮已完成的工程进展
+
+- `models/buffer.py`: 修复 `num_steps < seq_len` 时 `num_sequences=0` 导致 PPO 没有 batch 的问题。短 rollout 现在也会产生有效训练 batch。
+- `agent/agent.py`: 增加 `batches`、`decision_steps`、`rollout_steps`、`grad_norm`、`reward_comp` 等诊断；修复 padded mask 全 0 行可能导致 `Categorical` NaN 的问题；KL 估计改成非负形式。
+- `envs/openra_env.py`: 默认 asset reward，加入 `AssetValueTracker`；加入 production start / active / cancel credit；macro action 模式 `noop + produce:<type>`；修复 auto-place subject 和 Done 建筑放置问题。
+- `scripts/train_rl.py`: 支持 entity / macro / headless / `num_envs` / warmstart 权重隔离 / `--no-load-bc-action-head`。
+- `scripts/train_best.ps1`: 当前推荐启动脚本，默认 `MaxEpisodeTicks=1800`、`LearningRate=7e-5`、`ClipCoef=0.05`、`TargetKl=0.03`、`EntCoef=0.02`、`UpdateEpochs=4`、不硬加载 BC action head。
+- `RuleBasedAgent`: 从早期三建筑脚本升级为基础宏观发展脚本：`powr -> proc -> barracks -> powr -> weap`，之后持续步兵/车辆/经济循环，并屏蔽墙、防御塔、超级武器等短期噪声动作。
+
+### 7.2 关键实验结果
+
+| 实验 | 配置 | 结果 | 结论 |
+|------|------|------|------|
+| Short rollout fix | `num_steps=32/128`, `seq_len=128` | 修复后 `batches=4`，`decision_steps` 和 `grad_norm` 正常出现 | PPO 此前存在“看起来训练、实际没更新”的边界 bug，已修复 |
+| 稳定基线 | no BC head, asset reward 前 | `reward=0.0358`, `nz=0.039`, `KL=0.0017`, `batches=4.00` | 能更新但 reward 仍稀疏，策略几乎不动 |
+| Asset production credit | `run_asset_prod_credit_100` | `reward=0.0646`, `nz=0.913`, `KL=0.0156`, `early=11/100` | production credit 明显改善信号密度，reward 约提升 2x，但平台期约 `0.06-0.07` |
+| 更长 rollout | `256 x 100` | `reward=0.0571`, `nz=0.891`, `KL=0.0133` | 简单加长 rollout 没有更好，128 step 仍是当前主线 |
+| 强化 RuleBased teacher + hard BC head | `stronger_teacher_with_head_100` | `reward=0.0455`, `last20=0.0392`, `KL=0.8674`, `early=100/100` | 直接加载 BC action head 会过度锚定且触发高 KL early stop，不推荐 |
+| 强化 RuleBased teacher + no BC head | `stronger_teacher_no_head_100` | `reward=0.0679`, `last20=0.0706`, `KL=0.0324`, `early=40/100` | 当前最好趋势，但仍不够稳定 |
+| UE4/KL0.03 repeat | `stronger_teacher_no_head_repeat_ue4_kl003` | `reward=0.0697`, `last20=0.0645`, `best=0.1062@34`, `KL=0.0400`, `early=56/100` | 全程均值略高、峰值持平略高，但尾段不如上一组；说明能冲高但不能稳定保持 |
+| 降低 LR | `lr=5e-5`, 150 updates | `reward=0.0663`, `last20=0.0667`, `KL=0.0468`, `early=95/150` | 降 LR 没解决稳定性，略弱于当前最好 |
+| 减少 update epochs | `target_kl=0.05`, `UpdateEpochs=2` | `reward=0.0563`, `last20=0.0592`, `KL=0.0118` | 更稳但学习弱 |
+| `UpdateEpochs=3` 对照 | `target_kl=0.05`, `UpdateEpochs=3` | `reward=0.0415`, `last20=0.0397`, `KL=0.1010`, entropy 偏高 | 训练退化，出现接近随机/高熵的失败形态 |
+
+当前两组最有价值的记录是：
+
+- `stronger_teacher_no_head_100`: `mean=0.0679`, `last20=0.0706`, `best=0.1060@69`, `early=40/100`，尾段保持更好。
+- `stronger_teacher_no_head_repeat_ue4_kl003`: `mean=0.0697`, `last20=0.0645`, `best=0.1062@34`, `early=56/100`，全程均值略高但后半段更抖。
+
+这说明 asset reward + macro action + 更强脚本 teacher 的方向是有效的，但 PPO 并没有稳定收敛到高 reward 策略；它更像是在几个可行策略模式之间跳动。当前最该补的是 **best checkpoint 保存** 和 **soft teacher-KL**，否则高分策略会被后续更新洗掉。
+
+### 7.3 对训练日志的诊断
+
+典型日志中可以看到：
+
+- `mean_reward` 在 `0.02-0.07` 间震荡，最高阶段能到 `~0.07`，但没有稳定上行趋势。
+- `reward_comp` 主要来自 `asset_gained / asset_reward`，idle cash 和 power deficit penalty 当前为 0。
+- `atype_dist` 经常在 `noop`、`produce:<building/unit>` 间摆动，说明 macro action 已经让 agent 能探索生产，但策略仍容易退回保守/noop 或高熵。
+- KL 呈两难：过低表示策略几乎不动；过高会 early stop 或 collapse。简单调 `lr`、`target_kl`、`update_epochs` 只能在“不学”和“不稳”之间移动。
+- `LoadBcActionHead` 的实验非常明确：硬加载 action head 不是 teacher-KL，它会把策略压回脚本动作分布，并导致 PPO 更新空间变窄。
+- 最新 UE4/KL0.03 repeat 的高分 update 多数只有 `num_batches=1`，说明它经常刚有收益就被 KL early stop 截断；这不是“完全学不会”，而是“好策略无法稳定保留”。
+
+### 7.4 与 DI-star / AlphaStar 复现分析的对照
+
+DI-star 的“发展能力”不是纯 RL 从零发现，而是由多层结构支撑：
+
+1. 大规模人类 replay 的监督学习预训练，使 RL 起点已经会完整打局。
+2. 训练早期使用 teacher-KL，把策略拉在 SL teacher 附近，避免塌缩。
+3. 使用目标条件 `z`，把人类 build order / cumulative stat 喂给网络，策略知道本局要朝什么发展。
+4. 多路 reward 和多 value head，拆分 win/loss、build order、unit、upgrade、battle 等 credit assignment。
+5. V-trace / UPGO 等 off-policy 机制，提高样本复用和长 horizon 学习能力。
+6. 有对手和 battle / winloss 信号，发展动作最终能被战斗结果校准。
+
+OpenRA.Bot 当前相当于：弱脚本 BC + 单标量 asset reward + vanilla PPO + 发展-only 场景。实验现象与这个差距一致：PPO 可以学会靠近脚本宏观发展，但很难稳定超越，因为 teacher 本身没有完整战略和作战能力，reward 也没有把“更强军队是否能赢”传回来。
+
+### 7.5 当前结论
+
+- PPO 实现已经不是主要 blocker；它能产生 batch、能更新、有诊断、有 headless / vectorized 基础设施。
+- Asset reward + production credit 是有效改进，解决了旧 build-order reward 封顶和 reward 稀疏问题。
+- Macro action 是必要简化，解决了 6-head 联合采样导致的 produce 成功样本稀少问题。
+- 更强 `RuleBasedAgent` 是必要的，但“硬加载 BC action head”不是正确用法；下一步应做 frozen teacher 的 soft KL。
+- 当前任务余量太薄：发展-only asset reward 下，脚本经济已经很接近局部最优，多造兵的边际收益小于 PPO 方差。
+- 要继续提升，需要把训练目标从“造更多资产”推进到“在对手压力下发展并取胜”。
+
+### 7.6 下一步建议
+
+1. **先补实验记录能力**
+   - CSV 固化 action distribution、reward components、last20、best reward、early_stop、decision_steps。
+   - 保存 best checkpoint，避免只保留固定 update。
+   - 目前 `repeat_ue4_kl003` 的最佳点是 `model_0034.pth`，最终 `model_0100.pth` 未必更好；后续训练应按验证指标自动保存 best。
+
+2. **实现 soft teacher-KL**
+   - 冻结一个由升级版 `RuleBasedAgent` BC 得到的 teacher。
+   - PPO loss 加 action-type KL，先只约束 macro action head。
+   - KL 系数从强到弱退火，避免 hard BC head 的过锚定问题。
+
+3. **加入 goal conditioning**
+   - 手写多个 BO / strategy target：经济、步兵、重工、均衡。
+   - 每局采样目标，把目标编码进 scalar obs。
+   - reward 从“隐式猜方向”变成“朝给定目标前进”。
+
+4. **把 RuleBasedAgent 继续做成更好的专家基线**
+   - 它不需要完美，但需要覆盖红警基本常识：补电、补矿、兵营/重工持续出兵、基础防守/进攻触发。
+   - 更好的 teacher 会直接提升 BC 数据质量和 teacher-KL 锚点质量。
+
+5. **加入对手、combat reward 和 terminal reward**
+   - 发展-only 已经接近上限。
+   - 先做固定弱对手，记录 kill value、lost value、battle score、win/loss。
+   - 再考虑 self-play / league。
+
+6. **暂缓大模型和大规模算法迁移**
+   - Transformer、多 value head、V-trace/UPGO 都有价值，但应在 teacher-KL、goal conditioning、combat signal 有雏形后再上。
+   - 否则复杂度会上升，但训练信号仍然不够。

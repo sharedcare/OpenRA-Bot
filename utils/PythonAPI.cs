@@ -123,6 +123,20 @@ namespace OpenRA
 		static bool initialized;
 		static int networkConnectTimeoutMs = 10000;
 
+		static string GetBotLogDir(string engineDir)
+		{
+			var logDir = Path.Combine(engineDir, "OpenRA.Bot", ".support", "Logs");
+			Directory.CreateDirectory(logDir);
+			return logDir;
+		}
+
+		static string GetBotSettingsFile(string engineDir)
+		{
+			var supportDir = Path.Combine(engineDir, "OpenRA.Bot", ".support");
+			Directory.CreateDirectory(supportDir);
+			return Path.Combine(supportDir, "settings.yaml");
+		}
+
 		static void EnsureInitialized()
 		{
 			if (initialized)
@@ -158,7 +172,9 @@ namespace OpenRA
 			// Initialize the engine+mod state if needed using the provided binDir for EngineDir
 			if (Game.Mods == null || Game.ModData == null || Game.ModData.Manifest.Id != modId)
 			{
-				var args = new Arguments($"Game.Mod={modId}", $"Engine.EngineDir={engineDir}");
+				var logDir = GetBotLogDir(engineDir);
+				var settingsFile = GetBotSettingsFile(engineDir);
+				var args = new Arguments($"Game.Mod={modId}", $"Engine.EngineDir={engineDir}", $"Engine.LogDir={logDir}", $"Engine.SettingsFile={settingsFile}");
 				typeof(Game).GetMethod("Initialize", BindingFlags.NonPublic | BindingFlags.Static)
 					.Invoke(null, [args]);
 			}
@@ -180,7 +196,7 @@ namespace OpenRA
 		// Start local game with option to add a built-in bot opponent and set lobby options before the world starts
 		public static void StartLocalGame(string modId, string mapUid, string binDir,
 			bool addBotOpponent, string botType = null, string botSlotId = null,
-			bool? explored = null, bool? fog = null)
+			bool? explored = null, bool? fog = null, bool headless = false)
 		{
 			EnsureInitialized();
 
@@ -193,7 +209,18 @@ namespace OpenRA
 
 			if (Game.Mods == null || Game.ModData == null || Game.ModData.Manifest.Id != modId)
 			{
-				var args = new Arguments($"Game.Mod={modId}", $"Engine.EngineDir={engineDir}");
+				// headless=true selects the no-op OpenRA.Platforms.Null renderer so the engine
+				// runs logic-only (no window / GL context) — required for parallel training.
+				var logDir = GetBotLogDir(engineDir);
+				var settingsFile = GetBotSettingsFile(engineDir);
+				var args = headless
+					? new Arguments(
+						$"Game.Mod={modId}", $"Engine.EngineDir={engineDir}",
+						$"Engine.LogDir={logDir}", $"Engine.SettingsFile={settingsFile}",
+						"Game.Platform=Null")
+					: new Arguments(
+						$"Game.Mod={modId}", $"Engine.EngineDir={engineDir}",
+						$"Engine.LogDir={logDir}", $"Engine.SettingsFile={settingsFile}");
 				typeof(Game).GetMethod("Initialize", BindingFlags.NonPublic | BindingFlags.Static)
 					.Invoke(null, [args]);
 			}

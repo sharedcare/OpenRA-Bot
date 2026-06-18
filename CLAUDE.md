@@ -13,6 +13,12 @@ python scripts/train_rl.py --num-steps 512 --total-updates 80 \
 python scripts/train_rl.py --num-steps 256 --total-updates 50 \
     --max-episode-ticks 1500 --warmstart-episodes 10 --warmstart-epochs 15 \
     --observation-type entity
+
+# Macro action space (collapses 6-head -> single produce:<type> categorical, dev-only)
+# Default reward is now "asset" (open-ended net-worth growth, no build-order cap).
+python scripts/train_rl.py --observation-type entity --num-steps 256 \
+    --total-updates 50 --max-episode-ticks 1500 --warmstart-episodes 8 \
+    --warmstart-epochs 15 --action-space-mode macro --no-freeze-encoder --ent-coef 0.05
 ```
 
 ## Project Overview

@@ -39,8 +39,12 @@ class Buffer:
         """
         self.device = device
         self.num_envs = num_envs
+        if buffer_size <= 0:
+            raise ValueError("buffer_size must be > 0")
+        if seq_len <= 0:
+            raise ValueError("seq_len must be > 0")
         self.buffer_size = buffer_size
-        self.num_sequences = buffer_size // seq_len
+        self.num_sequences = max(1, (buffer_size + seq_len - 1) // seq_len)
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.num_lstm_layers = num_lstm_layers
@@ -231,7 +235,11 @@ class Buffer:
         self.logprobs[self.step_idx] = logprobs
 
         # Store hidden state at sequence boundaries
-        if self.step_idx % self.seq_len == 0 and hidden_state is not None:
+        if (
+            self.step_idx % self.seq_len == 0
+            and hidden_state is not None
+            and self.seq_idx < self.num_sequences
+        ):
             # hidden_state shape: (num_layers, num_envs, hidden_size)
             if hidden_state[0] is not None:
                 self.hidden_states_h[self.seq_idx] = hidden_state[0]

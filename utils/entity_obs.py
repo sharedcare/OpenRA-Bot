@@ -7,13 +7,26 @@ where each actor is independently encoded (no fixed-size padding).
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict
 
 import numpy as np
 
 # Number of raw features per entity (see _encode_actor).
 ENTITY_FEATURE_DIM: int = 14
 MAX_ENTITIES: int = 128
+
+
+_STABLE_TYPE_IDS: Dict[str, int] = {
+    name: idx
+    for idx, name in enumerate([
+        'mcv', 'fact', 'powr', 'apwr', 'proc', 'harv', 'barr', 'tent',
+        'weap', 'dome', 'fix', 'afld', 'spen', 'syrd', 'hpad', 'eye',
+        'atek', 'stek', 'gap', 'gun', 'pbox', 'hbox', 'agun', 'sbiz',
+        'e1', 'e2', 'e3', 'e4', 'e6', 'e7', 'dog', 'spy', 'thf',
+        'medi', 'shok', 'gren', 'flmr', 'jeep', 'apc', '1tnk', '2tnk',
+        '3tnk', '4tnk', 'arty', 'mgg', 'mrj', 'mnly', 'lstr', 'c17',
+    ], start=1)
+}
 
 
 class EntityObservationBuilder:
@@ -81,7 +94,7 @@ class EntityObservationBuilder:
             9: can_produce         (1.0 if 'startproduction' available)
            10: can_deploy          (1.0 if 'deploytransform' available)
            11: is_idle             (1.0 if idle order present)
-           12: type_embed_idx      (hashed type string, 0-1 normalised)
+           12: type_embed_idx      (stable type id, 0-1 normalised)
            13: type_is_mcv         (1.0 if type == 'mcv')
         """
         owner = int(actor.get('owner', -1))
@@ -107,7 +120,7 @@ class EntityObservationBuilder:
             1.0 if 'startproduction' in orders else 0.0,         # 9: produce
             1.0 if 'deploytransform' in orders else 0.0,         # 10: deploy
             1.0 if 'idle' in order_str else 0.0,                 # 11: idle
-            float(hash(atype) % 1000) / 1000.0,                  # 12: type hash
+            cls._type_id_norm(atype),                             # 12: type id
             1.0 if atype == 'mcv' else 0.0,                      # 13: is_mcv
         ], dtype=np.float32)
 
@@ -166,3 +179,19 @@ class EntityObservationBuilder:
     @staticmethod
     def _is_infantry(atype: str, _orders: set) -> bool:
         return atype.startswith('e') or atype in {'dog', 'spy', 'thf', 'medi', 'shok', 'gren', 'flmr'}
+
+    @staticmethod
+    def _fallback_type_id(atype: str) -> int:
+        # Deterministic small hash.  Do not use Python's hash(), which is salted
+        # per process and breaks SubprocVecEnv consistency under spawn.
+        acc = 0
+        for ch in atype:
+            acc = (acc * 131 + ord(ch)) % 997
+        return 64 + acc
+
+    @classmethod
+    def _type_id_norm(cls, atype: str) -> float:
+        tid = _STABLE_TYPE_IDS.get(atype)
+        if tid is None:
+            tid = cls._fallback_type_id(atype)
+        return float(min(tid, 1023)) / 1023.0

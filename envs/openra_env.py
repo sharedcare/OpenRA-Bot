@@ -78,6 +78,11 @@ class OpenRAEnv(gym.Env):
         max_episode_ticks: Optional[int] = None,
         observation_type: str = "vector",
         enable_actions: Optional[List[str]] = None,
+        reward_mode: str = "asset",
+        decision_point_skip: bool = False,
+        max_skip_steps: int = 300,
+        action_space_mode: str = "multidiscrete",
+        headless: bool = False,
     ) -> None:
         super().__init__()
 
@@ -97,6 +102,17 @@ class OpenRAEnv(gym.Env):
             raise ValueError(f"Invalid observation type: {self.observation_type}")
         default_actions = ['noop', 'move', 'attack', 'produce', 'build', 'deploy']
         self.action_types: List[str] = enable_actions if enable_actions else default_actions
+
+        # Action-space mode. "macro" collapses the 6-head MultiDiscrete to a
+        # single meaningful categorical (action_type) whose entries directly
+        # name what to produce: ['noop', 'produce:powr', 'produce:e1', ...].
+        # MCV deploy and finished-building placement are handled automatically
+        # by auto_place, so the agent's only decision is *what to produce*.
+        # The remaining 5 heads are forced to index 0 via masks (deterministic,
+        # zero entropy) so the whole model/agent/buffer stack is reused as-is.
+        self.action_space_mode = action_space_mode if action_space_mode in ("multidiscrete", "macro") else "multidiscrete"
+        if self.action_space_mode == "macro":
+            self.action_types = ['noop'] + [f'produce:{t}' for t in self.MACRO_PRODUCE_TYPES]
 
         # Unit type mappings sourced from actors.csv if available
         self.unit_types: Dict[str, int] = {}
@@ -124,6 +140,16 @@ class OpenRAEnv(gym.Env):
         self._recent_actions: deque[Tuple] = deque(maxlen=256)
         self._action_ttl_steps: int = 8
         self.auto_place: bool = True
+        # Reward mode: "asset" (net-worth growth, dev-only headroom) or "legacy" (fixed BO shaping)
+        self.reward_mode = reward_mode if reward_mode in ("asset", "legacy") else "asset"
+        # Decision-point skipping: advance the sim through forced-noop ticks
+        # (only noop legal) so every gym step the agent sees is a real choice.
+        # Densifies the gradient signal ~10-20x for on-policy PPO.
+        self.decision_point_skip = bool(decision_point_skip)
+        self.max_skip_steps = int(max_skip_steps)
+        # Headless: run the engine with the no-op Null renderer (no window / GL).
+        # Required for parallel multi-process training (no OpenGL windows).
+        self.headless = bool(headless)
         # Reward shaping config and previous metrics snapshot
         self.reward_weights = {
             'unit': 0.3,
@@ -139,6 +165,19 @@ class OpenRAEnv(gym.Env):
             'deploy_bonus': 0.5,             # one-time reward when first building appears (MCV deployed)
             # Differential per-step rewards (only active during specific actions, NOT constant background)
             'producing_per_step': 0.005,     # reward per in-progress production item each step
+            # --- Asset-mode weights (reward_mode == "asset") ---
+            'asset_value': 1.0,              # weight on cost-weighted net-worth growth (per value_scale units)
+            'asset_value_scale': 1000.0,     # cost normalizer: a 1000-cost actor -> +1.0 reward
+            # Per-step penalties are OFF by default: they accumulate over episode
+            # length and swamp the one-time asset gains (breaking the telescoping
+            # net-worth signal). The asset reward already rewards spending cash on
+            # assets, so an idle-cash penalty is largely redundant. Re-enable with
+            # care (and keep tiny) only if hoarding/power-stall becomes a problem.
+            'idle_cash_penalty': 0.0,        # per-step penalty for hoarded cash above keep threshold
+            'idle_cash_keep': 1500.0,        # cash below this is "operating reserve", not penalized
+            'idle_cash_scale': 10000.0,      # cash normalizer for idle penalty
+            'power_deficit_penalty': 0.0,    # per-step penalty when drained power exceeds provided
+            'power_deficit_scale': 100.0,    # power normalizer
         }
         self._prev_metrics: Dict[str, Optional[float]] = {
             'units': None,
@@ -153,6 +192,8 @@ class OpenRAEnv(gym.Env):
         # Build-order progress tracker (DI-star inspired)
         self._bo_tracker = self.BuildOrderTracker(self.TARGET_BUILD_ORDER)
         self._prev_building_types: Set[str] = set()
+        # Asset-value tracker (reward_mode == "asset"): cost-weighted net-worth growth
+        self._asset_tracker = self.AssetValueTracker()
 
         # Remote join settings (optional)
         self.remote_host: Optional[str] = None
@@ -299,7 +340,7 @@ class OpenRAEnv(gym.Env):
         elif self.remote_host and self.remote_port:
             self._join_remote()
         else:
-            api.StartLocalGame(self.mod_id, self.map_uid, self.bin_dir, addBotOpponent=False, explored=True, fog=False)
+            api.StartLocalGame(self.mod_id, self.map_uid, self.bin_dir, addBotOpponent=False, explored=True, fog=False, headless=self.headless)
 
         # Build first observation and info
         raw = self._get_raw_state()
@@ -319,6 +360,16 @@ class OpenRAEnv(gym.Env):
         self._deployed_once = int(m.get('buildings', 0)) > 0
         # Reset build-order tracker for the new episode
         self._bo_tracker.reset()
+        self._asset_tracker.reset()
+        # Seed the asset tracker with actors that already exist at reset.  The
+        # reward should measure growth after the agent starts acting, not pay a
+        # one-time bonus for the starting MCV / already-created structures.
+        self._asset_tracker.seed_existing(raw)
+        # The first env.step may auto-deploy the initial MCV before the policy
+        # has a meaningful production choice.  Treat that post-reset bootstrap
+        # state as baseline too, otherwise the rollout has a fixed reward floor.
+        self._asset_seed_after_first_step = True
+        self._last_reward_components: Dict[str, float] = {}
         self._prev_building_types.clear()
         # Clear action dedup history so stale entries from the previous
         # episode (with higher world_tick) don't suppress actions in the
@@ -344,18 +395,78 @@ class OpenRAEnv(gym.Env):
 
         raw = self._get_raw_state()
         self._last_raw_state = raw
-        new_obs = self._state_to_observation(raw)
 
         reward = self._compute_reward(raw, action if isinstance(action, np.ndarray) else None)
         terminated = False
-        truncated = False
+        truncated = self._is_truncated(raw)
 
-        if self.max_episode_ticks is not None and int(raw.get('world_tick', 0)) >= self.max_episode_ticks:
-            truncated = True
+        # Decision-point skipping: when only noop is legal (forced production
+        # wait), keep advancing the simulation — accumulating reward — until a
+        # real choice appears, the episode ends, or the skip cap is hit. This
+        # collapses long forced-wait stretches so each gym step is an actual
+        # decision, giving PPO a far denser per-step gradient.
+        if self.decision_point_skip and not truncated:
+            skips = 0
+            while skips < self.max_skip_steps and not self._has_choice(raw):
+                for _ in range(self.ticks_per_step):
+                    api.Step()
+                skips += 1
+                raw = self._get_raw_state()
+                self._last_raw_state = raw
+                reward += self._compute_reward(raw, None)
+                if self._is_truncated(raw):
+                    truncated = True
+                    break
 
+        new_obs = self._state_to_observation(raw)
         info = self._make_info(raw)
         self._last_obs = new_obs
         return new_obs, reward, terminated, truncated, info
+
+    def _is_truncated(self, raw: Dict[str, Any]) -> bool:
+        if self.max_episode_ticks is None:
+            return False
+        return int(raw.get('world_tick', 0)) >= self.max_episode_ticks
+
+    def _has_choice(self, raw: Dict[str, Any]) -> bool:
+        """Cheap (raw-dict only, no engine feasibility calls) test for whether
+        the agent has any non-noop action available. Used by decision-point
+        skipping; must be fast since it runs every skipped tick.
+
+        A "choice" exists if any owned unit can move/deploy, any enabled queue
+        is empty with producibles (can start production), or any queue has a
+        Done item to place. This mirrors the action_type mask intent without
+        the expensive per-unit/per-cell engine checks.
+        """
+        try:
+            my_owner = int(raw.get('my_owner', -1))
+            actors = raw.get('actors') or []
+            for a in actors:
+                if int(a.get('owner', -1)) != my_owner or bool(a.get('dead', False)):
+                    continue
+                orders = a.get('available_orders') or []
+                for o in orders:
+                    ol = str(o).lower()
+                    if ol == 'move' or ol == 'deploytransform':
+                        return True
+            prod = raw.get('production') or {}
+            placeable = raw.get('placeable_areas') or {}
+            for q in (prod.get('Queues') or []):
+                if not bool(q.get('Enabled', False)):
+                    continue
+                items = q.get('Items') or []
+                # Done item that can be placed -> build choice
+                for it in items:
+                    if bool(it.get('Done', False)):
+                        name = str(it.get('Item') or it.get('Name') or '').lower()
+                        if placeable.get(name):
+                            return True
+                # Empty enabled queue with producibles -> produce choice
+                if len(items) < 1 and (q.get('Producible') or []):
+                    return True
+            return False
+        except Exception:
+            return True  # on error, treat as a decision (do not skip)
 
     def render(self):  # type: ignore[override]
         return None
@@ -385,6 +496,16 @@ class OpenRAEnv(gym.Env):
     # The BuildOrderTracker rewards the agent for matching this sequence
     # using a longest-common-subsequence metric (inspired by DI-star).
     TARGET_BUILD_ORDER: List[str] = ['powr', 'proc', 'barr']
+
+    # Fixed macro production menu for action_space_mode="macro" (dev-only).
+    # Stable RA type names spanning economy, defense, infantry, vehicles.
+    # action_type enum = ['noop'] + ['produce:<t>' for t in this list]; the env
+    # resolves the correct queue and issues StartProduction. Buildings then
+    # auto-place when done. Order is fixed so the action space stays constant.
+    MACRO_PRODUCE_TYPES: List[str] = [
+        'powr', 'proc', 'barr', 'tent', 'weap', 'dome', 'fix', 'apwr',
+        'e1', 'e3', 'e2', '1tnk', '2tnk', '3tnk', 'jeep', 'arty', 'harv',
+    ]
 
     class BuildOrderTracker:
         """Tracks build progress via longest matching subsequence to a target order.
@@ -429,6 +550,91 @@ class OpenRAEnv(gym.Env):
         @property
         def last_match(self) -> int:
             return self._last_match
+
+    class AssetValueTracker:
+        """Tracks cost-weighted net worth (sum of owned actor build costs).
+
+        reward = total build-cost of actors that newly appeared this step.
+
+        Unlike BuildOrderTracker this has NO cap: every new building AND every
+        new unit (soldier, harvester, tank) is rewarded by its production cost,
+        so a policy that keeps building economy/army strictly out-earns one that
+        stops after a fixed build order. Event-based (per actor id) so the signal
+        is stable even as the producible catalog reveals new costs over time.
+        """
+
+        # Fallback costs for actors that may never appear in the producible
+        # catalog (e.g. the starting MCV / construction yard). Approximate RA
+        # values; catalog-reported costs always override these when available.
+        SEED_COSTS: Dict[str, int] = {
+            'mcv': 1500, 'fact': 2500, 'powr': 300, 'apwr': 500,
+            'proc': 1400, 'harv': 1100, 'barr': 400, 'tent': 400,
+            'weap': 2000, 'dome': 1000, 'fix': 1200, 'afld': 500, 'spen': 650,
+            'e1': 100, 'e2': 160, 'e3': 300, 'e4': 200, 'e6': 500,
+            '1tnk': 700, '2tnk': 850, '3tnk': 950, '4tnk': 1500,
+            'jeep': 600, 'apc': 700, 'arty': 600, 'mcv.q': 1500,
+        }
+        DEFAULT_COST: int = 200  # unknown owned actor type
+
+        def __init__(self) -> None:
+            self._cost_by_type: Dict[str, int] = dict(self.SEED_COSTS)
+            self._counted_ids: Set[int] = set()
+
+        def reset(self) -> None:
+            # Learned per-type costs persist across episodes (they are static
+            # game data); only the per-episode counted-id set is cleared.
+            self._counted_ids.clear()
+
+        def ingest_catalog(self, catalog: Any) -> None:
+            for item in (catalog or []):
+                try:
+                    name = str(item.get('Name', '')).lower().strip()
+                    cost = int(item.get('Cost', 0) or 0)
+                except Exception:
+                    continue
+                if not name or cost <= 0:
+                    continue
+                cur = self._cost_by_type.get(name)
+                # Keep the smallest positive cost seen (cheapest producer).
+                if cur is None or cost < cur:
+                    self._cost_by_type[name] = cost
+
+        def cost_of(self, atype: str) -> int:
+            return self._cost_by_type.get(str(atype).lower().strip(), self.DEFAULT_COST)
+
+        def update(self, raw: Dict[str, Any]) -> float:
+            """Ingest catalog, then return summed cost of newly-owned actors."""
+            self.ingest_catalog(raw.get('producible_catalog'))
+            actors = raw.get('actors') or []
+            my_owner = int(raw.get('my_owner', -1))
+            gained = 0.0
+            for a in actors:
+                try:
+                    if int(a.get('owner', -1)) != my_owner or bool(a.get('dead', False)):
+                        continue
+                    aid = int(a.get('id', -1))
+                except Exception:
+                    continue
+                if aid < 0 or aid in self._counted_ids:
+                    continue
+                self._counted_ids.add(aid)
+                gained += float(self.cost_of(a.get('type', '')))
+            return gained
+
+        def seed_existing(self, raw: Dict[str, Any]) -> None:
+            """Mark currently owned actors as already counted without reward."""
+            self.ingest_catalog(raw.get('producible_catalog'))
+            actors = raw.get('actors') or []
+            my_owner = int(raw.get('my_owner', -1))
+            for a in actors:
+                try:
+                    if int(a.get('owner', -1)) != my_owner or bool(a.get('dead', False)):
+                        continue
+                    aid = int(a.get('id', -1))
+                except Exception:
+                    continue
+                if aid >= 0:
+                    self._counted_ids.add(aid)
 
     # Actor types that are always buildings regardless of available_orders.
     _BUILDING_TYPES: set = {'fact', 'powr', 'proc', 'barr', 'tent', 'weap',
@@ -500,6 +706,105 @@ class OpenRAEnv(gym.Env):
         }
 
     def _compute_reward(self, raw: Dict[str, Any], action: Optional[np.ndarray] = None) -> float:
+        if self.reward_mode == "asset":
+            return self._compute_asset_reward(raw)
+        return self._compute_legacy_reward(raw, action)
+
+    def _compute_asset_reward(self, raw: Dict[str, Any]) -> float:
+        """Dev-only net-worth reward: cost-weighted growth of owned actors.
+
+        No build-order cap — every new building/unit is paid by its build cost,
+        so persistent economy/army expansion strictly out-earns a fixed build
+        order. Small penalties discourage cash hoarding and power deficits.
+        """
+        w = self.reward_weights
+        if getattr(self, '_asset_seed_after_first_step', False):
+            self._asset_tracker.seed_existing(raw)
+            self._asset_seed_after_first_step = False
+            self._prev_prod_items = self._extract_production_items(raw)
+            self._last_reward_components = {
+                'asset_gained': 0.0,
+                'asset_reward': 0.0,
+                'production_start_reward': 0.0,
+                'production_active_reward': 0.0,
+                'production_cancel_penalty': 0.0,
+                'idle_cash_penalty': 0.0,
+                'power_deficit_penalty': 0.0,
+                'total': 0.0,
+                'seeded_bootstrap': 1.0,
+            }
+            return 0.0
+
+        # Main signal: summed cost of newly-owned actors, normalized.
+        gained = self._asset_tracker.update(raw)
+        asset_reward = w['asset_value'] * (gained / max(1.0, float(w['asset_value_scale'])))
+        rw = asset_reward
+        idle_penalty = 0.0
+        power_penalty = 0.0
+        production_start_reward = 0.0
+        production_active_reward = 0.0
+        production_cancel_penalty = 0.0
+
+        starts, cancels = self._diff_production_events(raw)
+        if starts > 0:
+            production_start_reward = self._production_start_reward(raw, starts)
+            rw += production_start_reward
+        if cancels > 0:
+            production_cancel_penalty = self._production_cancel_penalty(cancels)
+            rw -= production_cancel_penalty
+
+        prod = raw.get('production') or {}
+        active_items = 0
+        try:
+            for q in (prod.get('Queues', []) or []):
+                for it in (q.get('Items', []) or []):
+                    if not bool(it.get('Done', False)):
+                        active_items += 1
+        except Exception:
+            active_items = 0
+        production_active_reward = self.reward_weights.get('producing_per_step', 0.0) * float(active_items)
+        rw += production_active_reward
+
+        # Idle-cash penalty: discourage hoarding above operating reserve.
+        cash = raw.get('cash')
+        if cash is not None:
+            try:
+                excess = max(0.0, float(cash) - float(w['idle_cash_keep']))
+                idle_penalty = w['idle_cash_penalty'] * (excess / max(1.0, float(w['idle_cash_scale'])))
+                rw -= idle_penalty
+            except Exception:
+                pass
+
+        # Power-deficit penalty: stalled production when drained > provided.
+        power = raw.get('power') or {}
+        try:
+            deficit = max(0.0, float(power.get('drained', 0) or 0.0) - float(power.get('provided', 0) or 0.0))
+            if deficit > 0:
+                power_penalty = w['power_deficit_penalty'] * (deficit / max(1.0, float(w['power_deficit_scale'])))
+                rw -= power_penalty
+        except Exception:
+            pass
+
+        self._prev_prod_items = self._extract_production_items(raw)
+        metrics = self._compute_development_metrics(raw)
+        self._prev_metrics['units'] = float(metrics.get('units') or 0.0)
+        self._prev_metrics['buildings'] = float(metrics.get('buildings') or 0.0)
+        if metrics.get('cash') is not None:
+            self._prev_metrics['cash'] = float(metrics.get('cash') or 0.0)
+
+        self._last_reward_components = {
+            'asset_gained': float(gained),
+            'asset_reward': float(asset_reward),
+            'production_start_reward': float(production_start_reward),
+            'production_active_reward': float(production_active_reward),
+            'production_cancel_penalty': float(production_cancel_penalty),
+            'idle_cash_penalty': float(idle_penalty),
+            'power_deficit_penalty': float(power_penalty),
+            'total': float(rw),
+        }
+        return float(rw)
+
+    def _compute_legacy_reward(self, raw: Dict[str, Any], action: Optional[np.ndarray] = None) -> float:
         metrics = self._compute_development_metrics(raw)
         # Initialize if first call
         if self._prev_metrics['units'] is None:
@@ -638,6 +943,33 @@ class OpenRAEnv(gym.Env):
 
     # --- MultiDiscrete helpers ---
 
+    def _find_producer_for(self, wanted: str) -> Optional[int]:
+        """Return the queue actor id that can currently produce `wanted`, or None.
+
+        Picks an enabled queue whose Producible list contains the type and that
+        is not already occupied (mirrors RuleBasedAgent / the produce mask).
+        Used by macro action mode where the agent names a type and the env
+        resolves the queue.
+        """
+        wanted = str(wanted).lower().strip()
+        raw = self._last_raw_state or {}
+        prod = raw.get('production') or {}
+        candidates: List[int] = []
+        for q in (prod.get('Queues') or []):
+            try:
+                if not bool(q.get('Enabled', False)):
+                    continue
+                if len(q.get('Items') or []) >= 1:
+                    continue  # queue busy (single-item guard)
+                producible = [str(it.get('Name', '')).lower() for it in (q.get('Producible') or [])]
+                if wanted in producible:
+                    candidates.append(int(q.get('ActorId', -1)))
+            except Exception:
+                continue
+        if not candidates:
+            return None
+        return int(sorted(candidates)[0])
+
     def _execute_multidiscrete_action(self, action: np.ndarray) -> None:
         atype_idx, unit_idx, tx, ty, target_idx, unit_type_idx = [int(x) for x in action.tolist()]
         atype = self.action_types[atype_idx] if 0 <= atype_idx < len(self.action_types) else 'noop'
@@ -652,7 +984,21 @@ class OpenRAEnv(gym.Env):
         if self.auto_place:
             actions.extend(self._auto_place_done_items())
 
-        if atype == 'move':
+        if self.action_space_mode == "macro":
+            # Macro mode: action_type fully specifies the order. Only 'produce:<t>'
+            # does work (noop falls through). Auto-deploy/auto-place above handle
+            # MCV deploy and finished-building placement.
+            if atype.startswith('produce:'):
+                wanted = atype.split(':', 1)[1]
+                producer_id = self._find_producer_for(wanted)
+                if producer_id is not None:
+                    actions.append({
+                        'order': 'StartProduction',
+                        'subject': int(producer_id),
+                        'target_string': wanted,
+                        'queued': True,
+                    })
+        elif atype == 'move':
             # Move to cell
             actor_id = self._resolve_my_unit_id(unit_idx)
             actions.append({
@@ -712,8 +1058,11 @@ class OpenRAEnv(gym.Env):
                 tgt = a.get('target_string', '') or a.get('target_cell', '')
                 print(f"[action] {atype} → {order} subj={subj} tgt={tgt}", file=sys.stderr)
 
-        # Deduplicate recent identical actions
-        if actions:
+        # Deduplicate recent identical actions. Skip in macro mode: the
+        # single-item queue guard + action mask already prevent over-queueing,
+        # and dedup's TTL window otherwise blocks legitimate re-production
+        # (e.g. queuing another powr after the queue frees up).
+        if actions and self.action_space_mode != "macro":
             deduped: List[Dict[str, Any]] = []
             for a in actions:
                 sig = self._action_signature(a)
@@ -821,14 +1170,6 @@ class OpenRAEnv(gym.Env):
 
         base_pos = self._find_base_position()
 
-        try:
-            api = self._openra['Game']
-            player_actor_id = int(
-                api.OrderManager.World.LocalPlayer.PlayerActor.ActorID
-            )
-        except Exception:
-            return []
-
         place_orders: List[Dict[str, Any]] = []
         for q in queues:
             q_id = int(q.get("ActorId", -1))
@@ -852,7 +1193,7 @@ class OpenRAEnv(gym.Env):
 
                 place_orders.append({
                     "order": "PlaceBuilding",
-                    "subject": player_actor_id,
+                    "subject": q_id,
                     "target_cell": (int(best[0]), int(best[1])),
                     "target_string": name,
                     "extra_data": q_id,
@@ -1036,6 +1377,7 @@ class OpenRAEnv(gym.Env):
             'my_unit_count': len(my_units),
             'ally_unit_count': len(ally_units),
             'enemy_unit_count': len(enemy_units),
+            'reward_components': dict(getattr(self, '_last_reward_components', {}) or {}),
         }
         info["actors"] = [
             actor["type"] + str(actor["id"]) for actor in raw.get("actors", [])
@@ -1056,9 +1398,41 @@ class OpenRAEnv(gym.Env):
         info['action_mask'] = self._get_action_mask(raw, my_units, enemy_units)
         return info
 
+    def _get_macro_action_mask(self, raw: Dict[str, Any]) -> Dict[str, np.ndarray]:
+        """Action mask for action_space_mode='macro'.
+
+        Only the action_type head is meaningful (the other 5 heads collapse to
+        index 0 via the agent's dummy masks). action_type[0] is noop (always
+        legal); action_type[i] is 'produce:<t>' legal iff some enabled, empty
+        queue can currently produce that type.
+        """
+        n = len(self.action_types)
+        action_type_mask = np.zeros((n,), dtype=np.uint8)
+        action_type_mask[0] = 1  # noop always legal
+
+        prod = raw.get('production') or {}
+        producible_now: set = set()
+        for q in (prod.get('Queues') or []):
+            try:
+                if not bool(q.get('Enabled', False)) or len(q.get('Items') or []) >= 1:
+                    continue
+                for it in (q.get('Producible') or []):
+                    nm = str(it.get('Name', '')).lower()
+                    if nm:
+                        producible_now.add(nm)
+            except Exception:
+                continue
+
+        for i, atype in enumerate(self.action_types):
+            if atype.startswith('produce:') and atype.split(':', 1)[1] in producible_now:
+                action_type_mask[i] = 1
+        return {'action_type': action_type_mask}
+
     def _get_action_mask(
         self, raw: Dict[str, Any], my_units: List[Dict[str, Any]], enemy_units: List[Dict[str, Any]]
     ) -> Dict[str, np.ndarray]:
+        if self.action_space_mode == "macro":
+            return self._get_macro_action_mask(raw)
         max_units = 100
         move_mask = np.zeros((max_units,), dtype=np.uint8)
         deploy_mask = np.zeros((max_units,), dtype=np.uint8)

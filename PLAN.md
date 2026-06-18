@@ -5,6 +5,58 @@
 
 ---
 
+## 当前修订版路线 (2026-06-18)
+
+最近一轮实验已经把几个底层问题打通：短 rollout 的零 batch bug、asset reward 的生产 credit、macro action、auto-place、headless，以及 `SubprocVecEnv` 多进程 rollout。PPO 现在是真正在更新，且能稳定接近升级后的 `RuleBasedAgent`；UE4/KL0.03 repeat 可以冲到 `~0.106` peak reward，但最终 checkpoint 不一定最好。多组对照显示：仅靠当前弱脚本 teacher + 标量 asset reward + on-policy PPO，仍不能稳定、决定性地超过基线。
+
+### 当前结论
+
+- **已解决的问题**: PPO 更新链路、mask 崩溃、reward 过稀疏、produce/build/auto-place 闭环、headless rollout、多环境基础设施。
+- **当前最大瓶颈**: 缺少强行为先验和训练中锚点。当前 `RuleBasedAgent` 只是宏观生产脚本，不是会完整打局的专家。
+- **最新 repeat 结论**: PPO 能短暂找到更高 reward 策略，但会在后续 update 中漂移或被 KL early stop 截断；因此需要 best checkpoint 保存和 soft teacher-KL。
+- **DI-star 对比结论**: AlphaStar/DI-star 的发展能力主要来自人类 replay 监督学习、teacher-KL、目标条件化 `z`、多路 reward/value head、V-trace/UPGO 和对战信号；不是从零 PPO 靠单标量 reward 自动发现完整 RTS 发展。
+- **对 OpenRA.Bot 的含义**: 继续堆 PPO 超参、单纯加 rollout 长度或加模型规模，收益有限。下一阶段应先补“专家锚”和“目标可见性”。
+
+### 近期优先级
+
+1. **实验可观测性收口**
+   - 在 CSV 中稳定记录 action 分布、reward component、decision_steps、batches、early_stop、best/last20。
+   - 保存 best checkpoint，而不是只按固定 update 保存；当前 `model_0034.pth` 这类中途峰值可能优于最终 `model_0100.pth`。
+   - 固化 2-3 个标准对照脚本：no BC head、hard BC head、后续 soft teacher-KL。
+
+2. **强化专家基线**
+   - 继续迭代 `RuleBasedAgent`，让它至少覆盖红警基础开局：电厂、矿场、兵营、电厂、重工、持续步兵/车辆、补电、补矿。
+   - 避免把防御塔、墙、超级武器等短期噪声动作作为 teacher 主体。
+   - 用它生成更丰富的 BC 数据，但不要默认硬加载 action head。
+
+3. **Soft teacher-KL，而不是 hard BC action head**
+   - 保留一份 frozen teacher policy。
+   - PPO loss 中加入 `KL(policy || teacher)` 或 action-type KL，先只约束 macro action_type。
+   - KL 系数做退火：前期强，后期弱，目标是防塌缩但允许超过 teacher。
+   - 最近实验显示 hard loading BC action head 会导致 KL 偏高、early_stop 频繁、reward 下降，因此应改为软锚。
+
+4. **Goal conditioning / BO library**
+   - 准备手写 build-order 库，例如 economy、infantry、vehicle、balanced。
+   - 每局采样一个目标 `z`，把目标序列/目标统计编码进 observation 的 scalar。
+   - reward 从“猜一个隐含目标”改为“朝显式目标前进”，对齐 DI-star 的 `z` 条件训练思想。
+
+5. **奖励拆分和 value head 拆分**
+   - 先把日志和 reward components 拆清楚：asset、production、economy、army、combat、terminal。
+   - 再做多 value head，避免单 critic 同时拟合短期生产、长期经济、战斗和胜负。
+
+6. **加入对手和 combat/winloss**
+   - 发展-only asset reward 的余量已经很薄，当前 PPO 多数时间只是在复刻高效经济脚本。
+   - 要制造真正的学习余量，需要让“多造兵、侦察、进攻、防守”进入目标函数。
+   - 先从固定弱对手 + battle score / kill value / terminal win-loss 开始，不急着上完整 league。
+
+### 当前不优先
+
+- 不优先把模型马上扩大到 Transformer/LSTM 大架构；弱 teacher 和弱目标下，大模型只是更快拟合噪声。
+- 不优先继续大范围扫 PPO 超参；已有实验显示过保守会不动，过激会 KL 爆炸或 late collapse。
+- 不优先上完整 league/self-play；先把单对手、单地图、可解释 reward 和 teacher-KL 跑通。
+
+---
+
 ## 目录
 
 1. [架构总览](#1-架构总览)

@@ -2,7 +2,7 @@
 
 `OpenRA.Bot` is a Python-side RL/control package for [OpenRA](https://github.com/OpenRA/OpenRA). It uses `pythonnet` to load the built game assemblies, calls the engine-side `PythonAPI`, and exposes a Gym-style environment for random agents, rule-based agents, and a baseline PPO training loop.
 
-**Status (2026-06-15)**: PPO training is stable with both flat-vector and entity-based observations. Entity encoder achieves 94% BC accuracy with only 25K parameters (vs 580K for flat vector). The agent learns to match the RuleBasedAgent's build-order performance.
+**Status (2026-06-18)**: The PPO stack is technically working with entity observations, macro production actions, asset-value reward, headless mode, and spawned multi-environment rollout support. The current best development-only PPO runs can approach and sometimes slightly exceed the upgraded `RuleBasedAgent` on asset reward; repeated UE4/KL0.03 runs can reach `~0.106` peak reward, but do not reliably keep that policy through the final checkpoint. Recent experiments show that the main bottleneck is no longer a single bug in PPO, observation, or reward sparsity; it is the weak expert prior plus long-horizon RTS credit assignment under a mostly on-policy PPO setup.
 
 ## What Is In Scope
 
@@ -12,24 +12,30 @@
 - A custom `ActorCritic` + `PPOAgent` baseline with BC warm-start
 - Local game, local hosted lobby, and remote lobby connection helpers
 - Build-order distance reward (DI-star / AlphaStar inspired)
+- Asset-value reward with production-start / active-production credit
+- Macro production action space for development-only training
 - Decision-step policy gradient masking
 - Action masking with `-inf` penalty (prevents policy collapse)
 - Entity-based observations (Phase 1 — `observation_type="entity"`)
+- Headless local rollout and `SubprocVecEnv` multi-process training support
 
 ## Current Layout
 
-- `envs/openra_env.py`: main Gym environment (MCV type detection fix, BO reward, decision mask support)
+- `envs/openra_env.py`: main Gym environment (MCV type detection fix, BO / asset reward, macro actions, decision mask support)
+- `envs/vector_env.py`: spawned `SubprocVecEnv` wrapper for multi-process headless rollout
 - `envs/wrappers.py`: `ShapedRewardWrapper` (passthrough + diagnostics), `AugmentedStateWrapper` (frame stacking)
 - `utils/engine.py`: loads `OpenRA.Game.dll` and `PythonAPI` through `pythonnet`
 - `utils/obs.py`: converts `PythonAPI.GetState()` output into Python dictionaries
 - `utils/actions.py`: encodes Python action dicts into `RLAction`
 - `utils/net.py`: local host / remote join / lobby helpers
 - `utils/PythonAPI.cs`: engine bridge source (C#, reflection-based — **known fragility on ARM64**)
-- `agent/agent.py`: `RandomMoveAgent`, `RuleBasedAgent`, `PPOAgent` (BC warm-start + frozen encoder support)
+- `agent/agent.py`: `RandomMoveAgent`, upgraded `RuleBasedAgent`, `PPOAgent` (BC warm-start, diagnostics, vectorized rollout support)
 - `models/actor.py`: `VectorEncoder`, `AugmentedVectorEncoder`, `MultiDiscretePolicy`, `ActorCritic`
 - `models/buffer.py`: rollout buffer for PPO (recurrent + GAE)
-- `scripts/train_rl.py`: baseline PPO training entry (lr=3e-4, gamma=0.995, vf_coef=0.01)
+- `scripts/train_rl.py`: PPO training entry with entity / macro / headless / multi-env flags
+- `scripts/train_best.ps1`: current recommended Windows launcher for development-only PPO runs
 - `scripts/warmstart.py`: BC data collection + pre-training from RuleBasedAgent
+- `scripts/verify_asset_reward.py`: compares asset-reward headroom between rule-based development agents
 - `scripts/rl_smoke_test.py`: quick RL smoke test
 - `scripts/remote_rule_based.py`: join a remote lobby and run `RuleBasedAgent`
 - `scripts/remote_ppo.py`: join a remote lobby and inspect `PPOAgent` actions, masks, and queue state
@@ -91,6 +97,33 @@ Baseline PPO training:
 python scripts/train_rl.py
 ```
 
+Current recommended development-only PPO launcher on Windows:
+
+```powershell
+.\scripts\train_best.ps1 -Updates 100 -RunName stronger_teacher_no_head_repeat
+```
+
+Useful overrides:
+
+```powershell
+.\scripts\train_best.ps1 `
+  -Updates 150 `
+  -NumSteps 128 `
+  -MaxEpisodeTicks 1800 `
+  -LearningRate 7e-5 `
+  -TargetKl 0.03 `
+  -UpdateEpochs 4 `
+  -RunName ppo_asset_macro_repeat
+```
+
+The launcher uses `observation_type="entity"`, `action_space_mode="macro"`, `reward_mode="asset"` through the default environment, headless mode, BC warm-start from `RuleBasedAgent`, and does **not** load the BC action head unless `-LoadBcActionHead` is specified. Current experiments show that hard-loading the BC action head anchors PPO too strongly to the teacher's action mix and usually hurts training.
+
+Parallel rollout can be enabled from `train_rl.py`:
+
+```bash
+python scripts/train_rl.py --observation-type entity --action-space-mode macro --headless --num-envs 4
+```
+
 Remote rule-based control:
 
 ```bash
@@ -136,11 +169,12 @@ env.close()
 
 ## Observation Modes
 
-`OpenRAEnv` currently supports three observation modes:
+`OpenRAEnv` currently supports four observation modes:
 
 - `feature`: returns the raw Python dict built from `PythonAPI.GetState()`
 - `vector`: flattened numeric observation for MLP policies
 - `image`: `128 x 128 x 10` semantic map for CNN-style policies
+- `entity`: fixed-cap entity tensor plus scalar features for the current lightweight entity encoder
 
 ### `feature`
 
@@ -185,9 +219,19 @@ Current image layout:
   - enemy infantry / non-infantry
 - Channels for resources, cash, and power are not fully populated yet
 
+### `entity`
+
+This is the current default for new PPO experiments. It uses `utils/entity_obs.py` to build:
+
+- `entities`: up to `MAX_ENTITIES` actor rows with per-actor features
+- `entity_mask`: valid-row mask
+- `scalar`: compact economy / power / game-state features
+
+The lightweight entity encoder is enough to clone the current `RuleBasedAgent`, but PPO still plateaus near the teacher without a stronger training signal.
+
 ## Action Space
 
-The RL action space is currently:
+The default multidiscrete RL action space is:
 
 ```text
 [action_type, unit_idx, target_x, target_y, target_idx, unit_type_idx]
@@ -211,6 +255,14 @@ Semantics:
 - `deploy`: uses `unit_idx`
 
 The environment also accepts legacy Python dict actions, which is what the rule-based agent uses.
+
+For development-only training, `action_space_mode="macro"` collapses the meaningful decision to the `action_type` head:
+
+```text
+noop, produce:powr, produce:proc, produce:barr, produce:weap, produce:e1, ...
+```
+
+The remaining argument heads are masked to index 0. MCV deployment and finished-building placement are handled by environment automation. This was added because the original 6-head action space made successful production a low-probability joint event (`produce + correct queue + correct unit_type`), which was too hard to reinforce reliably in single-env PPO.
 
 ## Action Masks
 
@@ -251,15 +303,15 @@ Remaining limitation: `target_x` and `target_y` are still masked independently r
 
 ## Reward Shaping
 
-The default reward in `envs/openra_env.py` is development-oriented, not combat-oriented. It currently rewards and penalizes:
+The default reward in `envs/openra_env.py` is development-oriented, not combat-oriented. The current default `reward_mode="asset"` rewards:
 
-- increase in owned unit count
-- increase in owned building count
+- cost-weighted growth in owned actors (`AssetValueTracker`)
 - starting new production items
-- canceling in-progress production
-- staying below a minimum cash reserve
+- keeping production active
+- canceling in-progress production, as a penalty
+- optional idle-cash and power-deficit penalties, currently disabled by default because per-step penalties can swamp one-time asset gains
 
-This is useful for bootstrapping a macro baseline, but it is not enough on its own for strong tactical play.
+`reward_mode="legacy"` keeps the older build-order / unit-count shaping path. The asset reward fixes the capped `[powr, proc, barr]` build-order reward and makes army production visible, but it is still not enough on its own for strong tactical play or decisive improvement over a scripted macro teacher.
 
 ## Connection Modes
 
@@ -288,14 +340,23 @@ Recent bridge changes were specifically made to keep network traffic progressing
 - ~~MCV deploy reward=0~~ Fixed with type-based `_is_building` detection (ARM64 reflection bug workaround)
 - ~~Reward signal too sparse (0.7% non-zero)~~ Fixed with BO distance reward + producing_per_step (now 98%+ non-zero)
 - ~~Action mask penalty insufficient~~ Fixed: `log(clamp(1e-6))` → `-inf`
+- ~~Short rollout with `num_steps < seq_len` produced zero PPO batches~~ Fixed in `models/buffer.py`
+- ~~Macro action auto-placement could fail silently~~ Fixed: done buildings are placed by queue actor id
+- ~~Single-process-only rollout~~ Improved with headless `SubprocVecEnv` support
 
 ### Remaining
-- The PPO baseline trains stably but cannot significantly exceed RuleBasedAgent performance due to flat vector observation expressiveness
+- PPO can match the upgraded `RuleBasedAgent` and occasionally reaches higher asset reward, but does not yet decisively retain that improvement over long runs
+- The final checkpoint is often not the best checkpoint; best-model saving is now required for meaningful comparisons
+- Loading the BC action head directly is too strong an anchor and caused high-KL early stopping in recent runs
+- The current expert prior is still weak: it is a hand-written macro script, not a full-game expert with scouting, combat, tech transitions, or opponent adaptation
+- There is no soft teacher-KL regularizer yet; PPO either drifts unstably or is over-anchored by hard-loaded BC heads
+- There is no goal conditioning yet: build-order / strategy targets are not fed into the policy as an explicit `z`
+- Rewards are still scalar and development-heavy; there are no separate value heads for economy, army, combat, and win/loss
+- Combat and terminal win/loss training are still missing from the main training loop
 - `PythonAPI.GetState()` is expensive (scans all world state every call, heavy reflection usage)
 - `target_x` / `target_y` masking is still factorized rather than fully cell-joint
-- Single-environment training (multi-environment vectorization is planned for Phase 4)
 - `PythonAPI.cs` uses reflection to access `OpenRA.Mods.Common` types — fragile across OpenRA versions and platforms
-- Headless mode not yet implemented (required for multi-environment parallel training)
+- Multi-environment rollout works in headless mode, but Windows multiprocessing / CLR process management remains operationally fragile and needs more soak testing
 
 ## Known Hacks / TODOs
 
@@ -308,8 +369,10 @@ Recent bridge changes were specifically made to keep network traffic progressing
 - Use `feature` observations first when debugging action execution.
 - For remote debugging, start with `scripts/remote_rule_based.py` or `scripts/remote_ppo_debug.py` before running long PPO training jobs.
 - Treat the current PPO stack as a baseline to iterate on, not a final trainer.
-- If you are improving sample efficiency, first optimize state extraction and observation consistency before making the policy larger.
-- If you are improving policy quality, prioritize better state encoding and stricter action masking before switching to a more complex network.
+- For current PPO experiments, prefer `scripts/train_best.ps1` defaults: entity obs, macro actions, asset reward, headless, no BC action head.
+- Track `mean_reward`, `last20`, `KL`, `entropy`, `batches`, `decision_steps`, `atype_dist`, and `reward_comp`; reward alone hides collapse.
+- If policy quality is the goal, the next highest-leverage work is a stronger teacher / goal-conditioned strategy prior / soft teacher-KL, not a larger network.
+- If sample efficiency is the goal, optimize state extraction and keep hardening multi-env headless rollout.
 
 ## Troubleshooting
 
@@ -365,11 +428,11 @@ The current action space is `MultiDiscrete([action_type, unit_idx, target_x, tar
 
 **Target**: Cache reflection calls in static fields, use incremental state updates, and optimize spatial queries.
 
-#### 4. Single-Environment Training
+#### 4. Rollout Throughput and Sample Efficiency
 
-The PPO training loop is hardcoded for `num_envs=1` ([agent.py:665-666](agent/agent.py#L665-L666)). On-policy algorithms like PPO are extremely sample-inefficient with a single environment — collecting 2048 steps requires 20,480+ serial game ticks.
+`SubprocVecEnv` now supports spawned headless workers, so the old single-environment hard limit is gone. This improves wall-clock sample throughput, but recent 4-env and 8-env experiments still did not produce a decisive improvement over the scripted teacher. The remaining issue is algorithmic and task-level: on-policy PPO still has high variance on long-horizon RTS development, especially when the reward is development-only and the teacher already covers the easy macro path.
 
-**Target**: Support 8-64 parallel environments via Python multiprocessing.
+**Target**: Keep hardening 8-64 parallel environments, but pair scale with stronger priors, teacher-KL, goal conditioning, and combat / win-loss rewards.
 
 #### 5. Reward Design is Development-Only
 
@@ -403,7 +466,7 @@ Critically missing:
 | **Unit selection** | Fixed categorical over 100 slots | Attention-based pointer network over entity embeddings |
 | **Spatial target** | Independent x, y categoricals (validity broken) | 2D logits map with spatial masking |
 | **Network core** | MLP-based encoder + optional LSTM | Deep LSTM + Transformer + ResNet |
-| **Training parallelism** | Single environment (serial) | Thousands of parallel environments (TPU pods) |
+| **Training parallelism** | Headless `SubprocVecEnv` works at small scale; needs hardening and better sample efficiency | Thousands of parallel environments (TPU pods) |
 | **Opponents** | Single built-in bot | Self-play league with PFSP, historical agents, exploiter agents |
 | **Reward** | Development shaping only | Win/loss + game statistics |
 | **Pre-training** | None (random init) | Supervised pre-training on human/expert replays |

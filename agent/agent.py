@@ -65,21 +65,34 @@ class RandomMoveAgent(BaseAgent):
 
 class RuleBasedAgent(BaseAgent):
     """
-    A simple rule-based agent that:
-    1) If the only owned actor is an MCV, deploy it to a Construction Yard (fact).
-    2) Never attempt to deploy a 'fact'.
-    3) If a 'fact' exists and the producible catalog is non-empty, issue a StartProduction action.
-    4) Production order cycles through: powr -> proc -> tent/barr -> powr -> ...
-       Picks 'tent' if available in catalog otherwise 'barr'.
-    5) If any production queue item is Done==True, place it using PlaceableAreas.
+    Rule-based development teacher for early OpenRA/RA training.
+
+    It executes a stable economy opening, then keeps production queues active
+    with infantry/vehicle follow-ups.  The goal is not to be a strong game AI;
+    it is to provide a broader behavior prior than a three-building script.
     """
+
+    BLOCKED_PRODUCTION: Set[str] = {
+        "brik", "sbag", "fenc", "cycl", "barb", "wood", "mine",
+        "ftur", "gun", "pbox", "hbox", "tsla", "agun", "sam",
+        "iron", "pdox", "gap", "atek", "stek", "mslo",
+    }
+    TEACHER_PRODUCTION_ALLOWLIST: Set[str] = {
+        "powr", "apwr", "proc", "barr", "tent", "weap", "dome", "fix",
+        "e1", "e2", "e3", "e4", "e6", "1tnk", "2tnk", "3tnk", "jeep",
+        "arty", "harv",
+    }
 
     def __init__(self, seed: Optional[int] = None) -> None:
         self._rng = random.Random(seed)
-        # Index into production cycle
-        self._produce_idx: int = 0
-        # Fixed cycle with a placeholder token for barracks choice
-        self._produce_cycle: List[str] = ["powr", "proc", "barracks", "powr", "proc", "barracks"]
+        self._opening_idx: int = 0
+        self._fallback_idx: int = 0
+        self._infantry_idx: int = 0
+        self._vehicle_idx: int = 0
+        self._opening: List[str] = ["powr", "proc", "barracks", "powr", "weap"]
+        self._fallback_cycle: List[str] = ["proc", "powr", "barracks", "weap", "powr"]
+        self._infantry_cycle: List[str] = ["e1", "e1", "e3", "e1", "e2"]
+        self._vehicle_cycle: List[str] = ["1tnk", "2tnk", "jeep", "arty"]
 
     @staticmethod
     def _infer_my_owner(actors: List[Dict[str, Any]], hint: Optional[int]) -> Optional[int]:
@@ -124,13 +137,9 @@ class RuleBasedAgent(BaseAgent):
         if build_actions:
             return build_actions
 
-        # 3) Produce whenever we can see a valid production queue, even if the
-        # deployed MCV/building type naming differs from the hard-coded "fact".
-        catalog = self._get_production_catalog(obs)
-        if has_fact or catalog:
-            act = self._maybe_produce(obs, catalog)
-            if act is not None:
-                return [act]
+        production_action = self._maybe_produce(obs)
+        if production_action is not None:
+            return [production_action]
 
         return []
 
@@ -174,85 +183,27 @@ class RuleBasedAgent(BaseAgent):
                 continue
         return []
 
-    def _maybe_produce(self, obs: Dict[str, Any], catalog: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        # Allowed names
-        allowed = set()
-        for b in catalog:
-            nm = str(b.get("Name") or "").lower()
-            if nm:
-                allowed.add(nm)
-
-        # Choose producer: prefer factory queues
+    def _maybe_produce(self, obs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         production = obs.get("production") or {}
         queues = production.get("Queues") or []
         if not queues:
             return None
 
-        # Determine next item based on cycle and availability
-        choice = self._next_build_choice(allowed)
+        queue_infos = self._eligible_queues(queues)
+        if not queue_infos:
+            return None
+
+        choice = self._choose_production(obs, queue_infos)
         if choice is None:
             return None
+        subject_id, item = choice
 
-        # Build set of enabled producers that can produce `choice`
-        enabled_producers = set()
-        for q in queues:
-            try:
-                if not bool(q.get("Enabled", False)) or len(q.get("Items") or []) >= 1:
-                    continue
-                items = q.get("Producible") or []
-                if any(str(it.get("Name", "")).lower() == choice for it in items):
-                    enabled_producers.add(int(q.get("ActorId", -1)))
-            except Exception:
-                continue
-
-        # Prefer the queue actor ids reported by the production snapshot. These are
-        # the same actors used by the in-game production palette and are more
-        # reliable than guessing from visible actor type names alone.
-        if enabled_producers:
-            subject_id = int(sorted(enabled_producers)[0])
-        else:
-            subject_id = None
-
-        # Prefer my producers; among them prefer 'fact' type when we can match the
-        # queue actor id back to the visible actor list.
-        my_owner = int(obs.get("my_owner", -1))
-        my_producers = [
-            a
-            for a in (obs.get("actors") or [])
-            if int(a.get("owner", -1)) == my_owner and int(a.get("id", -1)) in enabled_producers
-        ]
-        if my_producers:
-            fact_like = [a for a in my_producers if str(a.get("type", "")).lower() == "fact"]
-            subject_id = int((fact_like[0] if fact_like else my_producers[0]).get("id", -1))
-
-        # Fallback only when queue reflection is completely unavailable. If queues are
-        # present but none are eligible, we should not issue a speculative order to a
-        # random visible actor because that can silently no-op or hit the wrong queue.
-        if subject_id is None and not queues:
-            my_owner = int(obs.get("my_owner", -1))
-            fact_actor = next(
-                (
-                    a for a in (obs.get("actors") or [])
-                    if int(a.get("owner", -1)) == my_owner and str(a.get("type", "")).lower() == "fact"
-                ),
-                None,
-            )
-            if fact_actor is not None:
-                subject_id = int(fact_actor.get("id", -1))
-
-        if subject_id is None or subject_id < 0:
-            return None
-
-        # Issue StartProduction
-        action = {
+        return {
             "order": "StartProduction",
             "subject": int(subject_id),
-            "target_string": choice,
+            "target_string": item,
             "queued": True,
         }
-        # Advance cycle after successful selection
-        self._advance_cycle()
-        return action
 
     @staticmethod
     def _get_production_catalog(obs: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -276,25 +227,135 @@ class RuleBasedAgent(BaseAgent):
                 })
         return derived
 
-    def _next_build_choice(self, allowed: Set[str]) -> Optional[str]:
-        # Try up to the cycle length to find a valid item
-        attempts = len(self._produce_cycle)
-        idx = self._produce_idx
-        for _ in range(attempts):
-            token = self._produce_cycle[idx % len(self._produce_cycle)]
-            if token == "barracks":
-                cand = "tent" if "tent" in allowed else ("barr" if "barr" in allowed else None)
-                if cand is not None:
-                    return cand
-            else:
-                if token in allowed:
-                    return token
-            idx += 1
-            # Do not advance persisted index yet; only after selection
+    @staticmethod
+    def _count_owned_types(obs: Dict[str, Any], my_owner: Optional[int]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for a in (obs.get("actors") or []):
+            try:
+                if my_owner is not None and int(a.get("owner", -1)) != int(my_owner):
+                    continue
+                if bool(a.get("dead", False)):
+                    continue
+                t = str(a.get("type", "")).lower()
+                if t:
+                    counts[t] = counts.get(t, 0) + 1
+            except Exception:
+                continue
+        return counts
+
+    @staticmethod
+    def _eligible_queues(queues: List[Dict[str, Any]]) -> List[Tuple[int, Set[str]]]:
+        out: List[Tuple[int, Set[str]]] = []
+        for q in queues:
+            try:
+                if not bool(q.get("Enabled", False)) or len(q.get("Items") or []) >= 1:
+                    continue
+                q_actor = int(q.get("ActorId", -1))
+                producible = {
+                    str(it.get("Name", "")).lower()
+                    for it in (q.get("Producible") or [])
+                    if str(it.get("Name", "")).strip()
+                }
+                producible -= RuleBasedAgent.BLOCKED_PRODUCTION
+                producible &= RuleBasedAgent.TEACHER_PRODUCTION_ALLOWLIST
+                if q_actor >= 0 and producible:
+                    out.append((q_actor, producible))
+            except Exception:
+                continue
+        return out
+
+    @staticmethod
+    def _resolve_alias(item: str, allowed: Set[str]) -> Optional[str]:
+        if item == "barracks":
+            if "tent" in allowed:
+                return "tent"
+            if "barr" in allowed:
+                return "barr"
+            return None
+        return item if item in allowed else None
+
+    @staticmethod
+    def _find_queue_for(item: str, queue_infos: List[Tuple[int, Set[str]]]) -> Optional[int]:
+        for q_actor, allowed in sorted(queue_infos, key=lambda x: x[0]):
+            if item in allowed:
+                return q_actor
         return None
 
-    def _advance_cycle(self) -> None:
-        self._produce_idx = (self._produce_idx + 1) % len(self._produce_cycle)
+    def _choose_from_cycle(
+        self,
+        cycle: List[str],
+        start_idx: int,
+        queue_infos: List[Tuple[int, Set[str]]],
+    ) -> Tuple[Optional[Tuple[int, str]], int]:
+        if not cycle:
+            return None, start_idx
+        for offset in range(len(cycle)):
+            idx = (start_idx + offset) % len(cycle)
+            token = cycle[idx]
+            for q_actor, allowed in sorted(queue_infos, key=lambda x: x[0]):
+                item = self._resolve_alias(token, allowed)
+                if item is not None:
+                    return (q_actor, item), (idx + 1) % len(cycle)
+        return None, start_idx
+
+    def _choose_production(
+        self,
+        obs: Dict[str, Any],
+        queue_infos: List[Tuple[int, Set[str]]],
+    ) -> Optional[Tuple[int, str]]:
+        my_owner = self._infer_my_owner(obs.get("actors", []) or [], obs.get("my_owner"))
+        counts = self._count_owned_types(obs, my_owner)
+
+        # Complete a compact RA opening first. This unlocks economy, infantry,
+        # and vehicle production for broader demonstrations.
+        for _ in range(len(self._opening)):
+            token = self._opening[self._opening_idx % len(self._opening)]
+            already_have = False
+            if token == "barracks":
+                already_have = counts.get("barr", 0) + counts.get("tent", 0) > 0
+            else:
+                already_have = counts.get(token, 0) > 0
+            if already_have:
+                self._opening_idx = (self._opening_idx + 1) % len(self._opening)
+                continue
+            choice, next_idx = self._choose_from_cycle([token], 0, queue_infos)
+            if choice is not None:
+                self._opening_idx = (self._opening_idx + 1) % len(self._opening)
+                return choice
+            break
+
+        # If multiple queues are free, keep combat production busy first. This
+        # creates the post-opening army-value behavior missing from the old BC.
+        infantry_choice, next_i = self._choose_from_cycle(
+            self._infantry_cycle, self._infantry_idx, queue_infos
+        )
+        vehicle_choice, next_v = self._choose_from_cycle(
+            self._vehicle_cycle, self._vehicle_idx, queue_infos
+        )
+
+        if vehicle_choice is not None and counts.get("weap", 0) > 0:
+            self._vehicle_idx = next_v
+            return vehicle_choice
+        if infantry_choice is not None and (counts.get("barr", 0) + counts.get("tent", 0) > 0):
+            self._infantry_idx = next_i
+            return infantry_choice
+
+        # Keep economy/power progressing when no combat queue is available.
+        fallback_choice, next_f = self._choose_from_cycle(
+            self._fallback_cycle, self._fallback_idx, queue_infos
+        )
+        if fallback_choice is not None:
+            self._fallback_idx = next_f
+            return fallback_choice
+
+        # Last resort: pick the cheapest-looking common unit/building by a
+        # stable priority order so the queue does not sit idle.
+        priority = ["e1", "e3", "1tnk", "2tnk", "powr", "proc", "weap", "barr", "tent"]
+        for item in priority:
+            q_actor = self._find_queue_for(item, queue_infos)
+            if q_actor is not None:
+                return q_actor, item
+        return None
 
 
 class PPOAgent(BaseAgent):
@@ -347,6 +408,27 @@ class PPOAgent(BaseAgent):
             return {}
         return dict(mask)
 
+    @staticmethod
+    def _stack_env_masks(infos, num_envs: int, device) -> Dict[str, Any]:
+        """Stack per-env action masks (from a list of info dicts) into
+        (num_envs, *mask_shape) tensors for vectorized rollout."""
+        mask_dicts = [
+            (inf.get("action_mask") or {}) if isinstance(inf, dict) else {}
+            for inf in infos
+        ]
+        keys: set = set()
+        for md in mask_dicts:
+            keys.update(md.keys())
+        out: Dict[str, Any] = {}
+        for k in keys:
+            try:
+                arrs = [np.asarray(md.get(k)) for md in mask_dicts]
+                stacked = np.stack(arrs, axis=0)  # (num_envs, *mask_shape)
+                out[k] = torch.as_tensor(stacked, device=device, dtype=torch.float32)
+            except Exception:
+                pass
+        return out
+
     def _action_type_index(self, name: str) -> Optional[int]:
         try:
             return self.action_types.index(name)
@@ -367,6 +449,11 @@ class PPOAgent(BaseAgent):
         mask = mask.to(device=device, dtype=torch.float32)
         if mask.dim() == 1:
             mask = mask.unsqueeze(0)
+        if mask.dim() == 2 and mask.shape[-1] > 0:
+            empty_rows = mask.sum(dim=-1) <= 0.0
+            if empty_rows.any():
+                mask = mask.clone()
+                mask[empty_rows, 0] = 1.0
         return mask
 
     @staticmethod
@@ -616,6 +703,10 @@ class PPOAgent(BaseAgent):
                     "entropy_mean",
                     "policy_loss",
                     "value_loss",
+                    "num_batches",
+                    "rollout_steps",
+                    "decision_steps",
+                    "grad_norm",
                 ]
             )
 
@@ -630,6 +721,10 @@ class PPOAgent(BaseAgent):
         entropy_mean: float,
         policy_loss: float,
         value_loss: float,
+        num_batches: int,
+        rollout_steps: int,
+        decision_steps: int,
+        grad_norm: float,
     ) -> None:
         if not log_path:
             return
@@ -645,6 +740,10 @@ class PPOAgent(BaseAgent):
                     f"{entropy_mean:.6f}",
                     f"{policy_loss:.6f}",
                     f"{value_loss:.6f}",
+                    num_batches,
+                    rollout_steps,
+                    decision_steps,
+                    f"{grad_norm:.6f}",
                 ]
             )
 
@@ -668,8 +767,12 @@ class PPOAgent(BaseAgent):
         checkpoint_fn: Optional[Callable[[int, Any], None]] = None,
         log_path: Optional[str] = None,
     ) -> None:
-        if num_envs != 1:
-            raise NotImplementedError("The current PPO training loop only supports num_envs=1.")
+        # num_envs>1 requires a vectorized env (SubprocVecEnv) exposing n_envs.
+        is_vec = hasattr(env, "n_envs")
+        if is_vec:
+            num_envs = int(env.n_envs)
+        elif num_envs != 1:
+            raise NotImplementedError("num_envs>1 requires a SubprocVecEnv (pass the vec env).")
         device = torch.device(self.device)
         self.model.to(device)
         self.action_types = list(getattr(env, "action_types", self.action_types))
@@ -724,79 +827,155 @@ class PPOAgent(BaseAgent):
             buffer.reset()
             hidden_states = self.model.init_hidden(num_envs, device)
             rollout_rewards: List[float] = []
+            rollout_reward_components: Dict[str, List[float]] = {}
             action_type_counts: Dict[int, int] = {}
 
-            while not buffer.is_full:
-                if isinstance(obs, dict):
-                    x = {k: torch.as_tensor(v, device=device).unsqueeze(0)
-                         for k, v in obs.items()}
-                else:
-                    x = torch.as_tensor(obs, device=device)
-                    if x.dim() == 1:
-                        x = x.unsqueeze(0)
-                rollout_hidden = hidden_states
-                if self.use_lstm and hidden_states is not None:
-                    rollout_hidden = tuple(h.clone() if h is not None else None for h in hidden_states)
-
-                with torch.no_grad():
-                    if self.use_lstm:
-                        logits, values, hidden_states = self.model(x, hidden_states, seq_len=1)
+            if is_vec:
+                # ---- vectorized rollout: num_envs headless engines in parallel ----
+                while not buffer.is_full:
+                    if isinstance(obs, dict):
+                        x = {k: torch.as_tensor(v, device=device) for k, v in obs.items()}
                     else:
-                        logits, values, _ = self.model(x, seq_len=1)
+                        x = torch.as_tensor(obs, device=device)
+                    rollout_hidden = hidden_states
+                    if self.use_lstm and hidden_states is not None:
+                        rollout_hidden = tuple(h.clone() if h is not None else None for h in hidden_states)
 
-                raw_mask = self._policy_masks((info.get("action_mask") or {}) if isinstance(info, dict) else {})
-                masks_t = self._mask_to_tensors(raw_mask)
+                    with torch.no_grad():
+                        if self.use_lstm:
+                            logits, values, hidden_states = self.model(x, hidden_states, seq_len=1)
+                        else:
+                            logits, values, _ = self.model(x, seq_len=1)
 
-                actions_t, per_head_logps = self._sample_action(logits, raw_masks=masks_t)
-                actions_np = actions_t.cpu().numpy()
-                action_for_env = actions_np[0] if actions_np.ndim > 1 else actions_np
+                    masks_t = self._stack_env_masks(info, num_envs, device)
+                    actions_t, per_head_logps = self._sample_action(logits, raw_masks=masks_t)
+                    actions_np = actions_t.cpu().numpy()
+                    if actions_np.ndim == 1:
+                        actions_np = actions_np[None, :]
 
-                next_obs, reward, terminated, truncated, next_info = env.step(action_for_env)
-                rewards = np.array([reward], dtype=np.float32)
-                dones = np.array([terminated or truncated], dtype=bool)
-                rollout_rewards.append(float(reward))
+                    next_obs, rewards, terminated, truncated, next_info = env.step(
+                        [actions_np[i] for i in range(num_envs)]
+                    )
+                    dones = np.logical_or(np.asarray(terminated), np.asarray(truncated))
+                    rollout_rewards.extend(float(r) for r in rewards)
+                    for inf in next_info:
+                        comps = (inf.get("reward_components") or {}) if isinstance(inf, dict) else {}
+                        for k, v in comps.items():
+                            try:
+                                rollout_reward_components.setdefault(k, []).append(float(v))
+                            except Exception:
+                                pass
 
-                action_type = int(action_for_env[0]) if np.ndim(action_for_env) > 0 else int(action_for_env)
-                action_type_counts[action_type] = action_type_counts.get(action_type, 0) + 1
+                    for i in range(num_envs):
+                        at = int(actions_np[i, 0])
+                        action_type_counts[at] = action_type_counts.get(at, 0) + 1
 
-                logprobs_np = np.array([sum(float(lp.item()) for lp in per_head_logps.values())], dtype=np.float32)
-                values_np = values.detach().cpu().numpy().reshape(-1)
-                if values_np.shape[0] != num_envs:
-                    values_np = np.pad(values_np[:num_envs], (0, max(0, num_envs - values_np.shape[0])))
+                    logprobs_np = np.zeros(num_envs, dtype=np.float32)
+                    for lp in per_head_logps.values():
+                        logprobs_np += lp.detach().cpu().numpy().reshape(-1)[:num_envs]
+                    values_np = values.detach().cpu().numpy().reshape(-1)[:num_envs]
 
-                buffer.add(
-                    obs=obs,
-                    actions=actions_np,
-                    rewards=rewards,
-                    dones=dones,
-                    values=values_np,
-                    logprobs=logprobs_np,
-                    masks=masks_t,
-                    hidden_state=rollout_hidden,
-                )
-
-                if self.use_lstm and hidden_states[0] is not None:
-                    done_mask = torch.tensor(dones.astype(np.float32), device=device).view(1, -1, 1)
-                    hidden_states = (
-                        hidden_states[0] * (1 - done_mask),
-                        hidden_states[1] * (1 - done_mask),
+                    buffer.add(
+                        obs=obs,
+                        actions=actions_np,
+                        rewards=np.asarray(rewards, dtype=np.float32),
+                        dones=dones,
+                        values=values_np,
+                        logprobs=logprobs_np,
+                        masks=masks_t,
+                        hidden_state=rollout_hidden,
                     )
 
-                if dones[0]:
-                    obs, info = env.reset()
-                    if self.use_lstm:
-                        hidden_states = self.model.init_hidden(num_envs, device)
-                else:
+                    if self.use_lstm and hidden_states[0] is not None:
+                        done_mask = torch.tensor(dones.astype(np.float32), device=device).view(1, -1, 1)
+                        hidden_states = (
+                            hidden_states[0] * (1 - done_mask),
+                            hidden_states[1] * (1 - done_mask),
+                        )
+                    # SubprocVecEnv auto-resets done envs in the worker; no manual reset.
                     obs = next_obs
                     info = next_info
+            else:
+                while not buffer.is_full:
+                    if isinstance(obs, dict):
+                        x = {k: torch.as_tensor(v, device=device).unsqueeze(0)
+                             for k, v in obs.items()}
+                    else:
+                        x = torch.as_tensor(obs, device=device)
+                        if x.dim() == 1:
+                            x = x.unsqueeze(0)
+                    rollout_hidden = hidden_states
+                    if self.use_lstm and hidden_states is not None:
+                        rollout_hidden = tuple(h.clone() if h is not None else None for h in hidden_states)
+
+                    with torch.no_grad():
+                        if self.use_lstm:
+                            logits, values, hidden_states = self.model(x, hidden_states, seq_len=1)
+                        else:
+                            logits, values, _ = self.model(x, seq_len=1)
+
+                    raw_mask = self._policy_masks((info.get("action_mask") or {}) if isinstance(info, dict) else {})
+                    masks_t = self._mask_to_tensors(raw_mask)
+
+                    actions_t, per_head_logps = self._sample_action(logits, raw_masks=masks_t)
+                    actions_np = actions_t.cpu().numpy()
+                    action_for_env = actions_np[0] if actions_np.ndim > 1 else actions_np
+
+                    next_obs, reward, terminated, truncated, next_info = env.step(action_for_env)
+                    rewards = np.array([reward], dtype=np.float32)
+                    dones = np.array([terminated or truncated], dtype=bool)
+                    rollout_rewards.append(float(reward))
+                    comps = (next_info.get("reward_components") or {}) if isinstance(next_info, dict) else {}
+                    for k, v in comps.items():
+                        try:
+                            rollout_reward_components.setdefault(k, []).append(float(v))
+                        except Exception:
+                            pass
+
+                    action_type = int(action_for_env[0]) if np.ndim(action_for_env) > 0 else int(action_for_env)
+                    action_type_counts[action_type] = action_type_counts.get(action_type, 0) + 1
+
+                    logprobs_np = np.array([sum(float(lp.item()) for lp in per_head_logps.values())], dtype=np.float32)
+                    values_np = values.detach().cpu().numpy().reshape(-1)
+                    if values_np.shape[0] != num_envs:
+                        values_np = np.pad(values_np[:num_envs], (0, max(0, num_envs - values_np.shape[0])))
+
+                    buffer.add(
+                        obs=obs,
+                        actions=actions_np,
+                        rewards=rewards,
+                        dones=dones,
+                        values=values_np,
+                        logprobs=logprobs_np,
+                        masks=masks_t,
+                        hidden_state=rollout_hidden,
+                    )
+
+                    if self.use_lstm and hidden_states[0] is not None:
+                        done_mask = torch.tensor(dones.astype(np.float32), device=device).view(1, -1, 1)
+                        hidden_states = (
+                            hidden_states[0] * (1 - done_mask),
+                            hidden_states[1] * (1 - done_mask),
+                        )
+
+                    if dones[0]:
+                        obs, info = env.reset()
+                        if self.use_lstm:
+                            hidden_states = self.model.init_hidden(num_envs, device)
+                    else:
+                        obs = next_obs
+                        info = next_info
 
             with torch.no_grad():
                 if isinstance(obs, dict):
-                    x = {k: torch.as_tensor(v, device=device).unsqueeze(0)
-                         for k, v in obs.items()}
+                    if is_vec:
+                        x = {k: torch.as_tensor(v, device=device) for k, v in obs.items()}
+                    else:
+                        x = {k: torch.as_tensor(v, device=device).unsqueeze(0)
+                             for k, v in obs.items()}
                 else:
                     x = torch.as_tensor(obs, device=device)
-                    if x.dim() == 1:
+                    if not is_vec and x.dim() == 1:
                         x = x.unsqueeze(0)
                 if self.use_lstm:
                     _, last_v, _ = self.model(x, hidden_states, seq_len=1)
@@ -810,6 +989,8 @@ class PPOAgent(BaseAgent):
             entropy_values: List[float] = []
             policy_loss_values: List[float] = []
             value_loss_values: List[float] = []
+            grad_norm_values: List[float] = []
+            num_batches = 0
             stop_early = False
 
             for _ in range(update_epochs):
@@ -893,15 +1074,17 @@ class PPOAgent(BaseAgent):
                         # action_type_mask after reshape: (B*N*L, n_actions)
                         n_valid = action_type_mask.sum(dim=-1)
                         decision_mask = (n_valid > 1.0).float()
+                        # Reshaped masks are flattened in (B, N, L) order, matching
+                        # mb_attention_mask after its permute above — no extra permute.
                         decision_mask = decision_mask.view(batch_size, num_envs, seq_len)
-                        decision_mask = decision_mask.permute(0, 2, 1).float()  # (B, L, N)
                         decision_valid = (decision_mask * mb_attention_mask).sum().clamp_min(1)
                     else:
                         decision_mask = mb_attention_mask
                         decision_valid = valid_steps
 
                     ratio = torch.exp(new_logp - mb_old_logprobs)
-                    approx_kl = ((mb_old_logprobs - new_logp) * mb_attention_mask).sum() / valid_steps
+                    logratio = new_logp - mb_old_logprobs
+                    approx_kl = (((ratio - 1.0) - logratio) * mb_attention_mask).sum() / valid_steps
                     unclipped = ratio * mb_advantages
                     clipped = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * mb_advantages
                     policy_loss = -(torch.min(unclipped, clipped) * mb_attention_mask * decision_mask).sum() / decision_valid
@@ -912,13 +1095,15 @@ class PPOAgent(BaseAgent):
 
                     optimizer.zero_grad()
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
                     optimizer.step()
 
+                    num_batches += 1
                     approx_kl_values.append(float(approx_kl.item()))
                     entropy_values.append(float(((entropy * mb_attention_mask).sum() / valid_steps).item()))
                     policy_loss_values.append(float(policy_loss.item()))
                     value_loss_values.append(float(value_loss.item()))
+                    grad_norm_values.append(float(grad_norm.item() if hasattr(grad_norm, "item") else grad_norm))
 
                     if target_kl > 0 and approx_kl.item() > target_kl:
                         stop_early = True
@@ -934,13 +1119,30 @@ class PPOAgent(BaseAgent):
             entropy_mean = float(np.mean(entropy_values)) if entropy_values else 0.0
             policy_loss_mean = float(np.mean(policy_loss_values)) if policy_loss_values else 0.0
             value_loss_mean = float(np.mean(value_loss_values)) if value_loss_values else 0.0
+            grad_norm_mean = float(np.mean(grad_norm_values)) if grad_norm_values else 0.0
             mask_mean = buffer.get_mask_statistics()
+            rollout_steps = int(buffer.step_idx * num_envs)
+            decision_steps_count = rollout_steps
+            if buffer.masks_initialized and "action_type" in buffer.masks:
+                try:
+                    valid_action_counts = buffer.masks["action_type"][:buffer.step_idx].sum(dim=-1)
+                    decision_steps_count = int((valid_action_counts > 1.0).sum().item())
+                except Exception:
+                    decision_steps_count = rollout_steps
+            comp_mean = {
+                k: float(np.mean(v))
+                for k, v in rollout_reward_components.items()
+                if v
+            }
 
             print(
                 f"[PPO] update={update+1} mean_reward={mean_reward:.4f} std={std_reward:.4f} nz={nz_frac:.3f} "
                 f"KL={approx_kl_mean:.5f} entropy={entropy_mean:.4f} ploss={policy_loss_mean:.4f} "
                 f"vloss={value_loss_mean:.4f} atype_dist={action_type_counts} "
-                f"mask_mean={mask_mean if mask_mean is not None else 'n/a'}"
+                f"batches={num_batches} decision_steps={decision_steps_count}/{rollout_steps} "
+                f"grad_norm={grad_norm_mean:.4f} "
+                f"mask_mean={mask_mean if mask_mean is not None else 'n/a'} "
+                f"reward_comp={comp_mean if comp_mean else 'n/a'}"
                 f"{' early_stop=1' if stop_early else ''}"
             )
             self._append_log_row(
@@ -953,6 +1155,10 @@ class PPOAgent(BaseAgent):
                 entropy_mean,
                 policy_loss_mean,
                 value_loss_mean,
+                num_batches,
+                rollout_steps,
+                decision_steps_count,
+                grad_norm_mean,
             )
 
             if checkpoint_fn is not None:
