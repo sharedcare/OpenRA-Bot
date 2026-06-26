@@ -1,5 +1,23 @@
 # CLAUDE.md — OpenRA-Bot Project Guide
 
+## Next Session Handoff
+
+Current finding: `repeat_best_logging` reached `best=0.1052@31` but finished at `0.0463`. PPO can find good intermediate macro policies, but loses them later even without KL explosion.
+
+Do next:
+
+1. Add best-checkpoint and richer CSV logging before running more PPO.
+   - Save `model_best.pth`
+   - Write `best_metrics.json`
+   - Add CSV fields: `early_stop`, `last20_reward`, `best_reward`, `best_update`, `mask_mean`, `atype_dist`, `reward_comp`
+2. Validate with:
+   ```powershell
+   .\scripts\train_best.ps1 -Updates 100 -RunName best_ckpt_smoke
+   ```
+3. Then implement soft teacher-KL for macro `action_type`.
+   - Do not hard-load BC action head by default.
+   - Start with `teacher_kl_coef=0.05`, decay to `0.005` over `50` updates.
+
 ## Quick Start
 
 ```bash

@@ -1,6 +1,6 @@
 # OpenRA-Bot 实验报告
 
-> **日期**: 2026-06-15，更新至 2026-06-18
+> **日期**: 2026-06-15，更新至 2026-06-26
 > **状态**: PPO 链路已经可训练，entity obs、macro action、asset reward、headless 和多环境 rollout 均已打通。最新瓶颈不是单一 bug，而是弱专家先验、缺少 teacher-KL / goal-conditioning，以及 RTS 长周期 credit assignment。
 
 ## 目录
@@ -326,6 +326,7 @@ cd F:\Projects\OpenRA\OpenRA.Bot
 | 强化 RuleBased teacher + hard BC head | `stronger_teacher_with_head_100` | `reward=0.0455`, `last20=0.0392`, `KL=0.8674`, `early=100/100` | 直接加载 BC action head 会过度锚定且触发高 KL early stop，不推荐 |
 | 强化 RuleBased teacher + no BC head | `stronger_teacher_no_head_100` | `reward=0.0679`, `last20=0.0706`, `KL=0.0324`, `early=40/100` | 当前最好趋势，但仍不够稳定 |
 | UE4/KL0.03 repeat | `stronger_teacher_no_head_repeat_ue4_kl003` | `reward=0.0697`, `last20=0.0645`, `best=0.1062@34`, `KL=0.0400`, `early=56/100` | 全程均值略高、峰值持平略高，但尾段不如上一组；说明能冲高但不能稳定保持 |
+| Best logging repeat | `repeat_best_logging` | `reward=0.0577`, `last20=0.0476`, `best=0.1052@31`, `final=0.0463`, `KL=0.0154`, `early=12/100` | 再次验证中途会出现高分策略，但低 KL 下仍会逐步漂回低收益策略；最终 checkpoint 明显不是最佳 |
 | 降低 LR | `lr=5e-5`, 150 updates | `reward=0.0663`, `last20=0.0667`, `KL=0.0468`, `early=95/150` | 降 LR 没解决稳定性，略弱于当前最好 |
 | 减少 update epochs | `target_kl=0.05`, `UpdateEpochs=2` | `reward=0.0563`, `last20=0.0592`, `KL=0.0118` | 更稳但学习弱 |
 | `UpdateEpochs=3` 对照 | `target_kl=0.05`, `UpdateEpochs=3` | `reward=0.0415`, `last20=0.0397`, `KL=0.1010`, entropy 偏高 | 训练退化，出现接近随机/高熵的失败形态 |
@@ -334,8 +335,18 @@ cd F:\Projects\OpenRA\OpenRA.Bot
 
 - `stronger_teacher_no_head_100`: `mean=0.0679`, `last20=0.0706`, `best=0.1060@69`, `early=40/100`，尾段保持更好。
 - `stronger_teacher_no_head_repeat_ue4_kl003`: `mean=0.0697`, `last20=0.0645`, `best=0.1062@34`, `early=56/100`，全程均值略高但后半段更抖。
+- `repeat_best_logging`: `mean=0.0577`, `last20=0.0476`, `best=0.1052@31`, `final=0.0463`, `early=12/100`，前期能冲高，但随后稳定退回低收益区间。
 
-这说明 asset reward + macro action + 更强脚本 teacher 的方向是有效的，但 PPO 并没有稳定收敛到高 reward 策略；它更像是在几个可行策略模式之间跳动。当前最该补的是 **best checkpoint 保存** 和 **soft teacher-KL**，否则高分策略会被后续更新洗掉。
+这说明 asset reward + macro action + 更强脚本 teacher 的方向是有效的，但 PPO 并没有稳定收敛到高 reward 策略；它更像是在几个可行策略模式之间跳动。`repeat_best_logging` 还补充了一个重要信息：即使 KL 不高、early stop 不多，策略也会缓慢漂回低收益策略。当前最该补的是 **best checkpoint 保存** 和 **soft teacher-KL**，否则高分策略会被后续更新洗掉。
+
+`repeat_best_logging` 的 10-update 分段趋势：
+
+| updates | avg_reward | max_reward | avg_KL | early_lt4 | 诊断 |
+|---------|------------|------------|--------|-----------|------|
+| 1-10 | `0.0767` | `0.0947` | `0.0101` | `0` | 开局策略质量较好 |
+| 11-40 | `0.0649` | `0.1052` | `0.0105` | `1` | update 31 达到最佳 |
+| 41-70 | `0.0548` | `0.0956` | `0.0073` | `0` | 低 KL 下逐步退化 |
+| 71-100 | `0.0471` | `0.0770` | `0.0300` | `11` | 后期进入低收益区间 |
 
 ### 7.3 对训练日志的诊断
 
@@ -347,6 +358,7 @@ cd F:\Projects\OpenRA\OpenRA.Bot
 - KL 呈两难：过低表示策略几乎不动；过高会 early stop 或 collapse。简单调 `lr`、`target_kl`、`update_epochs` 只能在“不学”和“不稳”之间移动。
 - `LoadBcActionHead` 的实验非常明确：硬加载 action head 不是 teacher-KL，它会把策略压回脚本动作分布，并导致 PPO 更新空间变窄。
 - 最新 UE4/KL0.03 repeat 的高分 update 多数只有 `num_batches=1`，说明它经常刚有收益就被 KL early stop 截断；这不是“完全学不会”，而是“好策略无法稳定保留”。
+- `repeat_best_logging` 则说明另一个失败模式：不需要 KL 爆炸也会退化。前期 `avg_reward=0.0767`，后期 `last20=0.0476`，mean KL 只有 `0.0154`，说明当前 PPO 更新会在低 KL 漂移中丢掉中途好策略。
 
 ### 7.4 与 DI-star / AlphaStar 复现分析的对照
 
@@ -375,7 +387,7 @@ OpenRA.Bot 当前相当于：弱脚本 BC + 单标量 asset reward + vanilla PPO
 1. **先补实验记录能力**
    - CSV 固化 action distribution、reward components、last20、best reward、early_stop、decision_steps。
    - 保存 best checkpoint，避免只保留固定 update。
-   - 目前 `repeat_ue4_kl003` 的最佳点是 `model_0034.pth`，最终 `model_0100.pth` 未必更好；后续训练应按验证指标自动保存 best。
+   - 目前 `repeat_ue4_kl003` 的最佳点是 `model_0034.pth`，`repeat_best_logging` 的最佳点是 `model_0031.pth`，最终 `model_0100.pth` 未必更好；后续训练应按验证指标自动保存 best。
 
 2. **实现 soft teacher-KL**
    - 冻结一个由升级版 `RuleBasedAgent` BC 得到的 teacher。
@@ -399,3 +411,99 @@ OpenRA.Bot 当前相当于：弱脚本 BC + 单标量 asset reward + vanilla PPO
 6. **暂缓大模型和大规模算法迁移**
    - Transformer、多 value head、V-trace/UPGO 都有价值，但应在 teacher-KL、goal conditioning、combat signal 有雏形后再上。
    - 否则复杂度会上升，但训练信号仍然不够。
+
+### 7.7 新 Session 接续计划
+
+下一次 session 不建议继续跑同配置 PPO。先把训练系统补成“能保留好策略、能解释为什么好”的状态。
+
+#### P0: best checkpoint + richer CSV
+
+目标：不再丢掉 `model_0031.pth` / `model_0034.pth` 这类中途峰值。
+
+- 在 `PPOAgent.train()` 内维护：
+  - `best_reward`
+  - `best_update`
+  - `last20_reward`
+  - `early_stop`
+- 保存：
+  - `model_best.pth`
+  - `best_metrics.json`
+- `training.csv` 增加字段：
+  - `early_stop`
+  - `last20_reward`
+  - `best_reward`
+  - `best_update`
+  - `mask_mean`
+  - `atype_dist`
+  - `reward_comp`
+- 检查点策略：
+  - 保留 `save_interval` 或只按固定间隔保存普通 checkpoint。
+  - 每当 `mean_reward > best_reward` 时覆盖 `model_best.pth`。
+
+验收：
+
+```powershell
+.\scripts\train_best.ps1 -Updates 100 -RunName best_ckpt_smoke
+```
+
+训练结束后应能看到：
+
+- `checkpoints/best_ckpt_smoke/model_best.pth`
+- `checkpoints/best_ckpt_smoke/best_metrics.json`
+- `training.csv` 中有 `best_reward / last20_reward / atype_dist / reward_comp`
+
+预期：即使最终 `model_0100.pth` 退化，也能自动保留中途最佳模型。
+
+#### P1: soft teacher-KL
+
+目标：替代 hard BC action head，让 teacher 只作为软锚，减少“低 KL 漂移”和“高 KL 截断”两种失败模式。
+
+建议实现：
+
+- warmstart 后保留一份 frozen teacher model。
+- PPO rollout / update 时，对 macro `action_type` head 计算 teacher KL。
+- 先只约束 action_type，不约束其它 dummy heads。
+- loss 形态：
+
+```text
+loss = ppo_policy_loss + vf_coef * value_loss + ent_coef * entropy_loss + teacher_kl_coef * teacher_kl
+```
+
+建议参数：
+
+```text
+teacher_kl_coef = 0.05
+teacher_kl_final = 0.005
+teacher_kl_steps = 50
+```
+
+验收对照：
+
+```powershell
+.\scripts\train_best.ps1 -Updates 100 -RunName teacher_kl_005_decay
+```
+
+对比对象：
+
+- `stronger_teacher_no_head_100`
+- `stronger_teacher_no_head_repeat_ue4_kl003`
+- `repeat_best_logging`
+
+主要看：
+
+- `best_reward` 是否仍能到 `~0.10`
+- `last20_reward` 是否高于 `repeat_best_logging` 的 `0.0476`
+- `final` 是否不再明显低于 `best`
+
+#### P2: goal conditioning / BO library
+
+等 P0/P1 完成后再做。目标是让 policy 看到“本局要朝什么发展”，不要只靠 reward 隐式猜。
+
+初始 BO 目标库可以很小：
+
+- `economy`: `powr, proc, powr, proc`
+- `infantry`: `powr, proc, barr, e1, e1, e3`
+- `vehicle`: `powr, proc, barr, powr, weap, 1tnk`
+- `balanced`: `powr, proc, barr, powr, weap, e1, 1tnk`
+
+每局采样一个目标，把目标编码到 entity obs 的 scalar 部分；reward 加目标进度项。这个阶段再考虑多 value head。

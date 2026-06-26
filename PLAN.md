@@ -5,15 +5,15 @@
 
 ---
 
-## 当前修订版路线 (2026-06-18)
+## 当前修订版路线 (2026-06-26)
 
-最近一轮实验已经把几个底层问题打通：短 rollout 的零 batch bug、asset reward 的生产 credit、macro action、auto-place、headless，以及 `SubprocVecEnv` 多进程 rollout。PPO 现在是真正在更新，且能稳定接近升级后的 `RuleBasedAgent`；UE4/KL0.03 repeat 可以冲到 `~0.106` peak reward，但最终 checkpoint 不一定最好。多组对照显示：仅靠当前弱脚本 teacher + 标量 asset reward + on-policy PPO，仍不能稳定、决定性地超过基线。
+最近一轮实验已经把几个底层问题打通：短 rollout 的零 batch bug、asset reward 的生产 credit、macro action、auto-place、headless，以及 `SubprocVecEnv` 多进程 rollout。PPO 现在是真正在更新，且能稳定接近升级后的 `RuleBasedAgent`；UE4/KL0.03 repeat 可以冲到 `~0.106` peak reward，但最终 checkpoint 不一定最好。2026-06-26 的 `repeat_best_logging` 再次验证：中途能到 `0.1052@31`，但最终退到 `0.0463`，说明即使 KL 不爆炸，策略也会在后续更新中漂回低收益区域。多组对照显示：仅靠当前弱脚本 teacher + 标量 asset reward + on-policy PPO，仍不能稳定、决定性地超过基线。
 
 ### 当前结论
 
 - **已解决的问题**: PPO 更新链路、mask 崩溃、reward 过稀疏、produce/build/auto-place 闭环、headless rollout、多环境基础设施。
 - **当前最大瓶颈**: 缺少强行为先验和训练中锚点。当前 `RuleBasedAgent` 只是宏观生产脚本，不是会完整打局的专家。
-- **最新 repeat 结论**: PPO 能短暂找到更高 reward 策略，但会在后续 update 中漂移或被 KL early stop 截断；因此需要 best checkpoint 保存和 soft teacher-KL。
+- **最新 repeat 结论**: PPO 能短暂找到更高 reward 策略，但会在后续 update 中漂移或被 KL early stop 截断；`repeat_best_logging` 证明低 KL 也会退化。因此需要 best checkpoint 保存和 soft teacher-KL。
 - **DI-star 对比结论**: AlphaStar/DI-star 的发展能力主要来自人类 replay 监督学习、teacher-KL、目标条件化 `z`、多路 reward/value head、V-trace/UPGO 和对战信号；不是从零 PPO 靠单标量 reward 自动发现完整 RTS 发展。
 - **对 OpenRA.Bot 的含义**: 继续堆 PPO 超参、单纯加 rollout 长度或加模型规模，收益有限。下一阶段应先补“专家锚”和“目标可见性”。
 
@@ -21,8 +21,14 @@
 
 1. **实验可观测性收口**
    - 在 CSV 中稳定记录 action 分布、reward component、decision_steps、batches、early_stop、best/last20。
-   - 保存 best checkpoint，而不是只按固定 update 保存；当前 `model_0034.pth` 这类中途峰值可能优于最终 `model_0100.pth`。
+   - 保存 best checkpoint，而不是只按固定 update 保存；当前 `model_0034.pth`、`model_0031.pth` 这类中途峰值可能优于最终 `model_0100.pth`。
    - 固化 2-3 个标准对照脚本：no BC head、hard BC head、后续 soft teacher-KL。
+
+   **下一 session 具体实现顺序**:
+   - `training.csv` 增加 `early_stop / last20_reward / best_reward / best_update / mask_mean / atype_dist / reward_comp`。
+   - `PPOAgent.train()` 内维护 best metrics。
+   - 保存 `model_best.pth` 和 `best_metrics.json`。
+   - 用 `.\scripts\train_best.ps1 -Updates 100 -RunName best_ckpt_smoke` 验证最终 checkpoint 退化时仍能保留中途最佳模型。
 
 2. **强化专家基线**
    - 继续迭代 `RuleBasedAgent`，让它至少覆盖红警基础开局：电厂、矿场、兵营、电厂、重工、持续步兵/车辆、补电、补矿。
@@ -34,6 +40,12 @@
    - PPO loss 中加入 `KL(policy || teacher)` 或 action-type KL，先只约束 macro action_type。
    - KL 系数做退火：前期强，后期弱，目标是防塌缩但允许超过 teacher。
    - 最近实验显示 hard loading BC action head 会导致 KL 偏高、early_stop 频繁、reward 下降，因此应改为软锚。
+
+   **P0 完成后的实验**:
+   - 冻结 BC teacher model。
+   - 先只对 macro `action_type` head 加 teacher KL。
+   - 初始参数：`teacher_kl_coef=0.05`, `teacher_kl_final=0.005`, `teacher_kl_steps=50`。
+   - 验收：`best_reward` 仍接近 `0.10`，但 `last20_reward/final` 不再像 `repeat_best_logging` 一样掉到 `~0.047`。
 
 4. **Goal conditioning / BO library**
    - 准备手写 build-order 库，例如 economy、infantry、vehicle、balanced。
