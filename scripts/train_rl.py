@@ -208,6 +208,10 @@ def train(
     action_space_mode: str = "multidiscrete",
     headless: bool = False,
     num_envs: int = 1,
+    teacher_kl_coef: float = 0.0,
+    teacher_kl_anneal_steps: int = 50,
+    add_opponent: bool = False,
+    goal_conditioning: bool = False,
 ):
     # OpenRA initialization may change the process working directory to the
     # engine bin dir. Resolve user-provided relative output paths up front so
@@ -225,6 +229,8 @@ def train(
         decision_point_skip=decision_point_skip,
         action_space_mode=action_space_mode,
         headless=headless,
+        add_opponent=add_opponent,
+        goal_conditioning=goal_conditioning,
     )
     if remote_host and remote_port:
         env.configure_remote(
@@ -331,12 +337,12 @@ def train(
 
     agent = PPOAgent(model=model, device=str(device))
 
-    def _checkpoint(u: int, mdl: Any) -> None:
+    def _checkpoint(u: int, mdl: Any, path_override: str = "") -> None:
         try:
             base = log_dir
             if not os.path.exists(base):
                 os.makedirs(base)
-            path = os.path.join(base, f"model_{u:04d}.pth")
+            path = path_override if path_override else os.path.join(base, f"model_{u:04d}.pth")
             torch.save(mdl.state_dict(), path)
             print(f"Model saved to {path}")
         except Exception as e:
@@ -359,6 +365,8 @@ def train(
         target_kl=target_kl,
         checkpoint_fn=_checkpoint,
         log_path=os.path.join(log_dir, "training.csv"),
+        teacher_kl_coef=teacher_kl_coef,
+        teacher_kl_anneal_steps=teacher_kl_anneal_steps,
     )
 
     try:
@@ -445,6 +453,27 @@ if __name__ == "__main__":
              "categorical (dev-only; auto-deploy/auto-place handle the rest).",
     )
     parser.add_argument(
+        "--teacher-kl-coef", type=float, default=0.0,
+        help="initial KL(policy||teacher) coefficient for action_type head "
+             "(0=disabled, suggested: 0.05). Linearly decays to 10%% over "
+             "--teacher-kl-anneal-steps updates.",
+    )
+    parser.add_argument(
+        "--teacher-kl-anneal-steps", type=int, default=50,
+        help="linearly decay teacher KL coef to 10%% over this many updates (default: 50)",
+    )
+    parser.add_argument(
+        "--add-opponent", action="store_true",
+        help="Add a built-in bot opponent. Enables combat kill reward and creates "
+             "headroom beyond development-only asset accumulation.",
+    )
+    parser.add_argument(
+        "--goal-conditioning", action="store_true",
+        help="Enable goal-conditioned training: sample a build-order goal each "
+             "episode, encode it into the observation, and reward progress toward "
+             "the target composition (economy/infantry/vehicle/balanced).",
+    )
+    parser.add_argument(
         "--headless", action="store_true",
         help="Run the engine with the no-op Null renderer (no window/GL). Required "
              "for parallel multi-process training.",
@@ -492,4 +521,8 @@ if __name__ == "__main__":
         action_space_mode=args.action_space_mode,
         headless=args.headless,
         num_envs=args.num_envs,
+        teacher_kl_coef=args.teacher_kl_coef,
+        teacher_kl_anneal_steps=args.teacher_kl_anneal_steps,
+        add_opponent=args.add_opponent,
+        goal_conditioning=args.goal_conditioning,
     )

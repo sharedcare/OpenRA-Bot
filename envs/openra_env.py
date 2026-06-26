@@ -83,6 +83,9 @@ class OpenRAEnv(gym.Env):
         max_skip_steps: int = 300,
         action_space_mode: str = "multidiscrete",
         headless: bool = False,
+        add_opponent: bool = False,
+        bot_type: str = "rulebased",
+        goal_conditioning: bool = False,
     ) -> None:
         super().__init__()
 
@@ -130,6 +133,12 @@ class OpenRAEnv(gym.Env):
             }
         self.reverse_unit_types = {v: k for k, v in self.unit_types.items()}
 
+        # Basic config needed by _setup_spaces
+        self.headless = bool(headless)
+        self.add_opponent = bool(add_opponent)
+        self.bot_type = str(bot_type) if bot_type else "rulebased"
+        self.goal_conditioning = bool(goal_conditioning)
+
         # Spaces
         self._setup_spaces()
 
@@ -149,7 +158,11 @@ class OpenRAEnv(gym.Env):
         self.max_skip_steps = int(max_skip_steps)
         # Headless: run the engine with the no-op Null renderer (no window / GL).
         # Required for parallel multi-process training (no OpenGL windows).
-        self.headless = bool(headless)
+        self._goal_library: Any = None
+        self._active_goal: Any = None
+        if self.goal_conditioning:
+            from utils.goal_library import GoalLibrary
+            self._goal_library = GoalLibrary()
         # Reward shaping config and previous metrics snapshot
         self.reward_weights = {
             'unit': 0.3,
@@ -168,6 +181,8 @@ class OpenRAEnv(gym.Env):
             # --- Asset-mode weights (reward_mode == "asset") ---
             'asset_value': 1.0,              # weight on cost-weighted net-worth growth (per value_scale units)
             'asset_value_scale': 1000.0,     # cost normalizer: a 1000-cost actor -> +1.0 reward
+            'kill_value': 0.3,               # weight on enemy actor deaths (per value_scale units)
+            'goal_aligned_weight': 0.2,      # weight on goal-aligned composition progress
             # Per-step penalties are OFF by default: they accumulate over episode
             # length and swamp the one-time asset gains (breaking the telescoping
             # net-worth signal). The asset reward already rewards spending cash on
@@ -233,10 +248,14 @@ class OpenRAEnv(gym.Env):
             self.observation_space = spaces.Box(low=-1, high=max_coord, shape=(obs_dim,), dtype=np.float32)
         elif self.observation_type == "entity":
             from utils.entity_obs import ENTITY_FEATURE_DIM, MAX_ENTITIES, EntityObservationBuilder
+            from utils.goal_library import GoalLibrary
+            scalar_dim = EntityObservationBuilder.SCALAR_BASE_DIM
+            if self.goal_conditioning:
+                scalar_dim += GoalLibrary.scalar_dim()
             self.observation_space = spaces.Dict({
                 'entities': spaces.Box(-1, 1, (MAX_ENTITIES, ENTITY_FEATURE_DIM), dtype=np.float32),
                 'entity_mask': spaces.Box(0, 1, (MAX_ENTITIES,), dtype=bool),
-                'scalar': spaces.Box(-1, 1, (EntityObservationBuilder.SCALAR_DIM,), dtype=np.float32),
+                'scalar': spaces.Box(-1, 1, (scalar_dim,), dtype=np.float32),
             })
         elif self.observation_type == "image":
             self.observation_space = spaces.Box(low=0, high=255, shape=(128, 128, 10), dtype=np.uint8)
@@ -340,7 +359,7 @@ class OpenRAEnv(gym.Env):
         elif self.remote_host and self.remote_port:
             self._join_remote()
         else:
-            api.StartLocalGame(self.mod_id, self.map_uid, self.bin_dir, addBotOpponent=False, explored=True, fog=False, headless=self.headless)
+            api.StartLocalGame(self.mod_id, self.map_uid, self.bin_dir, addBotOpponent=self.add_opponent, botType=self.bot_type if self.add_opponent else None, explored=True, fog=False, headless=self.headless)
 
         # Build first observation and info
         raw = self._get_raw_state()
@@ -361,6 +380,9 @@ class OpenRAEnv(gym.Env):
         # Reset build-order tracker for the new episode
         self._bo_tracker.reset()
         self._asset_tracker.reset()
+        # Sample goal for goal-conditioned reward
+        if self.goal_conditioning and self._goal_library is not None:
+            self._active_goal = self._goal_library.sample()
         # Seed the asset tracker with actors that already exist at reset.  The
         # reward should measure growth after the agent starts acting, not pay a
         # one-time bonus for the starting MCV / already-created structures.
@@ -636,6 +658,41 @@ class OpenRAEnv(gym.Env):
                 if aid >= 0:
                     self._counted_ids.add(aid)
 
+        def update_enemy_kills(self, raw: Dict[str, Any]) -> float:
+            """Return cost of enemy actors that died this step.
+
+            Tracks enemy (owner != my_owner) actors by id. When a previously-seen
+            enemy disappears (dead or gone from actor list), their build cost is
+            rewarded as a kill.
+            """
+            if not hasattr(self, '_enemy_seen'):
+                self._enemy_seen: Dict[int, str] = {}  # actor_id -> type_name
+            self.ingest_catalog(raw.get('producible_catalog'))
+            actors = raw.get('actors') or []
+            my_owner = int(raw.get('my_owner', -1))
+            alive_enemy_ids: Set[int] = set()
+            kill_reward = 0.0
+            for a in actors:
+                try:
+                    owner = int(a.get('owner', -1))
+                    if owner == my_owner or bool(a.get('dead', False)):
+                        continue
+                    aid = int(a.get('id', -1))
+                    atype = str(a.get('type', ''))
+                except Exception:
+                    continue
+                if aid < 0:
+                    continue
+                alive_enemy_ids.add(aid)
+                if aid not in self._enemy_seen:
+                    self._enemy_seen[aid] = atype
+            # Reward for enemies that disappeared
+            for aid, atype in list(self._enemy_seen.items()):
+                if aid not in alive_enemy_ids:
+                    kill_reward += float(self.cost_of(atype))
+                    del self._enemy_seen[aid]
+            return kill_reward
+
     # Actor types that are always buildings regardless of available_orders.
     _BUILDING_TYPES: set = {'fact', 'powr', 'proc', 'barr', 'tent', 'weap',
                              'afld', 'spen', 'syrd', 'dome', 'hpad', 'eye',
@@ -792,6 +849,43 @@ class OpenRAEnv(gym.Env):
         if metrics.get('cash') is not None:
             self._prev_metrics['cash'] = float(metrics.get('cash') or 0.0)
 
+        # Combat reward: enemy units that died this step (kills / attrition)
+        kill_gained = 0.0
+        kill_reward = 0.0
+        if self.add_opponent:
+            kill_gained = self._asset_tracker.update_enemy_kills(raw)
+            kill_reward = w.get('kill_value', 0.3) * (kill_gained / max(1.0, float(w['asset_value_scale'])))
+            rw += kill_reward
+
+        # Goal-conditioned reward: progress toward sampled target composition
+        goal_aligned_reward = 0.0
+        goal_building_progress = 0.0
+        goal_unit_progress = 0.0
+        if self.goal_conditioning and self._active_goal is not None:
+            # Count current owned buildings and units by type
+            actors = raw.get('actors') or []
+            my_owner = int(raw.get('my_owner', -1))
+            owned_bld: Dict[str, int] = {}
+            owned_unit: Dict[str, int] = {}
+            for a in actors:
+                try:
+                    if int(a.get('owner', -1)) != my_owner or bool(a.get('dead', False)):
+                        continue
+                    atype = str(a.get('type', '')).lower().strip()
+                except Exception:
+                    continue
+                if self._is_building(atype):
+                    owned_bld[atype] = owned_bld.get(atype, 0) + 1
+                else:
+                    owned_unit[atype] = owned_unit.get(atype, 0) + 1
+
+            gb, gu, gt = self._goal_library.goal_reward(
+                self._active_goal, owned_bld, owned_unit)
+            goal_building_progress = float(gb)
+            goal_unit_progress = float(gu)
+            goal_aligned_reward = w.get('goal_aligned_weight', 0.2) * float(gt)
+            rw += goal_aligned_reward
+
         self._last_reward_components = {
             'asset_gained': float(gained),
             'asset_reward': float(asset_reward),
@@ -800,6 +894,11 @@ class OpenRAEnv(gym.Env):
             'production_cancel_penalty': float(production_cancel_penalty),
             'idle_cash_penalty': float(idle_penalty),
             'power_deficit_penalty': float(power_penalty),
+            'kill_gained': float(kill_gained),
+            'kill_reward': float(kill_reward),
+            'goal_aligned': float(goal_aligned_reward),
+            'goal_building_progress': float(goal_building_progress),
+            'goal_unit_progress': float(goal_unit_progress),
             'total': float(rw),
         }
         return float(rw)
@@ -1241,7 +1340,10 @@ class OpenRAEnv(gym.Env):
         if builder is None:
             builder = EntityObservationBuilder()
             self._entity_builder = builder
-        return builder.build(raw)
+        goal_vec = None
+        if self.goal_conditioning and self._active_goal is not None and self._goal_library is not None:
+            goal_vec = self._goal_library.encode_scalar(self._active_goal)
+        return builder.build(raw, goal_vec=goal_vec)
 
     def _split_visible_actors(self, raw: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         actors = raw.get('actors') or []

@@ -4,6 +4,7 @@ import random
 from typing import Any, Dict, List, Optional, Tuple, Callable, Set
 import os
 import csv
+import json
 
 import numpy as np
 import torch
@@ -707,6 +708,13 @@ class PPOAgent(BaseAgent):
                     "rollout_steps",
                     "decision_steps",
                     "grad_norm",
+                    "early_stop",
+                    "last20_reward",
+                    "best_reward",
+                    "best_update",
+                    "mask_mean",
+                    "atype_dist",
+                    "reward_comp",
                 ]
             )
 
@@ -725,6 +733,13 @@ class PPOAgent(BaseAgent):
         rollout_steps: int,
         decision_steps: int,
         grad_norm: float,
+        early_stop: int = 0,
+        last20_reward: float = 0.0,
+        best_reward: float = 0.0,
+        best_update: int = 0,
+        mask_mean: float = 0.0,
+        atype_dist: str = "",
+        reward_comp: str = "",
     ) -> None:
         if not log_path:
             return
@@ -744,6 +759,13 @@ class PPOAgent(BaseAgent):
                     rollout_steps,
                     decision_steps,
                     f"{grad_norm:.6f}",
+                    early_stop,
+                    f"{last20_reward:.6f}",
+                    f"{best_reward:.6f}",
+                    best_update,
+                    f"{mask_mean:.6f}",
+                    atype_dist,
+                    reward_comp,
                 ]
             )
 
@@ -766,7 +788,17 @@ class PPOAgent(BaseAgent):
         target_kl: float = 0.03,
         checkpoint_fn: Optional[Callable[[int, Any], None]] = None,
         log_path: Optional[str] = None,
+        teacher_kl_coef: float = 0.0,
+        teacher_kl_anneal_steps: int = 50,
     ) -> None:
+        """PPO training loop.
+
+        Args:
+            teacher_kl_coef: initial KL(policy || teacher) coefficient for
+                action_type head. 0.0 disables teacher-KL. Suggested: 0.05.
+            teacher_kl_anneal_steps: linearly decay teacher_kl_coef to 10% of
+                its initial value over this many updates.
+        """
         # num_envs>1 requires a vectorized env (SubprocVecEnv) exposing n_envs.
         is_vec = hasattr(env, "n_envs")
         if is_vec:
@@ -821,6 +853,25 @@ class PPOAgent(BaseAgent):
             hidden_size=getattr(self.model, "recurrent_hidden_size", 256),
             has_action_masks=True,
         )
+
+        # Teacher-KL: frozen copy of BC model to anchor policy, preventing
+        # late-stage reward collapse while still allowing the policy to
+        # exceed the teacher. Only action_type head is constrained.
+        use_teacher_kl = teacher_kl_coef > 0.0
+        teacher_model = None
+        if use_teacher_kl:
+            import copy
+            teacher_model = copy.deepcopy(self.model)
+            teacher_model.to(device)
+            teacher_model.eval()
+            for p in teacher_model.parameters():
+                p.requires_grad = False
+            print(f"[PPO] teacher-KL enabled: coef={teacher_kl_coef} anneal={teacher_kl_anneal_steps} "
+                  f"(action_type only)")
+
+        self._reward_history: List[float] = []
+        self._best_reward: float = float("-inf")
+        self._best_update: int = 0
 
         for update in range(total_updates):
             self.model.train()
@@ -1093,6 +1144,38 @@ class PPOAgent(BaseAgent):
 
                     loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss
 
+                    # Teacher-KL: anchor action_type distribution to frozen BC teacher.
+                    # Uses forward KL: KL(teacher || policy) so the penalty is applied
+                    # where the teacher had probability but the policy doesn't —
+                    # preventing the policy from forgetting useful teacher actions.
+                    if use_teacher_kl and teacher_model is not None:
+                        # Anneal: linear decay to 10% of initial over anneal_steps
+                        progress = min(update / max(teacher_kl_anneal_steps, 1), 1.0)
+                        current_kl_coef = teacher_kl_coef * (1.0 - 0.9 * progress)
+
+                        with torch.no_grad():
+                            t_logits, _, _ = teacher_model(mb_obs_flat, seq_len=seq_len)
+                            # action_type head: (B*N, L, n_actions) after view
+                            t_at_logits = t_logits["action_type"].view(batch_size, num_envs, seq_len, -1)
+                        p_at_logits = logits["action_type"]  # (B, N, L, n_actions)
+
+                        # Flatten to (B*N*L, n_actions) for KL computation
+                        p_flat = p_at_logits.reshape(-1, p_at_logits.shape[-1])
+                        t_flat = t_at_logits.reshape(-1, t_at_logits.shape[-1])
+
+                        # Forward KL: KL(teacher || policy)
+                        # = sum_i teacher_i * (log teacher_i - log policy_i)
+                        p_logp = torch.log_softmax(p_flat, dim=-1)
+                        t_logp = torch.log_softmax(t_flat, dim=-1)
+                        t_prob = torch.softmax(t_flat, dim=-1)
+                        teacher_kl = (t_prob * (t_logp - p_logp)).sum(dim=-1)
+                        teacher_kl = (teacher_kl * mb_attention_mask.reshape(-1)).sum() / valid_steps
+                        teacher_kl_val = float(teacher_kl.item())
+
+                        loss = loss + current_kl_coef * teacher_kl
+                    else:
+                        teacher_kl_val = 0.0
+
                     optimizer.zero_grad()
                     loss.backward()
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
@@ -1120,7 +1203,7 @@ class PPOAgent(BaseAgent):
             policy_loss_mean = float(np.mean(policy_loss_values)) if policy_loss_values else 0.0
             value_loss_mean = float(np.mean(value_loss_values)) if value_loss_values else 0.0
             grad_norm_mean = float(np.mean(grad_norm_values)) if grad_norm_values else 0.0
-            mask_mean = buffer.get_mask_statistics()
+            mask_mean_val = float(buffer.get_mask_statistics()) if buffer.get_mask_statistics() is not None else 0.0
             rollout_steps = int(buffer.step_idx * num_envs)
             decision_steps_count = rollout_steps
             if buffer.masks_initialized and "action_type" in buffer.masks:
@@ -1135,13 +1218,46 @@ class PPOAgent(BaseAgent):
                 if v
             }
 
+            # Track best / last20 reward
+            self._reward_history.append(mean_reward)
+            last20 = self._reward_history[-20:]
+            last20_reward = float(np.mean(last20)) if last20 else mean_reward
+            early_stop_flag = 1 if stop_early else 0
+            atype_str = str(dict(action_type_counts)) if action_type_counts else ""
+            comp_str = str(comp_mean) if comp_mean else ""
+
+            if mean_reward > self._best_reward:
+                self._best_reward = mean_reward
+                self._best_update = update + 1
+                # Save best model
+                if checkpoint_fn is not None:
+                    try:
+                        ckpt_dir = os.path.dirname(log_path) if log_path else "."
+                        best_path = os.path.join(ckpt_dir, "model_best.pth")
+                        checkpoint_fn("best", self.model, path_override=best_path)
+                        best_json_path = os.path.join(ckpt_dir, "best_metrics.json")
+                        with open(best_json_path, "w") as bf:
+                            json.dump({
+                                "best_reward": self._best_reward,
+                                "best_update": self._best_update,
+                                "last20_reward": last20_reward,
+                                "mean_reward": mean_reward,
+                                "approx_kl": approx_kl_mean,
+                                "entropy": entropy_mean,
+                                "policy_loss": policy_loss_mean,
+                                "value_loss": value_loss_mean,
+                            }, bf, indent=2)
+                    except Exception as exc:
+                        print(f"[PPO] best checkpoint failed: {exc}")
+
             print(
                 f"[PPO] update={update+1} mean_reward={mean_reward:.4f} std={std_reward:.4f} nz={nz_frac:.3f} "
                 f"KL={approx_kl_mean:.5f} entropy={entropy_mean:.4f} ploss={policy_loss_mean:.4f} "
                 f"vloss={value_loss_mean:.4f} atype_dist={action_type_counts} "
                 f"batches={num_batches} decision_steps={decision_steps_count}/{rollout_steps} "
                 f"grad_norm={grad_norm_mean:.4f} "
-                f"mask_mean={mask_mean if mask_mean is not None else 'n/a'} "
+                f"mask_mean={mask_mean_val:.4f} "
+                f"best={self._best_reward:.4f}@{self._best_update} last20={last20_reward:.4f} "
                 f"reward_comp={comp_mean if comp_mean else 'n/a'}"
                 f"{' early_stop=1' if stop_early else ''}"
             )
@@ -1159,6 +1275,13 @@ class PPOAgent(BaseAgent):
                 rollout_steps,
                 decision_steps_count,
                 grad_norm_mean,
+                early_stop=early_stop_flag,
+                last20_reward=last20_reward,
+                best_reward=self._best_reward,
+                best_update=self._best_update,
+                mask_mean=mask_mean_val,
+                atype_dist=atype_str,
+                reward_comp=comp_str,
             )
 
             if checkpoint_fn is not None:

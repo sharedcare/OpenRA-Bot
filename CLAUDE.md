@@ -2,21 +2,39 @@
 
 ## Next Session Handoff
 
-Current finding: `repeat_best_logging` reached `best=0.1052@31` but finished at `0.0463`. PPO can find good intermediate macro policies, but loses them later even without KL explosion.
+2026-06-27: Best-checkpoint + enhanced CSV logging and soft teacher-KL are both
+implemented and smoke-tested. Next session should run a full experiment to validate:
 
-Do next:
+```powershell
+# Baseline (no teacher-KL)
+.\scripts\train_best.ps1 -Updates 100 -RunName best_ckpt_baseline
 
-1. Add best-checkpoint and richer CSV logging before running more PPO.
-   - Save `model_best.pth`
-   - Write `best_metrics.json`
-   - Add CSV fields: `early_stop`, `last20_reward`, `best_reward`, `best_update`, `mask_mean`, `atype_dist`, `reward_comp`
-2. Validate with:
-   ```powershell
-   .\scripts\train_best.ps1 -Updates 100 -RunName best_ckpt_smoke
-   ```
-3. Then implement soft teacher-KL for macro `action_type`.
-   - Do not hard-load BC action head by default.
-   - Start with `teacher_kl_coef=0.05`, decay to `0.005` over `50` updates.
+# Teacher-KL anchor
+.\scripts\train_best.ps1 -Updates 100 -RunName teacher_kl_0.05 -TeacherKlCoef 0.05
+```
+
+On macOS:
+```bash
+python scripts/train_rl.py --num-steps 256 --total-updates 100 \
+    --max-episode-ticks 1500 --warmstart-episodes 10 --warmstart-epochs 15 \
+    --observation-type entity --action-space-mode macro --headless \
+    --teacher-kl-coef 0.05 --log-dir checkpoints_teacher_kl
+```
+
+Acceptance criteria for teacher-KL:
+- `best_reward` still near `0.10`
+- `last20_reward` doesn't collapse to `~0.047` (remains >= 0.07)
+- CSV columns: `early_stop,last20_reward,best_reward,best_update,mask_mean,atype_dist,reward_comp` populated
+- `checkpoints/model_best.pth` + `best_metrics.json` saved at peak
+
+If teacher-KL stabilizes the final policy, proceed to goal conditioning (PLAN.md priority 4).
+
+### Already implemented in this session
+
+- ✅ `training.csv` now has `early_stop / last20_reward / best_reward / best_update / mask_mean / atype_dist / reward_comp`
+- ✅ `model_best.pth` + `best_metrics.json` saved automatically when mean_reward exceeds previous best
+- ✅ `--teacher-kl-coef 0.05 --teacher-kl-anneal-steps 50`: soft KL anchor on action_type head only
+- ✅ Forward KL: KL(teacher || policy), linear decay to 10% over anneal steps
 
 ## Quick Start
 

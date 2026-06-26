@@ -53,7 +53,7 @@ class EntityObservationBuilder:
     # Public API
     # ------------------------------------------------------------------
 
-    def build(self, raw: Dict[str, Any]) -> Dict[str, np.ndarray]:
+    def build(self, raw: Dict[str, Any], goal_vec: Optional[List[float]] = None) -> Dict[str, np.ndarray]:
         actors = raw.get('actors') or []
         my_owner = int(raw.get('my_owner', -1))
         n = min(len(actors), self.max_entities)
@@ -65,7 +65,7 @@ class EntityObservationBuilder:
             entities[i] = self._encode_actor(actor, my_owner)
             mask[i] = True
 
-        scalar = self._encode_scalar(raw)
+        scalar = self._encode_scalar(raw, goal_vec)
 
         return {
             'entities': entities,
@@ -128,10 +128,10 @@ class EntityObservationBuilder:
     # Scalar encoding
     # ------------------------------------------------------------------
 
-    SCALAR_DIM: int = 10
+    SCALAR_BASE_DIM: int = 10
 
     @staticmethod
-    def _encode_scalar(raw: Dict[str, Any]) -> np.ndarray:
+    def _encode_scalar(raw: Dict[str, Any], goal_vec: Optional[List[float]] = None) -> np.ndarray:
         cash = max(0.0, float(raw.get('cash', 0) or 0.0))
         res_total = max(0.0, float(raw.get('resources_total', 0) or 0.0))
         res_cap = max(1.0, float(raw.get('resource_capacity', 0) or 0.0))
@@ -155,7 +155,7 @@ class EntityObservationBuilder:
             if len(items) == 0:
                 has_empty = 1.0
 
-        return np.array([
+        base = np.array([
             min(cash / 10000.0, 1.0),                           # 0: cash
             min(res_total / res_cap, 1.0),                      # 1: resource fill
             min(p_prov / 500.0, 1.0),                           # 2: power provided
@@ -167,6 +167,11 @@ class EntityObservationBuilder:
             any_done,                                            # 8: has done item
             float(raw.get('world_tick', 0)) / 20000.0,          # 9: game time
         ], dtype=np.float32)
+
+        if goal_vec:
+            goal_arr = np.array(goal_vec, dtype=np.float32)
+            return np.concatenate([base, goal_arr])
+        return base
 
     # ------------------------------------------------------------------
     # Helpers
