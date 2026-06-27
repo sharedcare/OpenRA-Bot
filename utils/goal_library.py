@@ -120,11 +120,15 @@ class GoalLibrary:
         goal: BuildOrderGoal,
         owned_buildings: Dict[str, int],
         owned_units: Dict[str, int],
-    ) -> Tuple[float, float, float]:
-        """Compute goal-aligned reward components.
+    ) -> Tuple[float, float, float, float, bool]:
+        """Compute staged goal-aligned reward.
 
-        Returns (building_progress, unit_progress, total_goal_reward).
-        Each is in [0, 1] range: fraction of target achieved.
+        Phase 1 (buildings incomplete): reward building progress only.
+            unit progress is reported but weighted 0 in total.
+        Phase 2 (buildings complete): reward unit production only.
+            buildings already capped, focus shifts to army.
+
+        Returns (building_progress, unit_progress, total, phase_bonus, phase2_active).
         """
         bld_progress = 0.0
         for btype, target in goal.target_buildings.items():
@@ -136,5 +140,20 @@ class GoalLibrary:
             current = owned_units.get(utype, 0)
             unit_progress += min(current / max(target, 1), 1.0) / max(len(goal.target_units), 1)
 
-        total = goal.building_weight * bld_progress + goal.unit_weight * unit_progress
-        return bld_progress, unit_progress, total
+        buildings_done = bld_progress >= 0.7
+        phase_bonus = 0.0
+
+        if not buildings_done:
+            # Phase 1: focus on buildings, unit weight scaled down
+            total = goal.building_weight * bld_progress
+        else:
+            # Phase 2: enough buildings up, reward unit production
+            if not getattr(self, '_phase2_triggered', False):
+                phase_bonus = 0.5  # one-time bonus
+                self._phase2_triggered = True
+            # Blend: still reward remaining buildings, but add unit weight
+            unit_w = max(goal.unit_weight, 0.6)
+            remain_bld = max(0.0, 1.0 - bld_progress)
+            total = goal.building_weight * bld_progress + unit_w * unit_progress
+
+        return bld_progress, unit_progress, total, phase_bonus, buildings_done

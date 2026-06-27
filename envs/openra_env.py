@@ -385,6 +385,7 @@ class OpenRAEnv(gym.Env):
         # Sample goal for goal-conditioned reward
         if self.goal_conditioning and self._goal_library is not None:
             self._active_goal = self._goal_library.sample()
+            self._goal_library._phase2_triggered = False  # reset staging
         # Seed the asset tracker with actors that already exist at reset.  The
         # reward should measure growth after the agent starts acting, not pay a
         # one-time bonus for the starting MCV / already-created structures.
@@ -881,12 +882,14 @@ class OpenRAEnv(gym.Env):
                 else:
                     owned_unit[atype] = owned_unit.get(atype, 0) + 1
 
-            gb, gu, gt = self._goal_library.goal_reward(
+            gb, gu, gt, phase_bonus, is_phase2 = self._goal_library.goal_reward(
                 self._active_goal, owned_bld, owned_unit)
             goal_building_progress = float(gb)
             goal_unit_progress = float(gu)
             goal_aligned_reward = self.goal_aligned_weight * float(gt)
             rw += goal_aligned_reward
+            if phase_bonus > 0:
+                rw += phase_bonus  # one-time reward for completing building phase
 
         self._last_reward_components = {
             'asset_gained': float(gained),
@@ -901,6 +904,8 @@ class OpenRAEnv(gym.Env):
             'goal_aligned': float(goal_aligned_reward),
             'goal_building_progress': float(goal_building_progress),
             'goal_unit_progress': float(goal_unit_progress),
+            'goal_phase2': float(is_phase2),
+            'goal_phase_bonus': float(phase_bonus),
             'total': float(rw),
         }
         return float(rw)
