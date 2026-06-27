@@ -18,22 +18,22 @@ Teacher-KL alone: +50% final reward, prevents collapse, but doesn't increase pea
 Goal conditioning alone: **2.5x peak**, stable last20, the clear winner.
 Goal+Teacher: slightly lower peak, teacher constrains when goal signal exists.
 
-### Recommended next launcher
+### Recommended launcher (best known config)
 
 ```bash
-python scripts/train_rl.py --num-steps 256 --total-updates 150 \
+python scripts/train_rl.py --num-steps 256 --total-updates 100 \
     --observation-type entity --action-space-mode macro --headless \
     --warmstart-episodes 10 --warmstart-epochs 15 \
-    --goal-conditioning --log-dir checkpoints_goal_v2
+    --goal-conditioning --goal-aligned-weight 0.4 \
+    --log-dir checkpoints_goal_w04
 ```
 
 ### Do next
 
-1. Run 150-update goal conditioning to see if reward continues climbing
-2. Tune `goal_aligned_weight` (currently 0.2) — may be the next lever
-3. Try goal-only (no BC action head): `--no-load-bc-action-head --goal-conditioning`
-4. If engine bot works on Windows: `--add-opponent --goal-conditioning` (code ready)
-5. Per PLAN.md priority 5: split reward logging for goal components
+1. Try `--goal-aligned-weight 0.6` or `0.8` — trend suggests higher=better (0.2→0.31, 0.4→?)
+2. Try goal-only (no BC action head): `--no-load-bc-action-head --goal-conditioning --goal-aligned-weight 0.4`
+3. If engine bot works on Windows: `--add-opponent --goal-conditioning` (code ready, macOS blocked)
+4. Per PLAN.md priority 5: split reward logging + multi-value-head for goal components
 
 ### Already implemented
 
