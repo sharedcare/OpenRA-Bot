@@ -186,10 +186,21 @@ class MultiDiscretePolicy(nn.Module):
         self.head_target_idx = nn.Linear(feature_dim, a4)
         self.head_unit_type = nn.Linear(feature_dim, a5)
 
-    def forward(self, features: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, features: torch.Tensor, gate_input: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         h = self.trunk(features)
+
+        action_type_logits = self.head_action_type(h)
+
+        # GLU (Gated Linear Unit) gating: goal-conditioned modulation of
+        # action_type logits. AlphaStar/DI-star use this so the z-vector
+        # directly scales which action types are available/amplified.
+        # gate = sigmoid(Linear(gate_input)) ∈ [0, 1]^{n_actions}
+        if gate_input is not None and hasattr(self, 'gate_action_type'):
+            gate = torch.sigmoid(self.gate_action_type(gate_input))
+            action_type_logits = action_type_logits * gate
+
         return {
-            "action_type": self.head_action_type(h),
+            "action_type": action_type_logits,
             "unit_idx": self.head_unit_idx(h),
             "target_x": self.head_target_x(h),
             "target_y": self.head_target_y(h),
@@ -314,6 +325,12 @@ class ActorCritic(nn.Module):
 
         self.policy_head = MultiDiscretePolicy(feature_dim=recurrent_hidden_size, action_dims=action_dims)
 
+        # GLU gating layer for goal-conditioned action_type modulation.
+        # Takes scalar features (including goal z-vector) and outputs a
+        # per-action-type gate ∈ [0, 1]. AlphaStar-style: z conditions policy.
+        scalar_dim_for_gate = obs_space.get('scalar_dim', 16) if isinstance(obs_space, dict) else 16
+        self.policy_head.gate_action_type = nn.Linear(scalar_dim_for_gate, action_dims[0])
+
         # Multi-head value: separate critics for different reward components.
         # AlphaStar-style decomposition — each head fits its own time-scale
         # and magnitude, preventing a single critic from collapsing when
@@ -398,7 +415,10 @@ class ActorCritic(nn.Module):
             output_flat = self.core(features_flat)  # (B*L, H)
             hidden = None
 
-        logits = self.policy_head(output_flat)
+        gate_input = obs.get('scalar', None) if isinstance(obs, dict) else None
+        if gate_input is not None:
+            gate_input = gate_input.reshape(-1, gate_input.shape[-1])
+        logits = self.policy_head(output_flat, gate_input=gate_input)
         value = self.value_head(output_flat).squeeze(-1)
 
         # Decomposed values for multi-head critic loss
@@ -451,7 +471,10 @@ class ActorCritic(nn.Module):
             output_flat = self.core(features_flat)
             hidden = None
 
-        logits = self.policy_head(output_flat)
+        gate_input = obs.get('scalar', None) if isinstance(obs, dict) else None
+        if gate_input is not None:
+            gate_input = gate_input.reshape(-1, gate_input.shape[-1])
+        logits = self.policy_head(output_flat, gate_input=gate_input)
         value = self.value_head(output_flat).squeeze(-1)
 
         value_dict = {
