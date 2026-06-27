@@ -626,9 +626,9 @@ class PPOAgent(BaseAgent):
         x = self._obs_to_tensor(obs)
         with torch.no_grad():
             if self.use_lstm:
-                logits, _, self._rnn_state = self.model(x, self._rnn_state, seq_len=1)
+                logits, _, _, self._rnn_state = self.model(x, self._rnn_state, seq_len=1)
             else:
-                logits, _, _ = self.model(x, seq_len=1)
+                logits, _, _, _ = self.model(x, seq_len=1)
             masks = self._mask_to_tensors(self._policy_masks((info or {}).get("action_mask", {})))
             action, _ = self._sample_action(logits, raw_masks=masks)
         return action.squeeze(0).cpu().numpy()
@@ -894,9 +894,9 @@ class PPOAgent(BaseAgent):
 
                     with torch.no_grad():
                         if self.use_lstm:
-                            logits, values, hidden_states = self.model(x, hidden_states, seq_len=1)
+                            logits, values, _, hidden_states = self.model(x, hidden_states, seq_len=1)
                         else:
-                            logits, values, _ = self.model(x, seq_len=1)
+                            logits, values, _, _ = self.model(x, seq_len=1)
 
                     masks_t = self._stack_env_masks(info, num_envs, device)
                     actions_t, per_head_logps = self._sample_action(logits, raw_masks=masks_t)
@@ -961,9 +961,9 @@ class PPOAgent(BaseAgent):
 
                     with torch.no_grad():
                         if self.use_lstm:
-                            logits, values, hidden_states = self.model(x, hidden_states, seq_len=1)
+                            logits, values, _, hidden_states = self.model(x, hidden_states, seq_len=1)
                         else:
-                            logits, values, _ = self.model(x, seq_len=1)
+                            logits, values, _, _ = self.model(x, seq_len=1)
 
                     raw_mask = self._policy_masks((info.get("action_mask") or {}) if isinstance(info, dict) else {})
                     masks_t = self._mask_to_tensors(raw_mask)
@@ -1029,9 +1029,9 @@ class PPOAgent(BaseAgent):
                     if not is_vec and x.dim() == 1:
                         x = x.unsqueeze(0)
                 if self.use_lstm:
-                    _, last_v, _ = self.model(x, hidden_states, seq_len=1)
+                    _, last_v, _, _ = self.model(x, hidden_states, seq_len=1)
                 else:
-                    _, last_v, _ = self.model(x, seq_len=1)
+                    _, last_v, _, _ = self.model(x, seq_len=1)
                 v_last = last_v.reshape(-1)[:num_envs]
 
             buffer.compute_advantages(v_last, gamma=gamma, lam=gae_lambda)
@@ -1040,6 +1040,7 @@ class PPOAgent(BaseAgent):
             entropy_values: List[float] = []
             policy_loss_values: List[float] = []
             value_loss_values: List[float] = []
+            decomp_loss_values: List[float] = []
             grad_norm_values: List[float] = []
             num_batches = 0
             stop_early = False
@@ -1083,12 +1084,15 @@ class PPOAgent(BaseAgent):
                             .view(self.model.num_lstm_layers, batch_size * num_envs, -1)
                         )
                         mb_hidden_flat = (h_flat, c_flat)
-                        logits, values_pred, _ = self.model(mb_obs_flat, mb_hidden_flat, seq_len=seq_len)
+                        logits, values_pred, values_decomp, _ = self.model(mb_obs_flat, mb_hidden_flat, seq_len=seq_len)
                     else:
-                        logits, values_pred, _ = self.model(mb_obs_flat, seq_len=seq_len)
+                        logits, values_pred, values_decomp, _ = self.model(mb_obs_flat, seq_len=seq_len)
 
                     logits = {k: v.view(batch_size, num_envs, seq_len, -1) for k, v in logits.items()}
                     values_pred = values_pred.view(batch_size, num_envs, seq_len)
+                    if values_decomp is not None:
+                        values_decomp = {k: v.view(batch_size, num_envs, seq_len)
+                                         for k, v in values_decomp.items()}
                     mb_actions_flat = mb_actions.permute(0, 2, 1, 3).contiguous().view(-1, mb_actions.shape[-1])
                     new_logp, entropy = self._logprob_and_entropy(
                         {k: v.permute(0, 1, 3, 2).contiguous().view(-1, v.shape[-1]) for k, v in logits.items()},
@@ -1140,9 +1144,51 @@ class PPOAgent(BaseAgent):
                     clipped = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * mb_advantages
                     policy_loss = -(torch.min(unclipped, clipped) * mb_attention_mask * decision_mask).sum() / decision_valid
                     value_loss = (0.5 * ((values_pred - mb_returns) ** 2) * mb_attention_mask).sum() / valid_steps
+
+                    # Multi-head value loss: each decomposed head predicts its
+                    # immediate reward component. This prevents the single-critic
+                    # collapse when reward components span different magnitudes
+                    # (e.g., goal_aligned=0.35 vs asset=0.03 at w=0.6).
+                    decomp_loss = torch.tensor(0.0, device=device)
+                    if values_decomp is not None and rollout_reward_components:
+                        comp_keys_map = {
+                            'asset': ['asset_reward'],
+                            'goal':  ['goal_aligned'],
+                            'prod':  ['production_start_reward', 'production_active_reward',
+                                      'production_cancel_penalty'],
+                            'other': ['idle_cash_penalty', 'power_deficit_penalty',
+                                      'kill_reward', 'seeded_bootstrap'],
+                        }
+                        # Determine common length from any component
+                        any_len = 0
+                        for v in rollout_reward_components.values():
+                            if v:
+                                any_len = max(any_len, len(v))
+                        target_len = min(any_len, batch_size * num_envs * seq_len)
+                        for head_key, comp_keys in comp_keys_map.items():
+                            if head_key not in values_decomp:
+                                continue
+                            combined = np.zeros(target_len, dtype=np.float32)
+                            for ck in comp_keys:
+                                vals = rollout_reward_components.get(ck, [])
+                                if vals:
+                                    n = min(len(vals), target_len)
+                                    combined[:n] += np.asarray(vals[:n], dtype=np.float32)
+                            target = torch.from_numpy(combined).float().to(device)
+                            # Pad to full batch if shorter
+                            if target_len < batch_size * num_envs * seq_len:
+                                padded = torch.zeros(batch_size * num_envs * seq_len, device=device)
+                                padded[:target_len] = target
+                                target = padded
+                            target = target.view(batch_size, num_envs, seq_len)
+                            head_pred = values_decomp[head_key]
+                            decomp_loss = decomp_loss + 0.5 * (
+                                (head_pred - target) ** 2 * mb_attention_mask
+                            ).sum() / valid_steps
+
                     entropy_loss = -(entropy * mb_attention_mask).sum() / valid_steps
 
-                    loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss
+                    loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss + vf_coef * decomp_loss
 
                     # Teacher-KL: anchor action_type distribution to frozen BC teacher.
                     # Uses forward KL: KL(teacher || policy) so the penalty is applied
@@ -1154,7 +1200,7 @@ class PPOAgent(BaseAgent):
                         current_kl_coef = teacher_kl_coef * (1.0 - 0.9 * progress)
 
                         with torch.no_grad():
-                            t_logits, _, _ = teacher_model(mb_obs_flat, seq_len=seq_len)
+                            t_logits, _, _, _ = teacher_model(mb_obs_flat, seq_len=seq_len)
                             # action_type head: (B*N, L, n_actions) after view
                             t_at_logits = t_logits["action_type"].view(batch_size, num_envs, seq_len, -1)
                         p_at_logits = logits["action_type"]  # (B, N, L, n_actions)
@@ -1186,6 +1232,7 @@ class PPOAgent(BaseAgent):
                     entropy_values.append(float(((entropy * mb_attention_mask).sum() / valid_steps).item()))
                     policy_loss_values.append(float(policy_loss.item()))
                     value_loss_values.append(float(value_loss.item()))
+                    decomp_loss_values.append(float(decomp_loss.item()))
                     grad_norm_values.append(float(grad_norm.item() if hasattr(grad_norm, "item") else grad_norm))
 
                     if target_kl > 0 and approx_kl.item() > target_kl:
@@ -1202,6 +1249,7 @@ class PPOAgent(BaseAgent):
             entropy_mean = float(np.mean(entropy_values)) if entropy_values else 0.0
             policy_loss_mean = float(np.mean(policy_loss_values)) if policy_loss_values else 0.0
             value_loss_mean = float(np.mean(value_loss_values)) if value_loss_values else 0.0
+            decomp_loss_mean = float(np.mean(decomp_loss_values)) if decomp_loss_values else 0.0
             grad_norm_mean = float(np.mean(grad_norm_values)) if grad_norm_values else 0.0
             mask_mean_val = float(buffer.get_mask_statistics()) if buffer.get_mask_statistics() is not None else 0.0
             rollout_steps = int(buffer.step_idx * num_envs)
@@ -1253,7 +1301,7 @@ class PPOAgent(BaseAgent):
             print(
                 f"[PPO] update={update+1} mean_reward={mean_reward:.4f} std={std_reward:.4f} nz={nz_frac:.3f} "
                 f"KL={approx_kl_mean:.5f} entropy={entropy_mean:.4f} ploss={policy_loss_mean:.4f} "
-                f"vloss={value_loss_mean:.4f} atype_dist={action_type_counts} "
+                f"vloss={value_loss_mean:.4f} dloss={decomp_loss_mean:.4f} atype_dist={action_type_counts} "
                 f"batches={num_batches} decision_steps={decision_steps_count}/{rollout_steps} "
                 f"grad_norm={grad_norm_mean:.4f} "
                 f"mask_mean={mask_mean_val:.4f} "

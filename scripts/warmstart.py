@@ -216,7 +216,7 @@ def pretrain_policy(
 
             # Run the same stateless forward path PPO will use after loading
             # warm-start weights.  recurrent_type=None is required here.
-            logits_dict, _, _ = model(x, seq_len=1)
+            logits_dict, _, _, _ = model(x, seq_len=1)
             logits = logits_dict["action_type"]
             loss = criterion(logits, y)
 

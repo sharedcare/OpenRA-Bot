@@ -313,6 +313,24 @@ class ActorCritic(nn.Module):
         self.hidden_layer = nn.Linear(recurrent_hidden_size, hidden_size)
 
         self.policy_head = MultiDiscretePolicy(feature_dim=recurrent_hidden_size, action_dims=action_dims)
+
+        # Multi-head value: separate critics for different reward components.
+        # AlphaStar-style decomposition — each head fits its own time-scale
+        # and magnitude, preventing a single critic from collapsing when
+        # reward components span different orders of magnitude.
+        self.value_head_asset  = _mlp([recurrent_hidden_size, 128, 1])   # asset growth
+        self.value_head_goal   = _mlp([recurrent_hidden_size, 128, 1])   # goal progress
+        self.value_head_prod   = _mlp([recurrent_hidden_size, 128, 1])   # production
+        self.value_head_other  = _mlp([recurrent_hidden_size, 128, 1])   # penalties + misc
+        self._value_heads = {
+            'asset': self.value_head_asset,
+            'goal':  self.value_head_goal,
+            'prod':  self.value_head_prod,
+            'other': self.value_head_other,
+        }
+
+        # Keep a unified head for backward-compat GAE rollout.
+        # During training, the decomposed loss uses individual heads.
         self.value_head = _mlp([recurrent_hidden_size, 256, 1])
 
     def init_hidden(self, batch_size: int, device: str) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -383,7 +401,16 @@ class ActorCritic(nn.Module):
         logits = self.policy_head(output_flat)
         value = self.value_head(output_flat).squeeze(-1)
 
-        return logits, value, hidden
+        # Decomposed values for multi-head critic loss
+        value_dict = {
+            'total': value,
+            'asset': self.value_head_asset(output_flat).squeeze(-1),
+            'goal':  self.value_head_goal(output_flat).squeeze(-1),
+            'prod':  self.value_head_prod(output_flat).squeeze(-1),
+            'other': self.value_head_other(output_flat).squeeze(-1),
+        }
+
+        return logits, value, value_dict, hidden
 
     def _forward_entity(
         self, obs: Dict[str, torch.Tensor],
@@ -426,4 +453,13 @@ class ActorCritic(nn.Module):
 
         logits = self.policy_head(output_flat)
         value = self.value_head(output_flat).squeeze(-1)
-        return logits, value, hidden
+
+        value_dict = {
+            'total': value,
+            'asset': self.value_head_asset(output_flat).squeeze(-1),
+            'goal':  self.value_head_goal(output_flat).squeeze(-1),
+            'prod':  self.value_head_prod(output_flat).squeeze(-1),
+            'other': self.value_head_other(output_flat).squeeze(-1),
+        }
+
+        return logits, value, value_dict, hidden
