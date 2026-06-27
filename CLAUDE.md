@@ -2,39 +2,46 @@
 
 ## Next Session Handoff
 
-2026-06-27: Best-checkpoint + enhanced CSV logging and soft teacher-KL are both
-implemented and smoke-tested. Next session should run a full experiment to validate:
+2026-06-27: All 4 experiments (100 updates each) completed. **Goal conditioning
+is the clear breakthrough** — 2.5x improvement over baseline.
 
-```powershell
-# Baseline (no teacher-KL)
-.\scripts\train_best.ps1 -Updates 100 -RunName best_ckpt_baseline
+### Results Summary
 
-# Teacher-KL anchor
-.\scripts\train_best.ps1 -Updates 100 -RunName teacher_kl_0.05 -TeacherKlCoef 0.05
-```
+| Experiment    | best      | final     | last20    |
+|--------------|-----------|-----------|-----------|
+| Baseline     | 0.0805@57 | 0.0386    | 0.0471    |
+| Teacher-KL   | 0.0824@46 | 0.0578    | 0.0578    |
+| **Goal**     | **0.2046@92** | **0.1507** | **0.1474** |
+| Goal+Teacher | 0.1935@61 | 0.0717    | 0.1085    |
 
-On macOS:
+Teacher-KL alone: +50% final reward, prevents collapse, but doesn't increase peak.
+Goal conditioning alone: **2.5x peak**, stable last20, the clear winner.
+Goal+Teacher: slightly lower peak, teacher constrains when goal signal exists.
+
+### Recommended next launcher
+
 ```bash
-python scripts/train_rl.py --num-steps 256 --total-updates 100 \
-    --max-episode-ticks 1500 --warmstart-episodes 10 --warmstart-epochs 15 \
+python scripts/train_rl.py --num-steps 256 --total-updates 150 \
     --observation-type entity --action-space-mode macro --headless \
-    --teacher-kl-coef 0.05 --log-dir checkpoints_teacher_kl
+    --warmstart-episodes 10 --warmstart-epochs 15 \
+    --goal-conditioning --log-dir checkpoints_goal_v2
 ```
 
-Acceptance criteria for teacher-KL:
-- `best_reward` still near `0.10`
-- `last20_reward` doesn't collapse to `~0.047` (remains >= 0.07)
-- CSV columns: `early_stop,last20_reward,best_reward,best_update,mask_mean,atype_dist,reward_comp` populated
-- `checkpoints/model_best.pth` + `best_metrics.json` saved at peak
+### Do next
 
-If teacher-KL stabilizes the final policy, proceed to goal conditioning (PLAN.md priority 4).
+1. Run 150-update goal conditioning to see if reward continues climbing
+2. Tune `goal_aligned_weight` (currently 0.2) — may be the next lever
+3. Try goal-only (no BC action head): `--no-load-bc-action-head --goal-conditioning`
+4. If engine bot works on Windows: `--add-opponent --goal-conditioning` (code ready)
+5. Per PLAN.md priority 5: split reward logging for goal components
 
-### Already implemented in this session
+### Already implemented
 
-- ✅ `training.csv` now has `early_stop / last20_reward / best_reward / best_update / mask_mean / atype_dist / reward_comp`
-- ✅ `model_best.pth` + `best_metrics.json` saved automatically when mean_reward exceeds previous best
-- ✅ `--teacher-kl-coef 0.05 --teacher-kl-anneal-steps 50`: soft KL anchor on action_type head only
-- ✅ Forward KL: KL(teacher || policy), linear decay to 10% over anneal steps
+- ✅ Best checkpoint + enhanced CSV (early_stop, last20, best_reward, etc.)
+- ✅ Soft teacher-KL on action_type head (--teacher-kl-coef)
+- ✅ Goal conditioning with 4 build-order goals (--goal-conditioning)
+- ✅ Opponent + kill reward code (--add-opponent, blocked by macOS bot hang)
+- ✅ 6 unit tests pass for goal_library.py
 
 ## Quick Start
 
