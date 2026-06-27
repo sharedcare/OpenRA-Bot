@@ -62,7 +62,12 @@ class Buffer:
             self.is_dict_obs = False
         if self.is_dict_obs:
             from utils.entity_obs import ENTITY_FEATURE_DIM, MAX_ENTITIES, EntityObservationBuilder
-            scalar_dim = obs_spaces.get('scalar').shape[0] if hasattr(obs_spaces.get('scalar', None), 'shape') else EntityObservationBuilder.SCALAR_BASE_DIM
+            if obs_spaces is not None and 'scalar' in obs_spaces:
+                scalar_dim = obs_spaces['scalar'].shape[0]
+            elif isinstance(observation_space, dict):
+                scalar_dim = int(observation_space.get('scalar_dim', EntityObservationBuilder.SCALAR_BASE_DIM))
+            else:
+                scalar_dim = EntityObservationBuilder.SCALAR_BASE_DIM
             self.dict_fields = {
                 'entities': (MAX_ENTITIES, ENTITY_FEATURE_DIM),
                 'entity_mask': (MAX_ENTITIES,),

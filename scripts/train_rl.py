@@ -97,7 +97,8 @@ def _do_warmstart(
         int(env.action_space.nvec[5]),
     )
     if observation_type == "entity":
-        obs_space = {"entity_dim": 14, "scalar_dim": 10}
+        obs_space = {"entity_dim": int(env.observation_space['entities'].shape[1]),
+                     "scalar_dim": int(env.observation_space['scalar'].shape[0])}
     else:
         obs_dim = observations[0].shape[0]
         obs_space = {"vector": obs_dim}

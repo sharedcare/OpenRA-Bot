@@ -874,7 +874,7 @@ class OpenRAEnv(gym.Env):
                     atype = str(a.get('type', '')).lower().strip()
                 except Exception:
                     continue
-                if self._is_building(atype):
+                if atype in self._BUILDING_TYPES:
                     owned_bld[atype] = owned_bld.get(atype, 0) + 1
                 else:
                     owned_unit[atype] = owned_unit.get(atype, 0) + 1
