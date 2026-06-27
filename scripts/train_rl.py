@@ -213,6 +213,7 @@ def train(
     teacher_kl_anneal_steps: int = 50,
     add_opponent: bool = False,
     goal_conditioning: bool = False,
+    goal_aligned_weight: float = 0.2,
 ):
     # OpenRA initialization may change the process working directory to the
     # engine bin dir. Resolve user-provided relative output paths up front so
@@ -232,6 +233,7 @@ def train(
         headless=headless,
         add_opponent=add_opponent,
         goal_conditioning=goal_conditioning,
+        goal_aligned_weight=goal_aligned_weight,
     )
     if remote_host and remote_port:
         env.configure_remote(
@@ -475,6 +477,11 @@ if __name__ == "__main__":
              "the target composition (economy/infantry/vehicle/balanced).",
     )
     parser.add_argument(
+        "--goal-aligned-weight", type=float, default=0.2,
+        help="Weight on goal-aligned composition progress reward (default: 0.2). "
+             "Higher values push the agent harder toward the sampled goal.",
+    )
+    parser.add_argument(
         "--headless", action="store_true",
         help="Run the engine with the no-op Null renderer (no window/GL). Required "
              "for parallel multi-process training.",
@@ -526,4 +533,5 @@ if __name__ == "__main__":
         teacher_kl_anneal_steps=args.teacher_kl_anneal_steps,
         add_opponent=args.add_opponent,
         goal_conditioning=args.goal_conditioning,
+        goal_aligned_weight=args.goal_aligned_weight,
     )

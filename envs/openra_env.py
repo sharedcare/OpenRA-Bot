@@ -86,6 +86,7 @@ class OpenRAEnv(gym.Env):
         add_opponent: bool = False,
         bot_type: str = "rulebased",
         goal_conditioning: bool = False,
+        goal_aligned_weight: float = 0.2,
     ) -> None:
         super().__init__()
 
@@ -138,6 +139,7 @@ class OpenRAEnv(gym.Env):
         self.add_opponent = bool(add_opponent)
         self.bot_type = str(bot_type) if bot_type else "rulebased"
         self.goal_conditioning = bool(goal_conditioning)
+        self.goal_aligned_weight = float(goal_aligned_weight)
 
         # Spaces
         self._setup_spaces()
@@ -883,7 +885,7 @@ class OpenRAEnv(gym.Env):
                 self._active_goal, owned_bld, owned_unit)
             goal_building_progress = float(gb)
             goal_unit_progress = float(gu)
-            goal_aligned_reward = w.get('goal_aligned_weight', 0.2) * float(gt)
+            goal_aligned_reward = self.goal_aligned_weight * float(gt)
             rw += goal_aligned_reward
 
         self._last_reward_components = {
