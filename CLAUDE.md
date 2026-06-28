@@ -2,8 +2,8 @@
 
 ## Next Session Handoff
 
-2026-06-27: All 4 experiments (100 updates each) completed. **Goal conditioning
-is the clear breakthrough** — 2.5x improvement over baseline.
+2026-06-29: Goal conditioning weight sweep + DI-star alignment complete. **w=0.6
+is the clear winner (5x baseline)**. Best checkpoint: model_best.pth (0.4037@99).
 
 ### Results Summary
 

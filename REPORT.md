@@ -1,7 +1,7 @@
 # OpenRA-Bot 实验报告
 
-> **日期**: 2026-06-15，更新至 2026-06-26
-> **状态**: PPO 链路已经可训练，entity obs、macro action、asset reward、headless 和多环境 rollout 均已打通。最新瓶颈不是单一 bug，而是弱专家先验、缺少 teacher-KL / goal-conditioning，以及 RTS 长周期 credit assignment。
+> **日期**: 2026-06-15，更新至 2026-06-29
+> **状态**: Goal conditioning 是实现突破的关键（5x baseline），AlphaStar/DI-star 各组件单独使用均无效，开发-only 场景的 reward 天花板已接近。下一步需要更强的 teacher、真正的对手、或并行环境。
 
 ## 目录
 
@@ -507,3 +507,96 @@ teacher_kl_steps = 50
 - `balanced`: `powr, proc, barr, powr, weap, e1, 1tnk`
 
 每局采样一个目标，把目标编码到 entity obs 的 scalar 部分；reward 加目标进度项。这个阶段再考虑多 value head。
+
+---
+
+## 8. 2026-06-27 实验更新：Goal Conditioning 突破
+
+### Round 16: Goal conditioning 实施 + 权重扫描
+
+**动机**: PLAN.md P4，DI-star 的 `z`-conditioning 思想。给 agent 显式目标（economy/infantry/vehicle/balanced），reward 从"猜一个隐含目标"改为"朝显式目标前进"。
+
+**实现** (`utils/goal_library.py`):
+- 4 个手写目标：economy (powr×2,proc×2,hary×3) / infantry (e1×15,e3×3) / vehicle (1tnk×5,jeep×3) / balanced
+- 每局均匀采样一个 goal，编码为 6 维向量（4 one-hot + 2 weights）拼接到 scalar observation
+- Reward: `goal_aligned_weight × progress`（progress = 达到目标建筑/兵力数量的比例）
+
+**Bug 发现** (2026-06-29): reset() 中 goal 采样在 observation 构建**之后**，导致每个 episode 的第一个 obs scalar 是 10 维而不是 16 维（goal_vec 缺失）。已在 `dbdeba4` 修复。所有之前的 goal conditioning 实验都受此影响。
+
+**权重扫描结果（100 轮）**:
+
+| goal_aligned_weight | best | final | vs baseline |
+|---------------------|------|-------|-------------|
+| 0.0 (baseline) | 0.0805 | 0.0386 | 1.0x |
+| 0.2 | 0.2046 | 0.1507 | 2.5x |
+| 0.4 | 0.3102 | 0.1881 | 3.9x |
+| **0.6** | **0.4037** | **0.2823** | **5.0x** |
+| 0.8 | 0.4690 | 0.1642 | 5.8x（塌缩更陡） |
+
+**结论**: Goal conditioning 是当前架构下唯一有效的大幅改进。权重线性驱动峰值（每 +0.2 → +0.07-0.09 peak）。w=0.6 是最佳平衡点（峰值高 + 塌缩小）。vloss 随权重增长（w=0.6 → vloss=9.7），但没有破坏策略稳定性。
+
+### Round 17: Best checkpoint + 增强 CSV + Teacher-KL
+
+**Best checkpoint**: `model_best.pth` + `best_metrics.json` 在每次 peak 保存。解决 "best=0.1052@31 → final=0.0463" 的退化问题——即使最终 checkpoint 塌缩，最佳模型仍被保留。
+
+**Teacher-KL**: 冻结 BC teacher，PPO loss 中加入 `KL(teacher||policy)`，仅约束 action_type head。退火 coef 0.05→0.005。结果：**final +50%（0.0578 vs baseline 0.0386），但峰值不变**。Teacher-KL 防塌缩但不增峰。
+
+**CSV 增强**: 新增 `early_stop / last20_reward / best_reward / best_update / mask_mean / atype_dist / reward_comp` 列。
+
+### Round 18: DI-star/AlphaStar 组件对齐尝试
+
+**动机**: 研究 AlphaStar 为什么可行、我们差在哪。参考 [DI-star](https://github.com/opendilab/DI-star)。
+
+**关键发现**:
+1. **GAE(λ) 就是 TD(λ)**: 数学上等价，不需要改
+2. **多路 Value Head**: AlphaStar 用的是单 value head + V-trace/UPGO，不是多路。我们尝试的简化版（预测 per-step component）无效——需要 per-component GAE λ-returns
+3. **γ=0.999**: 需要 V-trace 做 off-policy 校正。单独用 → vloss 爆炸到 30，峰值反而更低
+4. **GLU gating**: 让 goal z 直接 gate action_type logits。结果 KL→0，策略停更——sigmoid gate 阻止任何 action 获得高 logit
+5. **vf_coef 提高**: 降低 vloss 但破坏策略稳定性（entropy 爆炸到 2.0，KL 失控到 4.6）
+
+**完整对照**:
+
+| 实验 | best | 结论 |
+|------|------|------|
+| Baseline | 0.0805 | — |
+| **Goal w=0.6** | **0.4037** | ✅ **唯一有效** |
+| + γ=0.999 | 0.3974 | ❌ V-trace 缺失 |
+| + GLU gate | 0.4042 | ❌ KL→0 |
+| + multi-V | 0.3687 | ❌ 需要 per-component λ-return |
+| + vf_coef=0.1 | 0.3820 | ❌ 策略崩溃 |
+| + Teacher-KL | 0.0824 | 防塌缩不增峰 |
+
+**根因**: AlphaStar 每个组件都在完整栈中互相支撑（V-trace + UPGO + human replay SL + 1000 环境 + league training）。单独拆零件放进 PPO 框架中均无效。
+
+### Round 19: 阶段式 Goal（三版，均失败）
+
+尝试课程学习：phase 1 先奖励建筑完成，phase 2 再奖励造兵。
+
+- v1 (thresh=1.0): phase 2 从未触发，best=0.3594
+- v2 (thresh=0.7): phase 2 ~10%，best=0.3622
+- v3 (continuous weights, thresh=0.5): phase 2 ~70%，best=0.2509
+
+**结论**: 固定权重 goal conditioning 优于任何形式的课程学习。移动目标（mid-episode 权重变化）混淆 critic，降低峰值。
+
+### Round 20: 可视化 + Bug 修复
+
+- `scripts/view_best.py`: 加载 best checkpoint，终端显示 top-5 动作概率 + goal 进度，支持 `--delay` / `--stochastic`
+- 修复: scalar dim 不一致——reset() 中 goal 采样顺序错误导致首步 observation 缺 goal_vec → 修复后 scalar 正确为 16 维
+- 模型行为验证: 最优 checkpoint 产生 94.5% noop + 5% produce，与训练日志一致——这是学到的最优保守策略，不是 bug
+
+### 当前最佳配置
+
+```bash
+python scripts/train_rl.py --num-steps 256 --total-updates 100 \
+    --observation-type entity --action-space-mode macro --headless \
+    --warmstart-episodes 10 --warmstart-epochs 15 \
+    --goal-conditioning --goal-aligned-weight 0.6
+```
+
+### 剩余杠杆
+
+1. **强化 RuleBasedAgent** (PLAN.md P2) — 覆盖完整开局 + 持续造兵
+2. **加入对手** (PLAN.md P6) — 制造 combat headroom（macOS bot hang，需 Windows）
+3. **并行环境** (PLAN.md P4) — SubprocVecEnv 代码就绪，增加样本效率
+4. **Proper multi-value-head** (PLAN.md P5) — 需要 per-component GAE，Buffer 级改动
+5. **IMPALA/V-trace** — 替代 PPO 的完整 off-policy 框架
