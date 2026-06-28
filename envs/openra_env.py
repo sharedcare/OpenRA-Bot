@@ -363,6 +363,12 @@ class OpenRAEnv(gym.Env):
         else:
             api.StartLocalGame(self.mod_id, self.map_uid, self.bin_dir, addBotOpponent=self.add_opponent, botType=self.bot_type if self.add_opponent else None, explored=True, fog=False, headless=self.headless)
 
+        # Sample goal BEFORE building observation — the goal z-vector is
+        # encoded into the scalar, so _active_goal must be set first.
+        if self.goal_conditioning and self._goal_library is not None:
+            self._active_goal = self._goal_library.sample()
+            self._goal_library._phase2_triggered = False  # reset staging
+
         # Build first observation and info
         raw = self._get_raw_state()
         self._last_raw_state = raw
@@ -382,10 +388,6 @@ class OpenRAEnv(gym.Env):
         # Reset build-order tracker for the new episode
         self._bo_tracker.reset()
         self._asset_tracker.reset()
-        # Sample goal for goal-conditioned reward
-        if self.goal_conditioning and self._goal_library is not None:
-            self._active_goal = self._goal_library.sample()
-            self._goal_library._phase2_triggered = False  # reset staging
         # Seed the asset tracker with actors that already exist at reset.  The
         # reward should measure growth after the agent starts acting, not pay a
         # one-time bonus for the starting MCV / already-created structures.
