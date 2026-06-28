@@ -140,20 +140,22 @@ class GoalLibrary:
             current = owned_units.get(utype, 0)
             unit_progress += min(current / max(target, 1), 1.0) / max(len(goal.target_units), 1)
 
-        buildings_done = bld_progress >= 0.7
+        buildings_done = bld_progress >= 0.5
         phase_bonus = 0.0
 
+        # Always reward both buildings and units — but shift emphasis.
+        # Phase 1 (buildings < 50%):  80% buildings, 20% units
+        # Phase 2 (buildings >= 50%): 30% buildings, 70% units
         if not buildings_done:
-            # Phase 1: focus on buildings, unit weight scaled down
-            total = goal.building_weight * bld_progress
+            bld_w = 0.8
+            unit_w = 0.2
         else:
-            # Phase 2: enough buildings up, reward unit production
+            bld_w = 0.3
             if not getattr(self, '_phase2_triggered', False):
-                phase_bonus = 0.5  # one-time bonus
+                phase_bonus = 0.3
                 self._phase2_triggered = True
-            # Blend: still reward remaining buildings, but add unit weight
-            unit_w = max(goal.unit_weight, 0.6)
-            remain_bld = max(0.0, 1.0 - bld_progress)
-            total = goal.building_weight * bld_progress + unit_w * unit_progress
+            unit_w = max(goal.unit_weight, 0.7)
+
+        total = bld_w * bld_progress + unit_w * unit_progress
 
         return bld_progress, unit_progress, total, phase_bonus, buildings_done
