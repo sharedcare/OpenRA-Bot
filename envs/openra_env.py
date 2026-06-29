@@ -181,10 +181,11 @@ class OpenRAEnv(gym.Env):
             # Differential per-step rewards (only active during specific actions, NOT constant background)
             'producing_per_step': 0.005,     # reward per in-progress production item each step
             # --- Asset-mode weights (reward_mode == "asset") ---
-            'asset_value': 1.0,              # weight on cost-weighted net-worth growth (per value_scale units)
+            'asset_value': 2.0,              # weight on cost-weighted net-worth growth (per value_scale units)
             'asset_value_scale': 1000.0,     # cost normalizer: a 1000-cost actor -> +1.0 reward
+            'resource_growth_weight': 1.0,   # weight on mining income growth (per value_scale units)
             'kill_value': 0.3,               # weight on enemy actor deaths (per value_scale units)
-            'goal_aligned_weight': 0.2,      # weight on goal-aligned composition progress
+            'goal_aligned_weight': 0.0,      # goal only as observation, not reward
             # Per-step penalties are OFF by default: they accumulate over episode
             # length and swamp the one-time asset gains (breaking the telescoping
             # net-worth signal). The asset reward already rewards spending cash on
@@ -204,6 +205,8 @@ class OpenRAEnv(gym.Env):
         }
         # Track previous production items to detect new starts and cancels
         self._prev_prod_items: Dict[Tuple[int, str], float] = {}
+        # Track resource total for mining income growth reward
+        self._prev_resources: float = 0.0
         # One-time deploy bonus tracking
         self._deployed_once: bool = False
         # Build-order progress tracker (DI-star inspired)
@@ -392,6 +395,7 @@ class OpenRAEnv(gym.Env):
         # reward should measure growth after the agent starts acting, not pay a
         # one-time bonus for the starting MCV / already-created structures.
         self._asset_tracker.seed_existing(raw)
+        self._prev_resources = float(raw.get('resources_total', 0) or 0)
         # The first env.step may auto-deploy the initial MCV before the policy
         # has a meaningful production choice.  Treat that post-reset bootstrap
         # state as baseline too, otherwise the rollout has a fixed reward floor.
@@ -783,10 +787,13 @@ class OpenRAEnv(gym.Env):
         if getattr(self, '_asset_seed_after_first_step', False):
             self._asset_tracker.seed_existing(raw)
             self._asset_seed_after_first_step = False
+            self._prev_resources = float(raw.get('resources_total', 0) or 0)
             self._prev_prod_items = self._extract_production_items(raw)
             self._last_reward_components = {
                 'asset_gained': 0.0,
                 'asset_reward': 0.0,
+                'resource_growth': 0.0,
+                'resource_reward': 0.0,
                 'production_start_reward': 0.0,
                 'production_active_reward': 0.0,
                 'production_cancel_penalty': 0.0,
@@ -801,6 +808,14 @@ class OpenRAEnv(gym.Env):
         gained = self._asset_tracker.update(raw)
         asset_reward = w['asset_value'] * (gained / max(1.0, float(w['asset_value_scale'])))
         rw = asset_reward
+
+        # Resource income growth: reward increases in stored resources (mining).
+        resources_now = float(raw.get('resources_total', 0) or 0)
+        resource_growth = max(0.0, resources_now - self._prev_resources)
+        self._prev_resources = resources_now
+        resource_reward = w.get('resource_growth_weight', 0.5) * (resource_growth / max(1.0, float(w['asset_value_scale'])))
+        rw += resource_reward
+
         idle_penalty = 0.0
         power_penalty = 0.0
         production_start_reward = 0.0
@@ -896,6 +911,8 @@ class OpenRAEnv(gym.Env):
         self._last_reward_components = {
             'asset_gained': float(gained),
             'asset_reward': float(asset_reward),
+            'resource_growth': float(resource_growth),
+            'resource_reward': float(resource_reward),
             'production_start_reward': float(production_start_reward),
             'production_active_reward': float(production_active_reward),
             'production_cancel_penalty': float(production_cancel_penalty),
@@ -1525,7 +1542,10 @@ class OpenRAEnv(gym.Env):
         producible_now: set = set()
         for q in (prod.get('Queues') or []):
             try:
-                if not bool(q.get('Enabled', False)) or len(q.get('Items') or []) >= 1:
+                if not bool(q.get('Enabled', False)):
+                    continue
+                # Allow queuing up to 5 items (OpenRA default queue capacity)
+                if len(q.get('Items') or []) >= 5:
                     continue
                 for it in (q.get('Producible') or []):
                     nm = str(it.get('Name', '')).lower()
