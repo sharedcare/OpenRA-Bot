@@ -380,6 +380,7 @@ namespace OpenRA
 			return willTick;
 		}
 
+
 		// Convert RLAction list to engine orders and queue them for the next frame
 		public static void SendActions(IEnumerable<RLAction> actions)
 		{
@@ -402,14 +403,6 @@ namespace OpenRA
 				{
 					if (!string.IsNullOrEmpty(a.TargetString))
 					{
-						// Guard: for building-type items, suppress if the target
-						// queue already has an item (in-progress or Done).  This
-						// prevents the agent from accidentally canceling a completed
-						// item before it can be placed.  Unit queues (infantry,
-						// vehicle) are unaffected and allow stacking.
-						if (IsBuildingQueueOccupied(world, subject, a.TargetString))
-							continue;
-
 						var prodOrder = Order.StartProduction(subject, a.TargetString, 1, true);
 						orders.Add(prodOrder);
 					}

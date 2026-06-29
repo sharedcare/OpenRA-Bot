@@ -881,6 +881,8 @@ class OpenRAEnv(gym.Env):
         goal_aligned_reward = 0.0
         goal_building_progress = 0.0
         goal_unit_progress = 0.0
+        is_phase2 = False
+        phase_bonus = 0.0
         if self.goal_conditioning and self._active_goal is not None:
             # Count current owned buildings and units by type
             actors = raw.get('actors') or []

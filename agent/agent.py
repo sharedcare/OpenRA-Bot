@@ -306,56 +306,112 @@ class RuleBasedAgent(BaseAgent):
     ) -> Optional[Tuple[int, str]]:
         my_owner = self._infer_my_owner(obs.get("actors", []) or [], obs.get("my_owner"))
         counts = self._count_owned_types(obs, my_owner)
+        cash = float(obs.get("cash", 0) or 0)
+        power = obs.get("power") or {}
+        p_provided = float(power.get("provided", 0) or 0)
+        p_drained = float(power.get("drained", 0) or 0)
+        power_margin = p_provided - p_drained
 
-        # Complete a compact RA opening first. This unlocks economy, infantry,
-        # and vehicle production for broader demonstrations.
-        for _ in range(len(self._opening)):
-            token = self._opening[self._opening_idx % len(self._opening)]
-            already_have = False
-            if token == "barracks":
-                already_have = counts.get("barr", 0) + counts.get("tent", 0) > 0
-            else:
-                already_have = counts.get(token, 0) > 0
-            if already_have:
-                self._opening_idx = (self._opening_idx + 1) % len(self._opening)
+        # State-aware production decisions.  The order below defines priority;
+        # the first condition that matches wins.
+
+        # 1) Economy foundation
+        n_powr = counts.get("powr", 0)
+        n_proc = counts.get("proc", 0)
+        n_barr = counts.get("barr", 0) + counts.get("tent", 0)
+        n_weap = counts.get("weap", 0)
+        n_harv = counts.get("harv", 0)
+        n_fact = counts.get("fact", 0)
+
+        # 2) Power first — required prerequisite for refinery (proc).
+        if n_powr < 1 and cash >= 300:
+            qid = self._find_queue_for("powr", queue_infos)
+            if qid is not None:
+                return qid, "powr"
+
+        # 3) Refinery — needs power plant as prerequisite.
+        if n_proc < 1 and cash >= 1400 and n_powr >= 1:
+            qid = self._find_queue_for("proc", queue_infos)
+            if qid is not None:
+                return qid, "proc"
+
+        # 4) Power margin thinning — more power plants.
+        if power_margin < 20 and cash >= 300:
+            for item in ["powr", "apwr"]:
+                qid = self._find_queue_for(item, queue_infos)
+                if qid is not None:
+                    return qid, item
+
+        # 5) Second refinery + harvester for strong economy
+        if n_proc < 2 and cash >= 1400:
+            qid = self._find_queue_for("proc", queue_infos)
+            if qid is not None:
+                return qid, "proc"
+
+        # 4) Need harvester if we have proc
+        if n_proc > 0 and n_harv < n_proc * 2 and cash >= 1100:
+            qid = self._find_queue_for("harv", queue_infos)
+            if qid is not None:
+                return qid, item
+
+        # 5) Need barracks for infantry
+        if n_barr < 1 and cash >= 400:
+            for item in ["barr", "tent"]:
+                qid = self._find_queue_for(item, queue_infos)
+                if qid is not None:
+                    return qid, item
+
+        # 6) Need war factory for vehicles
+        if n_weap < 1 and cash >= 2000:
+            qid = self._find_queue_for("weap", queue_infos)
+            if qid is not None:
+                return qid, item
+
+        # 7) Combat units: infantry from barr
+        if n_barr > 0:
+            for item in ["e1", "e2", "e3", "e4", "e6"]:
+                if cash < 200:  # cheap infantry
+                    break
+                qid = self._find_queue_for(item, queue_infos)
+                if qid is not None:
+                    return qid, item
+
+        # 8) Combat units: vehicles from weap
+        if n_weap > 0:
+            for item in ["1tnk", "2tnk", "jeep", "arty", "3tnk"]:
+                if cash < 700:
+                    break
+                qid = self._find_queue_for(item, queue_infos)
+                if qid is not None:
+                    return qid, item
+
+        # 9) Expand power if margin is thinning
+        if power_margin < 100 and cash >= 300:
+            for item in ["powr", "apwr"]:
+                qid = self._find_queue_for(item, queue_infos)
+                if qid is not None:
+                    return qid, item
+
+        # 10) Expand economy: more refineries
+        if n_proc < n_powr and cash >= 1400:
+            qid = self._find_queue_for("proc", queue_infos)
+            if qid is not None:
+                return qid, "proc"
+
+        # 11) More harvesters
+        if n_proc > 0 and n_harv < n_proc * 3 and cash >= 1100:
+            qid = self._find_queue_for("harv", queue_infos)
+            if qid is not None:
+                return qid, "harv"
+
+        # 12) Fallback: build more economy/power
+        for item in ["powr", "proc", "apwr", "weap", "barr", "tent"]:
+            if cash < 300 and item != "powr":
                 continue
-            choice, next_idx = self._choose_from_cycle([token], 0, queue_infos)
-            if choice is not None:
-                self._opening_idx = (self._opening_idx + 1) % len(self._opening)
-                return choice
-            break
+            qid = self._find_queue_for(item, queue_infos)
+            if qid is not None:
+                return qid, item
 
-        # If multiple queues are free, keep combat production busy first. This
-        # creates the post-opening army-value behavior missing from the old BC.
-        infantry_choice, next_i = self._choose_from_cycle(
-            self._infantry_cycle, self._infantry_idx, queue_infos
-        )
-        vehicle_choice, next_v = self._choose_from_cycle(
-            self._vehicle_cycle, self._vehicle_idx, queue_infos
-        )
-
-        if vehicle_choice is not None and counts.get("weap", 0) > 0:
-            self._vehicle_idx = next_v
-            return vehicle_choice
-        if infantry_choice is not None and (counts.get("barr", 0) + counts.get("tent", 0) > 0):
-            self._infantry_idx = next_i
-            return infantry_choice
-
-        # Keep economy/power progressing when no combat queue is available.
-        fallback_choice, next_f = self._choose_from_cycle(
-            self._fallback_cycle, self._fallback_idx, queue_infos
-        )
-        if fallback_choice is not None:
-            self._fallback_idx = next_f
-            return fallback_choice
-
-        # Last resort: pick the cheapest-looking common unit/building by a
-        # stable priority order so the queue does not sit idle.
-        priority = ["e1", "e3", "1tnk", "2tnk", "powr", "proc", "weap", "barr", "tent"]
-        for item in priority:
-            q_actor = self._find_queue_for(item, queue_infos)
-            if q_actor is not None:
-                return q_actor, item
         return None
 
 

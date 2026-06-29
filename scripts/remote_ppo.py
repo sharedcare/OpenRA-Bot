@@ -104,7 +104,12 @@ def make_model(env, observation_type: str = "vector", recurrent_type: str = "lst
         int(env.action_space.nvec[4]),
         int(env.action_space.nvec[5]),
     )
-    if observation_type == "vector":
+    if observation_type == "entity":
+        obs_space = {
+            "entity_dim": int(env.observation_space['entities'].shape[1]),
+            "scalar_dim": int(env.observation_space['scalar'].shape[0]),
+        }
+    elif observation_type == "vector":
         obs_space = {"vector": int(env.observation_space.shape[0])}
     else:
         obs_space = {"channels": int(env.observation_space.shape[-1])}
@@ -153,8 +158,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--sleep-ms", type=int, default=0)
     parser.add_argument("--checkpoint", default=None, help="Optional .pth checkpoint to load.")
-    parser.add_argument("--observation-type", default="vector", choices=["vector", "image"])
+    parser.add_argument("--observation-type", default="entity", choices=["vector", "image", "entity"])
+    parser.add_argument("--action-space-mode", default="macro", choices=["multidiscrete", "macro"])
+    parser.add_argument("--goal-conditioning", action="store_true")
+    parser.add_argument("--goal-aligned-weight", type=float, default=0.6)
     parser.add_argument("--recurrent-type", default="lstm", choices=["lstm", "gru", "none"])
+    parser.add_argument("--stochastic", action="store_true", help="Sample instead of greedy")
     parser.add_argument("--seed", type=int, default=None)
     return parser.parse_args()
 
@@ -171,6 +180,9 @@ def main() -> None:
         map_uid=args.map_uid,
         ticks_per_step=args.ticks_per_step,
         observation_type=args.observation_type,
+        action_space_mode=args.action_space_mode,
+        goal_conditioning=args.goal_conditioning,
+        goal_aligned_weight=args.goal_aligned_weight,
         enable_actions=["noop", "move", "attack", "produce", "build", "deploy"],
     )
     env.configure_remote(
@@ -188,26 +200,68 @@ def main() -> None:
 
     if args.checkpoint:
         state_dict = torch.load(args.checkpoint, map_location=device)
-        model.load_state_dict(state_dict, strict=False)
-        print(f"[ppo] loaded checkpoint={args.checkpoint}")
+        missing, _ = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"[ppo] loaded checkpoint={args.checkpoint} (skipped {len(missing)} new keys)")
+        else:
+            print(f"[ppo] loaded checkpoint={args.checkpoint}")
     else:
         print("[ppo] no checkpoint provided, using randomly initialized weights")
 
-    agent = PPOAgent(model=model, device=str(device))
     obs, info = env.reset()
     print("[remote] connected and in game")
-    print_obs_summary(obs, info, step=0, action_types=env.action_types)
+    if isinstance(obs, dict):
+        print(f"[remote] entity obs: entities={obs['entities'].shape} scalar={obs['scalar'].shape}")
+    else:
+        print_obs_summary(obs, info, step=0, action_types=env.action_types)
+    if hasattr(env, '_active_goal') and env._active_goal:
+        print(f"[remote] goal: {env._active_goal.name}")
 
     total_reward = 0.0
     for step in range(1, args.max_steps + 1):
-        action = agent.act(obs, info)
+        # Forward pass
+        if isinstance(obs, dict):
+            x = {k: torch.from_numpy(v).unsqueeze(0).to(device) for k, v in obs.items()}
+            with torch.no_grad():
+                logits, _, _, _ = model(x, seq_len=1)
+        else:
+            action = model.act(obs, info)  # fall back to agent for vector obs
+            logits = None  # handled by agent below
+
+        if logits is not None:
+            masks = info.get('action_mask', {})
+            if masks:
+                torch_masks = {k: torch.from_numpy(v).to(device) if isinstance(v, np.ndarray) else v
+                              for k, v in masks.items()}
+                logits = model.policy_head.masked_logits(logits, torch_masks)
+
+            atype_logits = logits['action_type'][0]
+            probs = torch.softmax(atype_logits, dim=-1)
+            if args.stochastic:
+                atype_idx = int(torch.multinomial(probs, 1).item())
+            else:
+                atype_idx = int(torch.argmax(atype_logits).item())
+
+            action = np.zeros(len(env.action_space.nvec), dtype=np.int64)
+            action[0] = atype_idx
+        else:
+            # Agent-based action (vector obs fallback)
+            action_ = model.act(obs, info)  # uses PPOAgent
+            action = action_
+
         decoded = decode_action(env, action)
         obs, reward, terminated, truncated, info = env.step(action)
-        total_reward += reward
+        total_reward += float(reward)
 
-        print(f"[step] step={step} reward={reward:.4f}")
-        print_obs_summary(obs, info, step=step, action_types=env.action_types)
-        print_production_debug(obs, info, action=action, decoded=decoded, step=step)
+        print(f"[step] step={step} reward={reward:.4f} action={decoded.get('action_type','?')} total={total_reward:.2f}")
+        if isinstance(obs, dict):
+            comps = info.get('reward_components', {})
+            print(f"       goal_bld={comps.get('goal_building_progress',0):.2f} "
+                  f"goal_unit={comps.get('goal_unit_progress',0):.2f} "
+                  f"cash={obs.get('cash','?')}")
+        else:
+            print_obs_summary(obs, info, step=step, action_types=env.action_types)
+            print_production_debug(obs, info, action=action, decoded=decoded, step=step)
 
         if terminated or truncated:
             print(f"[remote] game finished terminated={terminated} truncated={truncated}")
