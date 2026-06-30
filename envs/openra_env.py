@@ -184,6 +184,7 @@ class OpenRAEnv(gym.Env):
             'asset_value': 2.0,              # weight on cost-weighted net-worth growth (per value_scale units)
             'asset_value_scale': 1000.0,     # cost normalizer: a 1000-cost actor -> +1.0 reward
             'resource_growth_weight': 1.0,   # weight on mining income growth (per value_scale units)
+            'overbuild_penalty': 0.002,      # per-step penalty per excess building
             'kill_value': 0.3,               # weight on enemy actor deaths (per value_scale units)
             'goal_aligned_weight': 0.0,      # goal only as observation, not reward
             # Per-step penalties are OFF by default: they accumulate over episode
@@ -808,6 +809,30 @@ class OpenRAEnv(gym.Env):
         gained = self._asset_tracker.update(raw)
         asset_reward = w['asset_value'] * (gained / max(1.0, float(w['asset_value_scale'])))
         rw = asset_reward
+
+        # Per-step efficiency penalty: having too many utility buildings
+        # wastes money. This discourages overbuilding without blocking
+        # production of combat units and production buildings.
+        actors = raw.get('actors') or []
+        my_owner = int(raw.get('my_owner', -1))
+        counts: Dict[str, int] = {}
+        for a in actors:
+            if int(a.get('owner', -1)) == my_owner and not bool(a.get('dead', False)):
+                t = str(a.get('type', '')).lower()
+                counts[t] = counts.get(t, 0) + 1
+
+        n_powr = counts.get('powr', 0) + counts.get('apwr', 0)
+        n_proc = counts.get('proc', 0)
+        n_dome = counts.get('dome', 0)
+
+        overbuild_penalty = 0.0
+        if n_powr > 3:
+            overbuild_penalty += w.get('overbuild_penalty', 0.001) * (n_powr - 3)
+        if n_proc > 2:
+            overbuild_penalty += w.get('overbuild_penalty', 0.001) * (n_proc - 2)
+        if n_dome > 1:
+            overbuild_penalty += 0.01 * (n_dome - 1)  # radar dupe is pure waste
+        rw -= overbuild_penalty
 
         # Resource income growth: reward increases in stored resources (mining).
         resources_now = float(raw.get('resources_total', 0) or 0)
