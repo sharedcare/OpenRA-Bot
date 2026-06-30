@@ -208,6 +208,7 @@ class OpenRAEnv(gym.Env):
         self._prev_prod_items: Dict[Tuple[int, str], float] = {}
         # Track resource total for mining income growth reward
         self._prev_resources: float = 0.0
+        self._prev_bld_counts: Dict[str, int] = {}
         # One-time deploy bonus tracking
         self._deployed_once: bool = False
         # Build-order progress tracker (DI-star inspired)
@@ -397,6 +398,7 @@ class OpenRAEnv(gym.Env):
         # one-time bonus for the starting MCV / already-created structures.
         self._asset_tracker.seed_existing(raw)
         self._prev_resources = float(raw.get('resources_total', 0) or 0)
+        self._prev_bld_counts: Dict[str, int] = {}
         # The first env.step may auto-deploy the initial MCV before the policy
         # has a meaningful production choice.  Treat that post-reset bootstrap
         # state as baseline too, otherwise the rollout has a fixed reward floor.
@@ -810,9 +812,11 @@ class OpenRAEnv(gym.Env):
         asset_reward = w['asset_value'] * (gained / max(1.0, float(w['asset_value_scale'])))
         rw = asset_reward
 
-        # Per-step efficiency penalty: having too many utility buildings
-        # wastes money. This discourages overbuilding without blocking
-        # production of combat units and production buildings.
+        # Conditional asset reward: buildings only give full reward when needed.
+        # - powr: full reward only if power_margin < 0.2 * provided (power tight)
+        # - proc: full reward only if cash < 5000 (need more income)
+        # - dome: full reward only for the first one
+        # - barr/weap/units: always full reward
         actors = raw.get('actors') or []
         my_owner = int(raw.get('my_owner', -1))
         counts: Dict[str, int] = {}
@@ -821,18 +825,32 @@ class OpenRAEnv(gym.Env):
                 t = str(a.get('type', '')).lower()
                 counts[t] = counts.get(t, 0) + 1
 
-        n_powr = counts.get('powr', 0) + counts.get('apwr', 0)
-        n_proc = counts.get('proc', 0)
+        power = raw.get('power') or {}
+        p_prov = max(1.0, float(power.get('provided', 0) or 0))
+        p_drain = float(power.get('drained', 0) or 0)
+        power_margin_ratio = (p_prov - p_drain) / p_prov
+        cash = float(raw.get('cash', 0) or 0)
         n_dome = counts.get('dome', 0)
 
-        overbuild_penalty = 0.0
-        if n_powr > 3:
-            overbuild_penalty += w.get('overbuild_penalty', 0.001) * (n_powr - 3)
-        if n_proc > 2:
-            overbuild_penalty += w.get('overbuild_penalty', 0.001) * (n_proc - 2)
-        if n_dome > 1:
-            overbuild_penalty += 0.01 * (n_dome - 1)  # radar dupe is pure waste
-        rw -= overbuild_penalty
+        # Discount asset_reward when building unneeded things
+        is_powr_new = counts.get('powr', 0) > getattr(self, '_prev_bld_counts', {}).get('powr', 0) or \
+                      counts.get('apwr', 0) > getattr(self, '_prev_bld_counts', {}).get('apwr', 0)
+        is_proc_new = counts.get('proc', 0) > getattr(self, '_prev_bld_counts', {}).get('proc', 0)
+        is_dome_new = counts.get('dome', 0) > getattr(self, '_prev_bld_counts', {}).get('dome', 0)
+
+        bld_discount = 1.0
+        if is_powr_new and power_margin_ratio > 0.3:
+            bld_discount = min(bld_discount, 0.1)  # power abundant → powr is waste
+        if is_proc_new and cash > 5000:
+            bld_discount = min(bld_discount, 0.1)  # already rich → proc is waste
+        if is_dome_new and n_dome > 1:
+            bld_discount = min(bld_discount, 0.0)  # radar dupe → zero value
+
+        if bld_discount < 1.0:
+            asset_reward *= bld_discount
+            rw = asset_reward  # recompute running reward
+
+        self._prev_bld_counts = counts
 
         # Resource income growth: reward increases in stored resources (mining).
         resources_now = float(raw.get('resources_total', 0) or 0)
