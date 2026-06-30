@@ -335,14 +335,27 @@ class RuleBasedAgent(BaseAgent):
             if qid is not None:
                 return qid, "proc"
 
-        # 4) Power margin thinning — more power plants.
-        if power_margin < 20 and cash >= 300:
+        # 4) Need barracks for infantry (before more power plants)
+        if n_barr < 1 and cash >= 400:
+            for item in ["barr", "tent"]:
+                qid = self._find_queue_for(item, queue_infos)
+                if qid is not None:
+                    return qid, item
+
+        # 5) Need war factory for vehicles
+        if n_weap < 1 and cash >= 2000 and n_powr >= 1:
+            qid = self._find_queue_for("weap", queue_infos)
+            if qid is not None:
+                return qid, "weap"
+
+        # 6) Power margin thinning — more power plants.
+        if power_margin < 20 and cash >= 300 and (n_barr > 0 or n_weap > 0):
             for item in ["powr", "apwr"]:
                 qid = self._find_queue_for(item, queue_infos)
                 if qid is not None:
                     return qid, item
 
-        # 5) Second refinery + harvester for strong economy
+        # 7) Second refinery + harvester for strong economy
         if n_proc < 2 and cash >= 1400:
             qid = self._find_queue_for("proc", queue_infos)
             if qid is not None:
