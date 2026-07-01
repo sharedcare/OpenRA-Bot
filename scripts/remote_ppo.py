@@ -164,6 +164,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--goal-aligned-weight", type=float, default=0.6)
     parser.add_argument("--recurrent-type", default="lstm", choices=["lstm", "gru", "none"])
     parser.add_argument("--stochastic", action="store_true", help="Sample instead of greedy")
+    parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for softmax (>1=flatter, more exploration)")
     parser.add_argument("--seed", type=int, default=None)
     return parser.parse_args()
 
@@ -236,6 +237,9 @@ def main() -> None:
                 logits = model.policy_head.masked_logits(logits, torch_masks)
 
             atype_logits = logits['action_type'][0]
+            # Temperature scaling: >1 flattens distribution (more exploration)
+            if getattr(args, 'temperature', 1.0) != 1.0:
+                atype_logits = atype_logits / args.temperature
             probs = torch.softmax(atype_logits, dim=-1)
             if args.stochastic:
                 atype_idx = int(torch.multinomial(probs, 1).item())

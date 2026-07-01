@@ -812,11 +812,7 @@ class OpenRAEnv(gym.Env):
         asset_reward = w['asset_value'] * (gained / max(1.0, float(w['asset_value_scale'])))
         rw = asset_reward
 
-        # Conditional asset reward: buildings only give full reward when needed.
-        # - powr: full reward only if power_margin < 0.2 * provided (power tight)
-        # - proc: full reward only if cash < 5000 (need more income)
-        # - dome: full reward only for the first one
-        # - barr/weap/units: always full reward
+        # Conditional asset reward + power deficit penalty.
         actors = raw.get('actors') or []
         my_owner = int(raw.get('my_owner', -1))
         counts: Dict[str, int] = {}
@@ -828,9 +824,15 @@ class OpenRAEnv(gym.Env):
         power = raw.get('power') or {}
         p_prov = max(1.0, float(power.get('provided', 0) or 0))
         p_drain = float(power.get('drained', 0) or 0)
-        power_margin_ratio = (p_prov - p_drain) / p_prov
+        power_margin = p_prov - p_drain
         cash = float(raw.get('cash', 0) or 0)
         n_dome = counts.get('dome', 0)
+
+        # Power deficit penalty: building things with no power = very slow = wasteful.
+        # Penalize heavily when drained > provided (negative margin).
+        if power_margin < 0:
+            power_deficit_penalty = 0.01 * abs(power_margin) / 20.0
+            rw -= power_deficit_penalty
 
         # Discount asset_reward when building unneeded things
         is_powr_new = counts.get('powr', 0) > getattr(self, '_prev_bld_counts', {}).get('powr', 0) or \
@@ -839,16 +841,26 @@ class OpenRAEnv(gym.Env):
         is_dome_new = counts.get('dome', 0) > getattr(self, '_prev_bld_counts', {}).get('dome', 0)
 
         bld_discount = 1.0
-        if is_powr_new and power_margin_ratio > 0.3:
-            bld_discount = min(bld_discount, 0.1)  # power abundant → powr is waste
-        if is_proc_new and cash > 5000:
-            bld_discount = min(bld_discount, 0.1)  # already rich → proc is waste
+        # powr: encouraged when power tight, penalized when abundant
+        if is_powr_new:
+            if power_margin > 60:
+                bld_discount = 0.1   # abundant → waste
+            elif power_margin > 30:
+                bld_discount = 0.5   # comfortable → half value
+            # margin < 30: full reward (power is needed)
+        # proc: discount when already rich (> 5000, original starting cash)
+        if is_proc_new:
+            if cash > 5000:
+                bld_discount = min(bld_discount, 0.1)  # way too rich
+            elif cash > 3000:
+                bld_discount = min(bld_discount, 0.5)  # comfortable
+        # dome: only first one has value
         if is_dome_new and n_dome > 1:
-            bld_discount = min(bld_discount, 0.0)  # radar dupe → zero value
+            bld_discount = min(bld_discount, 0.0)
 
         if bld_discount < 1.0:
             asset_reward *= bld_discount
-            rw = asset_reward  # recompute running reward
+            rw = asset_reward
 
         self._prev_bld_counts = counts
 

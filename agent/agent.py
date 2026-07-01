@@ -321,41 +321,46 @@ class RuleBasedAgent(BaseAgent):
         n_barr = counts.get("barr", 0) + counts.get("tent", 0)
         n_weap = counts.get("weap", 0)
         n_harv = counts.get("harv", 0)
-        n_fact = counts.get("fact", 0)
 
-        # 2) Power first — required prerequisite for refinery (proc).
-        if n_powr < 1 and cash >= 300:
+        # 2) Power FIRST — prevent deficit. Each building drains ~20 power.
+        #    Build powr before margin drops below the cost of a new building.
+        buildings_needing_power = n_proc + n_barr + n_weap + 1  # +1 for fact
+        power_per_bld = 20
+        needed_power = buildings_needing_power * power_per_bld
+        power_low = (power_margin < 15) or (p_provided < needed_power)
+
+        if (n_powr < 1) or (power_low and cash >= 300):
             qid = self._find_queue_for("powr", queue_infos)
             if qid is not None:
                 return qid, "powr"
 
-        # 3) Refinery — needs power plant as prerequisite.
-        if n_proc < 1 and cash >= 1400 and n_powr >= 1:
+        # 3) Refinery — only when cash is LOW (need more income).
+        #    If already rich, skip — spend money on military instead.
+        if n_proc < 1 and cash < 3000 and n_powr >= 1:
             qid = self._find_queue_for("proc", queue_infos)
             if qid is not None:
                 return qid, "proc"
 
-        # 4) Need barracks for infantry (before more power plants)
+        # 4) Barracks for infantry
         if n_barr < 1 and cash >= 400:
             for item in ["barr", "tent"]:
                 qid = self._find_queue_for(item, queue_infos)
                 if qid is not None:
                     return qid, item
 
-        # 5) Need war factory for vehicles
+        # 5) War factory for vehicles
         if n_weap < 1 and cash >= 2000 and n_powr >= 1:
             qid = self._find_queue_for("weap", queue_infos)
             if qid is not None:
                 return qid, "weap"
 
-        # 6) Power margin thinning — more power plants.
-        if power_margin < 20 and cash >= 300 and (n_barr > 0 or n_weap > 0):
-            for item in ["powr", "apwr"]:
-                qid = self._find_queue_for(item, queue_infos)
-                if qid is not None:
-                    return qid, item
+        # 6) More proc only if cash is low and we have harvester capacity
+        if n_proc < 2 and cash < 2000 and n_powr >= 2:
+            qid = self._find_queue_for("proc", queue_infos)
+            if qid is not None:
+                return qid, "proc"
 
-        # 7) Second refinery + harvester for strong economy
+        # 7) Harvester if we have proc
         if n_proc < 2 and cash >= 1400:
             qid = self._find_queue_for("proc", queue_infos)
             if qid is not None:
