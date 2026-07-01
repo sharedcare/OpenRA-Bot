@@ -7,7 +7,7 @@ where each actor is independently encoded (no fixed-size padding).
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -128,10 +128,10 @@ class EntityObservationBuilder:
     # Scalar encoding
     # ------------------------------------------------------------------
 
-    SCALAR_BASE_DIM: int = 10
+    SCALAR_BASE_DIM: int = 28
 
-    @staticmethod
-    def _encode_scalar(raw: Dict[str, Any], goal_vec: Optional[List[float]] = None) -> np.ndarray:
+    @classmethod
+    def _encode_scalar(cls, raw: Dict[str, Any], goal_vec: Optional[List[float]] = None) -> np.ndarray:
         cash = max(0.0, float(raw.get('cash', 0) or 0.0))
         res_total = max(0.0, float(raw.get('resources_total', 0) or 0.0))
         res_cap = max(1.0, float(raw.get('resource_capacity', 0) or 0.0))
@@ -139,21 +139,65 @@ class EntityObservationBuilder:
         p_prov = max(0.0, float(power.get('provided', 0) or 0.0))
         p_drain = max(0.0, float(power.get('drained', 0) or 0.0))
         p_state = str(power.get('state', '')).lower()
+        power_margin = p_prov - p_drain
 
         prod = raw.get('production') or {}
         queues = prod.get('Queues', []) or []
         active_items = 0
+        enabled_queues = 0
+        empty_queues = 0
+        busy_queues = 0
+        done_items = 0
         has_empty = 0.0
         any_done = 0.0
         for q in queues:
+            enabled = bool(q.get('Enabled', False))
+            if enabled:
+                enabled_queues += 1
             items = q.get('Items', []) or []
+            if enabled and len(items) == 0:
+                empty_queues += 1
+            if enabled and len(items) > 0:
+                busy_queues += 1
             for it in items:
                 if not bool(it.get('Done', False)):
                     active_items += 1
                 else:
+                    done_items += 1
                     any_done = 1.0
             if len(items) == 0:
                 has_empty = 1.0
+
+        my_owner = int(raw.get('my_owner', -1))
+        counts: Dict[str, int] = {}
+        total_buildings = 0
+        total_units = 0
+        for actor in raw.get('actors') or []:
+            if bool(actor.get('dead', False)):
+                continue
+            if int(actor.get('owner', -1)) != my_owner:
+                continue
+            atype = str(actor.get('type', '')).lower()
+            if not atype:
+                continue
+            counts[atype] = counts.get(atype, 0) + 1
+            if cls._is_building_type(atype):
+                total_buildings += 1
+            else:
+                total_units += 1
+
+        n_powr = counts.get('powr', 0) + counts.get('apwr', 0)
+        n_proc = counts.get('proc', 0)
+        n_barr = counts.get('barr', 0) + counts.get('tent', 0)
+        n_weap = counts.get('weap', 0)
+        n_dome = counts.get('dome', 0)
+        n_fix = counts.get('fix', 0)
+        n_harv = counts.get('harv', 0)
+        n_e1 = counts.get('e1', 0)
+        n_e2 = counts.get('e2', 0)
+        n_e3 = counts.get('e3', 0)
+        n_infantry = sum(counts.get(t, 0) for t in ('e1', 'e2', 'e3', 'e4', 'e6', 'e7', 'dog'))
+        n_vehicles = sum(counts.get(t, 0) for t in ('jeep', 'apc', '1tnk', '2tnk', '3tnk', '4tnk', 'arty'))
 
         base = np.array([
             min(cash / 10000.0, 1.0),                           # 0: cash
@@ -166,6 +210,24 @@ class EntityObservationBuilder:
             has_empty,                                           # 7: has empty queue
             any_done,                                            # 8: has done item
             float(raw.get('world_tick', 0)) / 20000.0,          # 9: game time
+            min(cash / 3000.0, 1.0),                             # 10: short-horizon cash
+            float(np.clip(power_margin / 200.0, -1.0, 1.0)),     # 11: signed power margin
+            min(n_powr / 8.0, 1.0),                              # 12: power plants
+            min(n_proc / 6.0, 1.0),                              # 13: refineries
+            min(n_barr / 4.0, 1.0),                              # 14: barracks
+            min(n_weap / 4.0, 1.0),                              # 15: war factories
+            min((n_dome + n_fix) / 4.0, 1.0),                    # 16: tech/support buildings
+            min(n_harv / 12.0, 1.0),                             # 17: harvesters
+            min(n_infantry / 50.0, 1.0),                         # 18: infantry total
+            min(n_e1 / 30.0, 1.0),                               # 19: rifle infantry
+            min((n_e2 + n_e3) / 24.0, 1.0),                      # 20: anti-armor infantry
+            min(n_vehicles / 30.0, 1.0),                         # 21: vehicle total
+            min(total_buildings / 24.0, 1.0),                    # 22: all buildings
+            min(total_units / 80.0, 1.0),                        # 23: all mobile units
+            min(enabled_queues / 8.0, 1.0),                      # 24: enabled queues
+            min(empty_queues / 8.0, 1.0),                        # 25: empty queues
+            min(busy_queues / 8.0, 1.0),                         # 26: busy queues
+            min(done_items / 8.0, 1.0),                          # 27: done production items
         ], dtype=np.float32)
 
         if goal_vec:

@@ -19,6 +19,12 @@
 
 ### 近期优先级
 
+0. **已完成：补齐 count-aware scalar obs（2026-07-01）**
+   - `utils/entity_obs.py` 的 scalar 从 10 base dims 扩到 28 base dims；goal conditioning 时为 34 dims。
+   - 新增 building/unit/harvester/power_margin/queue 统计，消除“1 powr vs 10 powr”观测盲区。
+   - `scripts/train_best.ps1` 默认开启 goal conditioning w=0.6，并暴露 `-NoGoalConditioning`、`-GoalAlignedWeight`、`-TeacherKlCoef`、`-AddOpponent`。
+   - 首轮 `obs_counts_goal_w06`：`best=0.3298@6`、`final=0.2240`、`last20=0.2184`，但 `early_stop=100/100`、`batches=1`，说明下一步主线是稳定 PPO 更新。
+
 1. **实验可观测性收口**
    - 在 CSV 中稳定记录 action 分布、reward component、decision_steps、batches、early_stop、best/last20。
    - 保存 best checkpoint，而不是只按固定 update 保存；当前 `model_0034.pth`、`model_0031.pth` 这类中途峰值可能优于最终 `model_0100.pth`。
@@ -66,6 +72,23 @@
 - 不优先把模型马上扩大到 Transformer/LSTM 大架构；弱 teacher 和弱目标下，大模型只是更快拟合噪声。
 - 不优先继续大范围扫 PPO 超参；已有实验显示过保守会不动，过激会 KL 爆炸或 late collapse。
 - 不优先上完整 league/self-play；先把单对手、单地图、可解释 reward 和 teacher-KL 跑通。
+
+### 下一条推荐实验（count-aware obs 后）
+
+```powershell
+.\scripts\train_best.ps1 `
+  -Updates 100 `
+  -RunName obs_counts_goal_w06_stable `
+  -NumSteps 256 `
+  -WarmstartEpisodes 10 `
+  -WarmstartEpochs 15 `
+  -LearningRate 3e-5 `
+  -EntCoef 0.005 `
+  -TargetKl 0.05 `
+  -GoalAlignedWeight 0.6
+```
+
+验收指标：`early_stop` 明显低于 100/100，平均 `num_batches > 1`，`last20 > 0.25`，`best` 接近或超过旧 `0.4037`。如果稳定后仍大量选择 `dome/fix/apwr`，优先给 macro action mask 加硬上限，而不是继续扩大网络。
 
 ---
 

@@ -11,9 +11,14 @@ param(
     [double]$EntCoef = 0.02,
     [int]$UpdateEpochs = 4,
     [int]$MinibatchSize = 64,
+    [double]$GoalAlignedWeight = 0.6,
+    [double]$TeacherKlCoef = 0.0,
+    [int]$TeacherKlAnnealSteps = 50,
     [string]$RunName = "",
     [switch]$NoWarmstart,
-    [switch]$LoadBcActionHead
+    [switch]$LoadBcActionHead,
+    [switch]$NoGoalConditioning,
+    [switch]$AddOpponent
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,7 +28,13 @@ Set-Location $BotRoot
 
 if ([string]::IsNullOrWhiteSpace($RunName)) {
     $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $RunName = "asset_prod_credit_128_$stamp"
+    if ($NoGoalConditioning) {
+        $goalTag = "no_goal"
+    } else {
+        $weightTag = [string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0:0.##}", $GoalAlignedWeight).Replace(".", "p")
+        $goalTag = "goal_w$weightTag"
+    }
+    $RunName = "obs_counts_${goalTag}_$stamp"
 }
 
 $LogDir = Join-Path "checkpoints" $RunName
@@ -55,13 +66,28 @@ $argsList = @(
     "--target-kl", "$TargetKl",
     "--ent-coef", "$EntCoef",
     "--update-epochs", "$UpdateEpochs",
-    "--minibatch-size", "$MinibatchSize"
+    "--minibatch-size", "$MinibatchSize",
+    "--teacher-kl-coef", "$TeacherKlCoef",
+    "--teacher-kl-anneal-steps", "$TeacherKlAnnealSteps"
 ) + $warmstartArgs
 
 if ($LoadBcActionHead) {
     $argsList += "--load-bc-action-head"
 } else {
     $argsList += "--no-load-bc-action-head"
+}
+
+if ($NoGoalConditioning) {
+    Write-Host "[train_best] goal_conditioning=off"
+} else {
+    $argsList += @(
+        "--goal-conditioning",
+        "--goal-aligned-weight", "$GoalAlignedWeight"
+    )
+}
+
+if ($AddOpponent) {
+    $argsList += "--add-opponent"
 }
 
 Write-Host "[train_best] log_dir=$LogDir"

@@ -2,7 +2,7 @@
 
 `OpenRA.Bot` is a Python-side RL/control package for [OpenRA](https://github.com/OpenRA/OpenRA). It uses `pythonnet` to load the built game assemblies, calls the engine-side `PythonAPI`, and exposes a Gym-style environment for random agents, rule-based agents, and a baseline PPO training loop.
 
-**Status (2026-07-01)**: Goal conditioning achieves 5x baseline improvement (0.08→0.40 reward). Economic reward with state-aware RuleBasedAgent produces diverse actions including infantry (e1/e2/e3), harvesters, and heavy tanks. Two critical ARM64 bugs discovered and fixed: `IsBuildingQueueOccupied` reflection bug (silently dropped all building production orders) and scalar dimension mismatch (first obs missing goal vector). Current bottleneck: BC-frozen encoder is state-unaware (can't distinguish 1 powr from 10 powr), causing repeated overbuilding. Full architecture documented in [ARCHITECTURE.md](ARCHITECTURE.md).
+**Status (2026-07-01)**: Goal conditioning achieves 5x baseline improvement (0.08→0.40 reward). Economic reward with state-aware RuleBasedAgent produces diverse actions including infantry (e1/e2/e3), harvesters, and heavy tanks. Two critical ARM64 bugs discovered and fixed: `IsBuildingQueueOccupied` reflection bug (silently dropped all building production orders) and scalar dimension mismatch (first obs missing goal vector). Entity scalar observations now include building/unit/queue counts (`28` base dims, `34` with goal conditioning), removing the old "1 powr vs 10 powr" blind spot. Current bottleneck: PPO update stability under goal reward; `obs_counts_goal_w06` hit `0.3298@6` but every update early-stopped on KL, so the next step is a lower-LR / lower-entropy stable rerun. Full architecture documented in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## What Is In Scope
 
@@ -29,7 +29,7 @@
 - `utils/actions.py`: encodes Python action dicts into `RLAction`
 - `utils/net.py`: local host / remote join / lobby helpers
 - `utils/PythonAPI.cs`: engine bridge source (C#, ARM64 reflection bugs fixed — `IsBuildingQueueOccupied` guard removed)
-- `utils/entity_obs.py`: entity observation builder (14-dim per actor + 16-dim scalar)
+- `utils/entity_obs.py`: entity observation builder (14-dim per actor + 28-dim scalar, or 34 with goal conditioning)
 - `utils/goal_library.py`: 4 build-order goals (economy/infantry/vehicle/balanced)
 - `agent/agent.py`: `RandomMoveAgent`, state-aware `RuleBasedAgent` (cash/power/building checks), `PPOAgent`
 - `models/actor.py`: `VectorEncoder`, `SimpleEntityEncoder`, `MultiDiscretePolicy`, `ActorCritic` with GLU gating + multi-value-heads
@@ -102,7 +102,7 @@ python scripts/train_rl.py
 Current recommended development-only PPO launcher on Windows:
 
 ```powershell
-.\scripts\train_best.ps1 -Updates 100 -RunName stronger_teacher_no_head_repeat
+.\scripts\train_best.ps1 -Updates 100 -RunName obs_counts_goal_w06
 ```
 
 Useful overrides:
@@ -110,15 +110,19 @@ Useful overrides:
 ```powershell
 .\scripts\train_best.ps1 `
   -Updates 150 `
-  -NumSteps 128 `
+  -NumSteps 256 `
   -MaxEpisodeTicks 1800 `
-  -LearningRate 7e-5 `
-  -TargetKl 0.03 `
+  -WarmstartEpisodes 10 `
+  -WarmstartEpochs 15 `
+  -LearningRate 3e-5 `
+  -TargetKl 0.05 `
+  -EntCoef 0.005 `
   -UpdateEpochs 4 `
-  -RunName ppo_asset_macro_repeat
+  -GoalAlignedWeight 0.6 `
+  -RunName obs_counts_goal_w06_stable
 ```
 
-The launcher uses `observation_type="entity"`, `action_space_mode="macro"`, `reward_mode="asset"` through the default environment, headless mode, BC warm-start from `RuleBasedAgent`, and does **not** load the BC action head unless `-LoadBcActionHead` is specified. Current experiments show that hard-loading the BC action head anchors PPO too strongly to the teacher's action mix and usually hurts training.
+The launcher uses `observation_type="entity"`, `action_space_mode="macro"`, `reward_mode="asset"` through the default environment, headless mode, goal conditioning with `-GoalAlignedWeight 0.6`, BC warm-start from `RuleBasedAgent`, and does **not** load the BC action head unless `-LoadBcActionHead` is specified. Use `-NoGoalConditioning` for no-goal baselines. Current experiments show that hard-loading the BC action head anchors PPO too strongly to the teacher's action mix and usually hurts training.
 
 Parallel rollout can be enabled from `train_rl.py`:
 
@@ -227,9 +231,9 @@ This is the current default for new PPO experiments. It uses `utils/entity_obs.p
 
 - `entities`: up to `MAX_ENTITIES` actor rows with per-actor features
 - `entity_mask`: valid-row mask
-- `scalar`: compact economy / power / game-state features
+- `scalar`: compact economy / power / queue / count / game-state features
 
-The lightweight entity encoder is enough to clone the current `RuleBasedAgent`, but PPO still plateaus near the teacher without a stronger training signal.
+The lightweight entity encoder is enough to clone the current `RuleBasedAgent`. Goal conditioning is the strongest current training signal; after adding count-aware scalar features, the remaining issue is PPO stability rather than pure observability.
 
 ## Action Space
 
@@ -347,13 +351,13 @@ Recent bridge changes were specifically made to keep network traffic progressing
 - ~~Single-process-only rollout~~ Improved with headless `SubprocVecEnv` support
 
 ### Remaining
-- PPO can match the upgraded `RuleBasedAgent` and occasionally reaches higher asset reward, but does not yet decisively retain that improvement over long runs
+- PPO can match the upgraded `RuleBasedAgent` and goal-conditioned PPO can reach much higher reward, but does not yet decisively retain the best policy over long runs
 - The final checkpoint is often not the best checkpoint; best-model saving is now required for meaningful comparisons
 - Loading the BC action head directly is too strong an anchor and caused high-KL early stopping in recent runs
 - The current expert prior is still weak: it is a hand-written macro script, not a full-game expert with scouting, combat, tech transitions, or opponent adaptation
 - There is no soft teacher-KL regularizer yet; PPO either drifts unstably or is over-anchored by hard-loaded BC heads
-- There is no goal conditioning yet: build-order / strategy targets are not fed into the policy as an explicit `z`
-- Rewards are still scalar and development-heavy; there are no separate value heads for economy, army, combat, and win/loss
+- Goal conditioning is implemented and is the current strongest improvement; staged / moving-goal variants underperformed fixed goal weights
+- Rewards are still development-heavy; combat and terminal win/loss are still too thin in the main training loop
 - Combat and terminal win/loss training are still missing from the main training loop
 - `PythonAPI.GetState()` is expensive (scans all world state every call, heavy reflection usage)
 - `target_x` / `target_y` masking is still factorized rather than fully cell-joint
@@ -371,7 +375,7 @@ Recent bridge changes were specifically made to keep network traffic progressing
 - Use `feature` observations first when debugging action execution.
 - For remote debugging, start with `scripts/remote_rule_based.py` or `scripts/remote_ppo_debug.py` before running long PPO training jobs.
 - Treat the current PPO stack as a baseline to iterate on, not a final trainer.
-- For current PPO experiments, prefer `scripts/train_best.ps1` defaults: entity obs, macro actions, asset reward, headless, no BC action head.
+- For current PPO experiments, prefer `scripts/train_best.ps1` defaults: count-aware entity obs, macro actions, asset reward, goal conditioning w=0.6, headless, no BC action head.
 - Track `mean_reward`, `last20`, `KL`, `entropy`, `batches`, `decision_steps`, `atype_dist`, and `reward_comp`; reward alone hides collapse.
 - If policy quality is the goal, the next highest-leverage work is a stronger teacher / goal-conditioned strategy prior / soft teacher-KL, not a larger network.
 - If sample efficiency is the goal, optimize state extraction and keep hardening multi-env headless rollout.

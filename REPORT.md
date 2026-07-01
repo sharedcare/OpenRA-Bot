@@ -1,7 +1,7 @@
 # OpenRA-Bot 实验报告
 
 > **日期**: 2026-06-15，更新至 2026-07-01
-> **状态**: Goal conditioning 5x baseline。经济 reward + 升级版 RuleBasedAgent 产生步兵产线。两处 ARM64 反射 bug 已修复。当前瓶颈：BC-frozen encoder 无法区分建筑数量（1 powr vs 10 powr）→ 过度建造。完整架构见 ARCHITECTURE.md。
+> **状态**: Goal conditioning 5x baseline。经济 reward + 升级版 RuleBasedAgent 产生步兵产线。两处 ARM64 反射 bug 已修复。Entity scalar 已补 building/unit/queue counts（28 base / 34 with goal），消除“1 powr vs 10 powr”观测盲区。当前瓶颈转为 PPO 更新稳定性与 reward/action 上限：`obs_counts_goal_w06` 100/100 updates KL early stop。完整架构见 ARCHITECTURE.md。
 
 ## 目录
 
@@ -521,7 +521,7 @@ teacher_kl_steps = 50
 - 每局均匀采样一个 goal，编码为 6 维向量（4 one-hot + 2 weights）拼接到 scalar observation
 - Reward: `goal_aligned_weight × progress`（progress = 达到目标建筑/兵力数量的比例）
 
-**Bug 发现** (2026-06-29): reset() 中 goal 采样在 observation 构建**之后**，导致每个 episode 的第一个 obs scalar 是 10 维而不是 16 维（goal_vec 缺失）。已在 `dbdeba4` 修复。所有之前的 goal conditioning 实验都受此影响。
+**Bug 发现** (2026-06-29): reset() 中 goal 采样在 observation 构建**之后**，导致每个 episode 的第一个 obs scalar 是 10 维而不是 16 维（goal_vec 缺失；当时 scalar 维度，Round 30 后为 28/34）。已在 `dbdeba4` 修复。所有之前的 goal conditioning 实验都受此影响。
 
 **权重扫描结果（100 轮）**:
 
@@ -581,7 +581,7 @@ teacher_kl_steps = 50
 ### Round 20: 可视化 + Bug 修复
 
 - `scripts/view_best.py`: 加载 best checkpoint，终端显示 top-5 动作概率 + goal 进度，支持 `--delay` / `--stochastic`
-- 修复: scalar dim 不一致——reset() 中 goal 采样顺序错误导致首步 observation 缺 goal_vec → 修复后 scalar 正确为 16 维
+- 修复: scalar dim 不一致——reset() 中 goal 采样顺序错误导致首步 observation 缺 goal_vec → 修复后当时 scalar 正确为 16 维；Round 30 后为 28/34 维
 - 模型行为验证: 最优 checkpoint 产生 94.5% noop + 5% produce，与训练日志一致——这是学到的最优保守策略，不是 bug
 
 ### 当前最佳配置
@@ -657,8 +657,70 @@ python scripts/train_rl.py --num-steps 256 --total-updates 100 \
 
 **游戏内置 Bot 对照**: BaseBuilderBotModule 有 `MaximumExcessPower`（电厂上限）、`MinimumExcessPower`（电厂下限）、`InititalMinimumRefineryCount`（生产前先造矿场）——这些概念我们一个都没有。
 
-**核心发现**:
+**核心发现（Round 30 已修复第 1 项）**:
 1. Scalar observation 缺失 building_counts——模型分不清 1 个和 10 个 powr
 2. Reward 缺硬上限——游戏 bot 有 MaximumExcessPower，我们没有
 3. BC frozen encoder 是当前最大瓶颈——state-unaware 导致重复造同一建筑
 4. 单队列丢弃让训练时的 "action distribution" 完全不可信
+
+### Round 30: Count-aware Scalar Obs + `train_best.ps1` 默认 Goal 配置
+
+**动机**: Round 29 确认 scalar observation 缺失关键计数，policy 看不到已经造了多少电厂/矿场/兵营/重工/矿车/兵。Reward 和 RuleBasedAgent 都在用这些概念，但模型只能从 entity mean-pool 间接推断，导致重复建造和高方差。
+
+**实现**:
+- `utils/entity_obs.py`: `SCALAR_BASE_DIM` 从 10 扩到 28；goal conditioning 打开时为 34。
+- 新增 scalar 特征：短尺度 cash、signed `power_margin`、`powr/proc/barr/weap/dome+fix/harv` 计数、步兵/车辆总量、`e1/e2+e3`、总建筑/总单位、enabled/empty/busy/done queue 统计。
+- `scripts/train_best.ps1`: 默认开启 `--goal-conditioning --goal-aligned-weight 0.6`；新增 `-NoGoalConditioning`、`-GoalAlignedWeight`、`-TeacherKlCoef`、`-TeacherKlAnnealSteps`、`-AddOpponent` 参数；默认 run name 改为 `obs_counts_goal_w...`。
+
+**验证**:
+- Python AST parse 通过。
+- PowerShell parser 通过。
+- Env observation shape 验证：no-goal scalar `(28,)`，goal scalar `(34,)`。
+- `git diff --check` 通过。
+
+**实验：`obs_counts_goal_w06`**
+
+命令：
+
+```powershell
+.\scripts\train_best.ps1 -Updates 100 -RunName obs_counts_goal_w06
+```
+
+结果：
+
+| 指标 | 数值 |
+|------|------|
+| best | `0.3298 @ update 6` |
+| final | `0.2240` |
+| mean | `0.2286` |
+| last20 | `0.2184` |
+| mean KL | `0.1684` |
+| early_stop | `100/100` |
+| batches | `1.0` |
+
+**判断**:
+- 新 obs 没有破坏训练，且明显高于 no-goal/baseline；但它没有复现旧 `goal w=0.6` 的 `0.4037` peak。
+- 主要原因不是“count obs 无效”，而是默认脚本配置过激/过短：`NumSteps=128`、warmstart 仅 `3/3`，`TargetKl=0.03`，结果 100/100 updates 都 KL early stop，每轮只吃 1 个 PPO batch。
+- 行为上不再只偏向 powr/proc，后期大量探索 `dome/fix/apwr/barr/e2`，说明 count obs 给了策略更多状态区分，但当前 high-entropy + KL 截断让策略无法稳定收敛。
+
+**下一条推荐实验**:
+
+```powershell
+.\scripts\train_best.ps1 `
+  -Updates 100 `
+  -RunName obs_counts_goal_w06_stable `
+  -NumSteps 256 `
+  -WarmstartEpisodes 10 `
+  -WarmstartEpochs 15 `
+  -LearningRate 3e-5 `
+  -EntCoef 0.005 `
+  -TargetKl 0.05 `
+  -GoalAlignedWeight 0.6
+```
+
+验收重点：
+- `early_stop` 不再接近 100/100。
+- `num_batches` 平均显著高于 1。
+- `last20` 回到 `0.25+`。
+- `best` 接近或超过旧 `0.4037`。
+- 若稳定后仍 spam `dome/fix/apwr`，下一步给 macro action mask 加硬上限：例如 `dome/fix <= 1`，`apwr` 仅在电力余量不足或特定阶段开放。

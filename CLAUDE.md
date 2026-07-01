@@ -2,44 +2,50 @@
 
 ## Next Session Handoff
 
-2026-07-01: Two ARM64 bugs fixed. Economic reward + upgraded RuleBasedAgent producing infantry. BC-frozen encoder is bottleneck (state-unaware). Full arch in ARCHITECTURE.md. **w=0.6
-is the clear winner (5x baseline)**. Best checkpoint: model_best.pth (0.4037@99).
+2026-07-01: Two ARM64 bugs fixed. Economic reward + upgraded RuleBasedAgent producing infantry. Entity scalar now includes building/unit/queue counts (28 base dims, 34 with goal), fixing the old "1 powr vs 10 powr" blind spot. Full arch in ARCHITECTURE.md. **Goal w=0.6 remains the best known direction** (`0.4037@99` before count-aware obs). New `obs_counts_goal_w06` reached `0.3298@6`, final `0.2240`, but hit `early_stop=100/100`; next work is PPO stability, not more observability.
 
 ### Results Summary
 
-| Experiment    | best      | final     | last20    |
-|--------------|-----------|-----------|-----------|
-| Baseline     | 0.0805@57 | 0.0386    | 0.0471    |
-| Teacher-KL   | 0.0824@46 | 0.0578    | 0.0578    |
-| **Goal**     | **0.2046@92** | **0.1507** | **0.1474** |
-| Goal+Teacher | 0.1935@61 | 0.0717    | 0.1085    |
+| Experiment | best | final | last20 / note |
+|-----------|------|-------|---------------|
+| Baseline | 0.0805@57 | 0.0386 | 0.0471 |
+| Teacher-KL | 0.0824@46 | 0.0578 | prevents collapse, no peak gain |
+| Goal w=0.6 | **0.4037@99** | 0.2823 | best known pre-count-obs run |
+| obs_counts_goal_w06 | 0.3298@6 | 0.2240 | early_stop 100/100, batches=1 |
 
 Teacher-KL alone: +50% final reward, prevents collapse, but doesn't increase peak.
-Goal conditioning alone: **2.5x peak**, stable last20, the clear winner.
-Goal+Teacher: slightly lower peak, teacher constrains when goal signal exists.
+Goal conditioning alone: clear winner; fixed w=0.6 beats staged / moving-goal variants.
+Count-aware obs removes a real blind spot, but the first run was KL-clipped every update.
 
 ### Recommended launcher (best known config)
 
-```bash
-python scripts/train_rl.py --num-steps 256 --total-updates 100 \
-    --observation-type entity --action-space-mode macro --headless \
-    --warmstart-episodes 10 --warmstart-epochs 15 \
-    --goal-conditioning --goal-aligned-weight 0.4 \
-    --log-dir checkpoints_goal_w04
+```powershell
+.\scripts\train_best.ps1 `
+  -Updates 100 `
+  -RunName obs_counts_goal_w06_stable `
+  -NumSteps 256 `
+  -WarmstartEpisodes 10 `
+  -WarmstartEpochs 15 `
+  -LearningRate 3e-5 `
+  -EntCoef 0.005 `
+  -TargetKl 0.05 `
+  -GoalAlignedWeight 0.6
 ```
 
 ### Do next
 
-1. Try `--goal-aligned-weight 0.6` or `0.8` — trend suggests higher=better (0.2→0.31, 0.4→?)
-2. Try goal-only (no BC action head): `--no-load-bc-action-head --goal-conditioning --goal-aligned-weight 0.4`
-3. If engine bot works on Windows: `--add-opponent --goal-conditioning` (code ready, macOS blocked)
-4. Per PLAN.md priority 5: split reward logging + multi-value-head for goal components
+1. Rerun count-aware goal with the stable command above. Acceptance: early_stop much less than 100/100, average batches > 1, last20 > 0.25.
+2. If stable but still below 0.4037, inspect action mix. If `dome/fix/apwr` spam persists, add hard macro masks/caps for tech/support actions.
+3. Run no-goal count-aware baseline only as a short control with `-NoGoalConditioning`.
+4. If engine bot works on Windows: `-AddOpponent -GoalAlignedWeight 0.6` to create combat headroom.
 
 ### Already implemented
 
 - ✅ Best checkpoint + enhanced CSV (early_stop, last20, best_reward, etc.)
 - ✅ Soft teacher-KL on action_type head (--teacher-kl-coef)
 - ✅ Goal conditioning with 4 build-order goals (--goal-conditioning)
+- ✅ Count-aware scalar obs: building/unit/queue counts (28 base, 34 with goal)
+- ✅ `train_best.ps1` defaults to goal conditioning w=0.6 and exposes goal/teacher/opponent flags
 - ✅ Opponent + kill reward code (--add-opponent, blocked by macOS bot hang)
 - ✅ 6 unit tests pass for goal_library.py
 

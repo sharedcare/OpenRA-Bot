@@ -11,7 +11,8 @@
 ```
 entities: Box(-1, 1, (128, 14), float32)
 entity_mask: Box(0, 1, (128,), bool)
-scalar: Box(-1, 1, (16,), float32)
+scalar: Box(-1, 1, (28,), float32)       # no goal conditioning
+scalar: Box(-1, 1, (34,), float32)       # with 6-dim goal vector
 ```
 
 每个 actor 的 14 维特征 (`EntityObservationBuilder._encode_actor`):
@@ -33,7 +34,7 @@ scalar: Box(-1, 1, (16,), float32)
 | 12 | type_embed_idx | 稳定的 type 哈希值 (0-997)，归一化到 [0,1] | [0, 1] |
 | 13 | type_is_mcv | `1.0 if type == 'mcv'` | {0, 1} |
 
-### 1.2 Scalar Features (16 维)
+### 1.2 Scalar Features (28 维 base + 6 维 goal)
 
 `EntityObservationBuilder._encode_scalar`:
 
@@ -49,15 +50,29 @@ scalar: Box(-1, 1, (16,), float32)
 | 7 | has_empty_queue | `1.0 if any queue has 0 items` | {0, 1} |
 | 8 | has_done_item | `1.0 if any item has Done=True` | {0, 1} |
 | 9 | game_time | `world_tick / 20000.0` | [0, 1] |
-| 10-13 | goal_onehot | goal conditioning 的 one-hot 编码 (4 goals) | {0, 1}⁴ |
-| 14 | goal_building_weight | goal 的建筑权重 (0.1-1.0) | [0, 1] |
-| 15 | goal_unit_weight | goal 的兵力权重 (0.1-0.7) | [0, 1] |
+| 10 | cash_short | `min(cash / 3000.0, 1.0)` | [0, 1] |
+| 11 | power_margin | `clip((provided - drained) / 200.0, -1, 1)` | [-1, 1] |
+| 12 | n_powr | `(powr + apwr) / 8` | [0, 1] |
+| 13 | n_proc | `proc / 6` | [0, 1] |
+| 14 | n_barr | `(barr + tent) / 4` | [0, 1] |
+| 15 | n_weap | `weap / 4` | [0, 1] |
+| 16 | n_tech_support | `(dome + fix) / 4` | [0, 1] |
+| 17 | n_harv | `harv / 12` | [0, 1] |
+| 18 | n_infantry | infantry total / 50 | [0, 1] |
+| 19 | n_e1 | `e1 / 30` | [0, 1] |
+| 20 | n_e2_e3 | `(e2 + e3) / 24` | [0, 1] |
+| 21 | n_vehicles | vehicle total / 30 | [0, 1] |
+| 22 | total_buildings | owned buildings / 24 | [0, 1] |
+| 23 | total_units | owned mobile units / 80 | [0, 1] |
+| 24 | enabled_queues | enabled queues / 8 | [0, 1] |
+| 25 | empty_queues | empty enabled queues / 8 | [0, 1] |
+| 26 | busy_queues | busy enabled queues / 8 | [0, 1] |
+| 27 | done_items | completed production items / 8 | [0, 1] |
+| 28-31 | goal_onehot | goal conditioning 的 one-hot 编码 (4 goals) | {0, 1}⁴ |
+| 32 | goal_building_weight | goal 的建筑权重 (0.1-1.0) | [0, 1] |
+| 33 | goal_unit_weight | goal 的兵力权重 (0.1-0.7) | [0, 1] |
 
-**关键缺失**: 
-- 没有 building_count 特征（模型不知道有几个 powr/proc/barr）
-- 没有 unit_count 特征
-- 没有 harvester_count 特征
-- 没有 production_queue_length 特征
+**2026-07-01 更新**: 原先的 building/unit/harvester count 盲区已经补上。`obs_counts_goal_w06` 证明新 obs 可以稳定跑通，但默认 PPO 配置过激，100/100 updates 触发 KL early stop；后续需要先稳定 PPO 更新，再判断计数特征对最终策略质量的贡献。
 
 ---
 
@@ -66,14 +81,14 @@ scalar: Box(-1, 1, (16,), float32)
 ### 2.1 SimpleEntityEncoder
 
 ```
-entity_dim=14, scalar_dim=16, feature_dim=256
+entity_dim=14, scalar_dim=28 or 34, feature_dim=256
 
 Entity path:
   128 × 14 → MLP(14→128→128) → (128*N, 128)
   → masked_mean_pool → (B, 128)
 
 Scalar path:
-  16 → MLP(16→64→128) → (B, 128)
+  scalar_dim → MLP(scalar_dim→64→128) → (B, 128)
 
 Fusion:
   concat(entity_128, scalar_128) = (B, 256)
@@ -93,7 +108,7 @@ SimpleEntityEncoder (frozen after BC warmstart)
       target_idx:  Linear(256, 100)
       unit_type:   Linear(256, 7)
   → value_head: MLP(256→256→1)
-  + GLU gate: Linear(16, 18) — goal-conditioned action_type modulation
+  + GLU gate: Linear(scalar_dim, 18) — goal-conditioned action_type modulation
   + Multi-value heads: value_head_asset/goal/prod/other (all Linear(256→128→1))
 ```
 
@@ -251,14 +266,15 @@ reward_weights = {
 
 ## 5. 已知问题
 
-### 5.1 Observation 盲区
+### 5.1 Observation / Policy 问题
 
-| 缺失特征 | 影响 |
-|---------|------|
-| building_counts (powr/proc/barr/...) | 模型不知道已造了几个电厂 |
-| unit_counts (e1/e2/harv/...) | 模型不知道已造了多少兵 |
-| power_margin | 模型不知道电力余量（只有 power_provided/drained 的归一化值） |
-| cash_absolute | 只有 cash/10000，$500 和 $5000 差别仅 0.05 |
+| 问题 | 状态 | 影响 |
+|------|------|------|
+| building_counts (powr/proc/barr/...) | 已补入 scalar 12-16,22 | 模型现在能区分 1 个和多个关键建筑 |
+| unit_counts (e1/e2/e3/vehicle/harv) | 已补入 scalar 17-23 | 模型现在能看到兵力和矿车规模 |
+| power_margin | 已补入 scalar 11 | 模型能直接看到电力余量 |
+| cash_absolute | 部分缓解，新增 cash_short | `$500` vs `$5000` 的区分更明显，但仍是归一化连续特征 |
+| PPO 更新稳定性 | 未解决 | `obs_counts_goal_w06` 全部 update early stop，新增 obs 的收益被 KL 截断限制 |
 
 ### 5.2 Reward 问题
 
