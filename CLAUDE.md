@@ -2,7 +2,7 @@
 
 ## Next Session Handoff
 
-2026-06-29: Goal conditioning weight sweep + DI-star alignment complete. **w=0.6
+2026-07-01: Two ARM64 bugs fixed. Economic reward + upgraded RuleBasedAgent producing infantry. BC-frozen encoder is bottleneck (state-unaware). Full arch in ARCHITECTURE.md. **w=0.6
 is the clear winner (5x baseline)**. Best checkpoint: model_best.pth (0.4037@99).
 
 ### Results Summary

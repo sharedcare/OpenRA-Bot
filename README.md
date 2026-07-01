@@ -2,7 +2,7 @@
 
 `OpenRA.Bot` is a Python-side RL/control package for [OpenRA](https://github.com/OpenRA/OpenRA). It uses `pythonnet` to load the built game assemblies, calls the engine-side `PythonAPI`, and exposes a Gym-style environment for random agents, rule-based agents, and a baseline PPO training loop.
 
-**Status (2026-06-26)**: The PPO stack is technically working with entity observations, macro production actions, asset-value reward, headless mode, and spawned multi-environment rollout support. The current best development-only PPO runs can approach and sometimes slightly exceed the upgraded `RuleBasedAgent` on asset reward; repeated UE4/KL0.03 runs can reach `~0.105-0.106` peak reward, but do not reliably keep that policy through the final checkpoint. The latest `repeat_best_logging` run reached `0.1052` at update 31 and finished at `0.0463`, confirming that good intermediate policies are being lost. Recent experiments show that the main bottleneck is no longer a single bug in PPO, observation, or reward sparsity; it is the weak expert prior plus long-horizon RTS credit assignment under a mostly on-policy PPO setup.
+**Status (2026-07-01)**: Goal conditioning achieves 5x baseline improvement (0.08→0.40 reward). Economic reward with state-aware RuleBasedAgent produces diverse actions including infantry (e1/e2/e3), harvesters, and heavy tanks. Two critical ARM64 bugs discovered and fixed: `IsBuildingQueueOccupied` reflection bug (silently dropped all building production orders) and scalar dimension mismatch (first obs missing goal vector). Current bottleneck: BC-frozen encoder is state-unaware (can't distinguish 1 powr from 10 powr), causing repeated overbuilding. Full architecture documented in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## What Is In Scope
 
@@ -28,17 +28,19 @@
 - `utils/obs.py`: converts `PythonAPI.GetState()` output into Python dictionaries
 - `utils/actions.py`: encodes Python action dicts into `RLAction`
 - `utils/net.py`: local host / remote join / lobby helpers
-- `utils/PythonAPI.cs`: engine bridge source (C#, reflection-based — **known fragility on ARM64**)
-- `agent/agent.py`: `RandomMoveAgent`, upgraded `RuleBasedAgent`, `PPOAgent` (BC warm-start, diagnostics, vectorized rollout support)
-- `models/actor.py`: `VectorEncoder`, `AugmentedVectorEncoder`, `MultiDiscretePolicy`, `ActorCritic`
-- `models/buffer.py`: rollout buffer for PPO (recurrent + GAE)
-- `scripts/train_rl.py`: PPO training entry with entity / macro / headless / multi-env flags
-- `scripts/train_best.ps1`: current recommended Windows launcher for development-only PPO runs
+- `utils/PythonAPI.cs`: engine bridge source (C#, ARM64 reflection bugs fixed — `IsBuildingQueueOccupied` guard removed)
+- `utils/entity_obs.py`: entity observation builder (14-dim per actor + 16-dim scalar)
+- `utils/goal_library.py`: 4 build-order goals (economy/infantry/vehicle/balanced)
+- `agent/agent.py`: `RandomMoveAgent`, state-aware `RuleBasedAgent` (cash/power/building checks), `PPOAgent`
+- `models/actor.py`: `VectorEncoder`, `SimpleEntityEncoder`, `MultiDiscretePolicy`, `ActorCritic` with GLU gating + multi-value-heads
+- `models/entity_encoder.py`: MLP per-entity encoder + masked mean-pool (25K params)
+- `models/buffer.py`: rollout buffer for PPO (GAE + dict obs support)
+- `scripts/train_rl.py`: PPO training entry (entity/macro/headless/opponent/goal/teacher flags)
 - `scripts/warmstart.py`: BC data collection + pre-training from RuleBasedAgent
-- `scripts/verify_asset_reward.py`: compares asset-reward headroom between rule-based development agents
-- `scripts/rl_smoke_test.py`: quick RL smoke test
-- `scripts/remote_rule_based.py`: join a remote lobby and run `RuleBasedAgent`
-- `scripts/remote_ppo.py`: join a remote lobby and inspect `PPOAgent` actions, masks, and queue state
+- `scripts/remote_ppo.py`: join a remote lobby and run trained model (with --stochastic --temperature)
+- `scripts/view_best.py`: view best checkpoint in local game window
+- `scripts/verify_asset_reward.py`: reward headroom verification
+- `ARCHITECTURE.md`: complete obs/action/reward/model specification
 - `PLAN.md`: long-term roadmap (AlphaStar-style architecture)
 - `REPORT.md`: detailed experiment log and findings
 

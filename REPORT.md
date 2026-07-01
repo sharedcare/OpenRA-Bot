@@ -1,7 +1,7 @@
 # OpenRA-Bot 实验报告
 
-> **日期**: 2026-06-15，更新至 2026-06-29
-> **状态**: Goal conditioning 是实现突破的关键（5x baseline），AlphaStar/DI-star 各组件单独使用均无效，开发-only 场景的 reward 天花板已接近。下一步需要更强的 teacher、真正的对手、或并行环境。
+> **日期**: 2026-06-15，更新至 2026-07-01
+> **状态**: Goal conditioning 5x baseline。经济 reward + 升级版 RuleBasedAgent 产生步兵产线。两处 ARM64 反射 bug 已修复。当前瓶颈：BC-frozen encoder 无法区分建筑数量（1 powr vs 10 powr）→ 过度建造。完整架构见 ARCHITECTURE.md。
 
 ## 目录
 
@@ -600,3 +600,65 @@ python scripts/train_rl.py --num-steps 256 --total-updates 100 \
 3. **并行环境** (PLAN.md P4) — SubprocVecEnv 代码就绪，增加样本效率
 4. **Proper multi-value-head** (PLAN.md P5) — 需要 per-component GAE，Buffer 级改动
 5. **IMPALA/V-trace** — 替代 PPO 的完整 off-policy 框架
+
+---
+
+## 9. 2026-06-29~07-01 实验更新：经济 Reward + Bug 修复 + 架构整理
+
+### Round 21: ARM64 Bug 修复 — IsBuildingQueueOccupied
+
+**发现**: PythonAPI.cs 中 `IsBuildingQueueOccupied` 用反射检测建筑队列占用状态。ARM64 上反射失败 → 永远返回 True → 所有建筑的 `StartProduction` 订单被静默丢弃。这就是为什么模型在远程模式中只造得出 powr（它偶然绕过了 guard）。
+
+**修复**: 移除 `IsBuildingQueueOccupied` guard，游戏引擎自身处理队列占用逻辑。
+
+**连带修复**: `RenderFrame()` 方法删除（`Renderer.BeginFrame` 是 internal 的，无法从 pythonnet 调用）。
+
+### Round 22: RA 前置建筑依赖
+
+**发现**: proc（矿场）需要 powr（电厂）作为前置。RuleBasedAgent 的 state-aware 逻辑先造 proc → 游戏拒绝 → 静默丢弃。powr 能造成因为它是首批可建造建筑之一。
+
+**修复**: Agent 优先建造 powr（`n_powr < 1`），然后 proc（`n_powr >= 1`），然后 barr/weap，最后才允许额外 powr。
+
+### Round 23-28: 经济 Reward 迭代 (V2-V8)
+
+**V2 (纯经济)**: 去掉 goal_aligned reward (w=0.0)，全部靠资产价值 + 资源增长。best=0.1159。
+- 13 种动作类型，e1/e2/e3 步兵产线出现
+- 但过度建矿场（proc×66）和电厂（powr×45）
+
+**V3 (per-step 冗余惩罚)**: 每步按超出阈值建筑数扣分。best=0.1020。
+- powr 从 45 降到 36，proc 从 66 降到 23
+- 但惩罚累积导致 total reward 变负
+
+**V4 (一次性建造折扣)**: 建造时打折而非每步扣。best=0.109。
+- 回退到 V2 水平
+
+**V5 (BC barr优先)**: Agent 在额外 powr 之前先建 barr+weap。best=0.115。
+- 模型大量造 e1 步兵 (×91)
+- powr 仍然很多
+
+**V6 (电力规划)**: Agent 在 power_margin<30 时强制 powr。best=0.111。
+- powr 回到 133
+
+**V7 (proc 门槛过激)**: proc discount 在 cash>2000 触发。best=0.045。
+- 模型跳过 economy 直接 spam weap — 崩了
+
+**V8 (proc 滑梯)**: proc discount >5000→10%, >3000→50%。best=0.121。
+- 全部版本最高 reward，9 种动作类型
+- 但实际建造率极低（单队列丢弃 80%+ 命令）
+
+**关键教训**: 
+- 条件折扣是精妙的但一过性——只在建造那步生效
+- "86% produce 率"是假象——统计的是意图，80%+ 被单队列丢弃
+- 所有版本都无法克服 frozen encoder 的 state-unawareness
+
+### Round 29: ARCHITECTURE.md + 游戏 Bot 对照
+
+**产出**: [ARCHITECTURE.md](ARCHITECTURE.md) — 完整的 obs/action/reward/model 规格。
+
+**游戏内置 Bot 对照**: BaseBuilderBotModule 有 `MaximumExcessPower`（电厂上限）、`MinimumExcessPower`（电厂下限）、`InititalMinimumRefineryCount`（生产前先造矿场）——这些概念我们一个都没有。
+
+**核心发现**:
+1. Scalar observation 缺失 building_counts——模型分不清 1 个和 10 个 powr
+2. Reward 缺硬上限——游戏 bot 有 MaximumExcessPower，我们没有
+3. BC frozen encoder 是当前最大瓶颈——state-unaware 导致重复造同一建筑
+4. 单队列丢弃让训练时的 "action distribution" 完全不可信
